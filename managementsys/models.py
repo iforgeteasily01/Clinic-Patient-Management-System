@@ -31,34 +31,29 @@ class Patient(models.Model):
 
 #ActivePatient
 class ActivePatient(models.Model):
-    visit_id = models.IntegerField
     patient_id = models.ForeignKey(Patient, on_delete=models.CASCADE) #Cascade as in if Patient is deleted, then there is no Active Patient
-    status = models.IntegerField
-    consult_status = models.BooleanField
+    status = models.IntegerField()
+    consult_status = models.BooleanField()
 
 #Doctors
 class Doctors(models.Model):
-    doctor_id = models.IntegerField
     doctor_name = models.CharField(max_length=50)
 
 #Beauticians
 class Beauticians(models.Model):
-    beautician_id = models.IntegerField
     beautician_name = models.CharField(max_length=50)
     bphone_number = models.CharField(max_length=15)
 
 #MedicalRecord
 class MedRec(models.Model):
-    medrec_id = models.IntegerField
     doctor_id = models.ForeignKey(Doctors, on_delete=models.SET_NULL, null = True) #set null as in, if there is no doctor that takes care of this patient, then doctor_id is Null rather than deleted
     patient_id = models.ForeignKey(Patient, on_delete=models.CASCADE)
-    anamnesis = models.TextField    #TextField is used because no StringField, and this one has no limit. If you want limit, then models.CharField(max_length=500)
-    action = models.TextField
-    medication = models.TextField
+    anamnesis = models.TextField(default="")    #TextField is used because no StringField, and this one has no limit. If you want limit, then models.CharField(max_length=500)
+    action = models.TextField(default="")
+    medication = models.TextField(default="")
 
 #patientStatus
 class patientStatus(models.Model):
-    status_id = models.IntegerField
     status_name = models.CharField(max_length=20)
     
 
