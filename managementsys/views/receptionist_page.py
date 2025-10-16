@@ -1,4 +1,4 @@
-from .models import Patient, ActivePatient              #no need to import other things based on the function said
+from ..models import Patient, ActivePatient              #no need to import other things based on the function said
 from django.db.models import Q
 from django.http import HttpResponse
 
