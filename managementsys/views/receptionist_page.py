@@ -29,12 +29,17 @@ def GetFilteredPatientList(name_input: str, id_input: str, pn_input: str):
     #after everything, returns a filtered data from what i understand
     return patient
 
-def AddActivePatient(pn_input: str): 
-    #i assume this is to add from patient list to the active patient list, but so far haven't come up with ideas on how to move the data and make sure there is no duplicates
-    #i think first need to either build a filter or a finder to find the patient in the Patient model, then somehow copy it into ActivePatient
+def AddActivePatient(id_input: str, is_consult: bool): 
+    query = Q()
+    if id_input:
+        query &= Q(patient_id = id_input)
+
+    patient = Patient.objects.filter(query)
     
-    #default values
-    consult_status = False  #only true when doctor updatepatientstatus
-
-
+    
+    if(patient.exists):
+        newActivePatient = ActivePatient.objects.create(
+        patient_id = id_input,
+        consult_status = is_consult
+        )
     return HttpResponse("Added successfully", status = 200)

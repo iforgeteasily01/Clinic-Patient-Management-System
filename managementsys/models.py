@@ -46,6 +46,7 @@ class Beauticians(models.Model):
 
 #MedicalRecord
 class MedRec(models.Model):
+    medrec_id = models.CharField(max_length=10, unique=True, blank=True)
     doctor_id = models.ForeignKey(Doctors, on_delete=models.SET_NULL, null = True) #set null as in, if there is no doctor that takes care of this patient, then doctor_id is Null rather than deleted
     patient_id = models.ForeignKey(Patient, on_delete=models.CASCADE)
     anamnesis = models.TextField(default="")    #TextField is used because no StringField, and this one has no limit. If you want limit, then models.CharField(max_length=500)
