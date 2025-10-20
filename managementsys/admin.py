@@ -4,4 +4,5 @@ from .models import Patient, ActivePatient, Doctors, Beauticians ,MedRec, patien
 
 admin.site.register([Patient, ActivePatient, Doctors, Beauticians ,MedRec, patientStatus])
 
-#class PatientAdmin(admin.ModelAdmin):
+class PatientAdmin(admin.ModelAdmin):
+    name = 0                #random shit, idk what to put

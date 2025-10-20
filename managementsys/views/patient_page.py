@@ -9,6 +9,6 @@ def ListActivePatient():                                        #idk why this fu
     return 0
 
 
-def UpdatePatientStatus(id_input: str, new_status: int):        #idk why this function needs a param to define the function the patient is currently in
+def UpdatePatientStatus(id_input: str, target_status: int):        #t
 
     return HttpResponse("", status = 200)

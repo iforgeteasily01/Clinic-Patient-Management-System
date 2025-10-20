@@ -13,7 +13,7 @@ def GetMedicalRecordByPatientId(id_input:str):
     return patient_medrec
 
 def AddMedicalRecord(id_input:str):
-    patient_data = MedRec.objects.filter(patient_id = id_input)     #to find medical data and returns the whole row as a list or querylist
+    patient_data = MedRec.objects.filter(patient_id = id_input)     #to find medical data and returns the whole row as a list or querylist <------------ STILL PROBLEM
 
     return HttpResponse("", status = 200)
 

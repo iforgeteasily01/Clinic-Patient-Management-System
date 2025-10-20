@@ -42,4 +42,8 @@ def AddActivePatient(id_input: str, is_consult: bool):
         patient_id = id_input,
         consult_status = is_consult
         )
+        #need to save the new activepatient
+        newActivePatient.save()
+
+
     return HttpResponse("Added successfully", status = 200)
