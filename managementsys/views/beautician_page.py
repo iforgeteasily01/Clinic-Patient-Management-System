@@ -14,12 +14,7 @@ def GetActivePatientForBeautician(status_input: int):
 
 
 #since patient_id is unique, then using filter shouldn't ha
-def ProcessPatientTreatment(id_input: str):
-    ActivePatient.objects.filter(patient_id = id_input).update(status = 3)
+def UpdatePatientTreatment(id_input: str, target_status = int):
+    ActivePatient.objects.filter(patient_id = id_input).update(status = target_status)
 
     return HttpResponse("Patient finished processing", status = 200)
-        
-def FinishPatientTreatment(id_input: str):
-    ActivePatient.objects.filter(patient_id = id_input).update(status = 4)
-
-    return HttpResponse("Patient finished their visit", status = 200)

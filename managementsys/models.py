@@ -35,14 +35,23 @@ class ActivePatient(models.Model):
     status = models.IntegerField()
     consult_status = models.BooleanField()
 
+    def __str__(self):
+        return self.patient_id
+
 #Doctors
 class Doctors(models.Model):
     doctor_name = models.CharField(max_length=50)
+   
+    def __str__(self):
+        return self.doctor_name
 
 #Beauticians
 class Beauticians(models.Model):
     beautician_name = models.CharField(max_length=50)
     bphone_number = models.CharField(max_length=15)
+    
+    def __str__(self):
+        return self.beautician_name
 
 #MedicalRecord
 class MedRec(models.Model):
@@ -52,6 +61,9 @@ class MedRec(models.Model):
     anamnesis = models.TextField(default="")    #TextField is used because no StringField, and this one has no limit. If you want limit, then models.CharField(max_length=500)
     action = models.TextField(default="")
     medication = models.TextField(default="")
+
+    def __str__(self):
+        return self.medrec_id
 
 #patientStatus
 class patientStatus(models.Model):
