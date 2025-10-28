@@ -7,7 +7,8 @@ urlpatterns = [
     path("activepatient/", views.ActPatListCreate.as_view(), name = "ActPat-view-create"),
     path("doctors/", views.DoctorsListCreate.as_view(), name = "doctors-list"),
     path("beauticians/", views.BeauticiansListCreate.as_view(), name = "beauticians-list"),
-    path("medicalrecord/", views.MedRecListCreate.as_view(), name = "medical-record")
-    #i assume patient status doesnt need a url, because if yes, why?  
+    path("medicalrecord/", views.MedRecListCreate.as_view(), name = "medical-record"),
+    #i assume patient status doesnt need a url, because if yes, why? 
+    path("beautician/update/<str:patient_id>/", views.BeauticianUpdateActPat.as_view(), name = "beautician-update-actpat")
 ]
 

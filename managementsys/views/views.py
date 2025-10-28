@@ -1,5 +1,6 @@
 from django.shortcuts import render, HttpResponse
 from rest_framework import generics
+from rest_framework.exceptions import ValidationError
 from ..models import *
 from ..api.serializers import *
 from .beautician_page import *
@@ -35,7 +36,7 @@ class patStatusListCreate(generics.ListCreateAPIView):
     serializer_class = PatStatSerializer
 
 #to update the data based from functions that was mentioned before
-class BeauticianUpdate(generics.UpdateAPIView):
+class BeauticianUpdateActPat(generics.UpdateAPIView):
     queryset = ActivePatient.objects.all()
     serializer_class = ActivePatientSerializer
     lookup_field = 'patient_id'
@@ -43,6 +44,11 @@ class BeauticianUpdate(generics.UpdateAPIView):
     def perform_update(self, serializer):
         input_id = serializer.instance.patient_id #colorless doesnt mean wrong, i asked chatgpt. need to test it tho tbh
         target_status = self.request.data.get('target_status')
-        message = UpdatePatientTreatment(input_id, target_status)
+
+        if not target_status:
+            raise ValidationError("target_status is needed, do not leave it empty")
+        else:
+            message = UpdatePatientTreatment(input_id, target_status)
+        
         print(message)
         return super().perform_update(serializer)
