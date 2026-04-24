@@ -1,7 +1,7 @@
 from managementsys.models import Patient, ActivePatient, Doctors, Beauticians, MedRec, patientStatus
 
 def run():
-    # Create doctors (no doctor_id field in model)
+# Create doctors (no doctor_id field in model)
     d1 = Doctors.objects.create(doctor_name="Dr. Alice Tan")
     d2 = Doctors.objects.create(doctor_name="Dr. Bob Lee")
 

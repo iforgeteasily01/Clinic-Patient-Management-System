@@ -1,9 +1,11 @@
 from django.shortcuts import render, HttpResponse
-from rest_framework import generics
+from rest_framework import generics, filters
 from rest_framework.exceptions import ValidationError
 from ..models import *
 from ..api.serializers import *
 from .beautician_page import *
+from .patient_page import PatientCreateWithActiveView, PatientSearchView, ActivePatientUpdateStatusView
+from .medical_record_page import MedRecByPatientNoView
 
 # Create your views here.
 def homepage(request):
@@ -16,7 +18,7 @@ class PatientListCreate(generics.ListCreateAPIView):
     serializer_class = PatientSerializer
 
 class ActPatListCreate(generics.ListCreateAPIView):
-    queryset = ActivePatient.objects.all()
+    queryset = ActivePatient.objects.exclude(status=0)
     serializer_class = ActivePatientSerializer
 
 class DoctorsListCreate(generics.ListCreateAPIView):
@@ -52,3 +54,10 @@ class BeauticianUpdateActPat(generics.UpdateAPIView):
         
         print(message)
         return super().perform_update(serializer)
+    
+
+class PatientSearchView(generics.ListAPIView):
+    queryset = Patient.objects.all()
+    serializer_class = PatientSerializer
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name', 'patient_no']
