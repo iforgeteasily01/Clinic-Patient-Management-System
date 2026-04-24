@@ -7,10 +7,10 @@ from django.db.models import Max, Min, Avg, Sum, Count
 class Patient(models.Model):
     patient_no = models.CharField(
         max_length=10, unique=True, primary_key=True, blank=True)
-    name = models.CharField(max_length=100)
-    address = models.CharField(max_length=100)
-    phone_number = models.CharField(max_length=15)
-    NIK = models.CharField(max_length=16)
+    name = models.CharField(max_length=100, null=True)
+    address = models.CharField(max_length=100, null=True)
+    phone_number = models.CharField(max_length=15, null=True)
+    NIK = models.CharField(max_length=16, null=True)
 
     def __str__(self):
         return self.name
