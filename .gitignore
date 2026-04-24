@@ -14,10 +14,15 @@ media/
 .env.*
 local_settings.py
 
-# Virtual environment (if ever placed inside the project)
+# Virtual environment
 venv/
 env/
 .venv/
+# venv installed directly in project root
+Lib/
+Scripts/
+Include/
+pyvenv.cfg
 
 # IDEs
 .vscode/
