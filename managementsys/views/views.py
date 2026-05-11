@@ -1,11 +1,48 @@
 from django.shortcuts import render, HttpResponse
 from rest_framework import generics, filters
+from rest_framework.response import Response
 from rest_framework.exceptions import ValidationError
 from ..models import *
 from ..api.serializers import *
 from .beautician_page import *
-from .patient_page import PatientCreateWithActiveView, PatientSearchView, ActivePatientUpdateStatusView
+from .patient_page import PatientCreateWithActiveView, PatientSearchView, ActivePatientUpdateStatusView, ActivePatientClearView, TreatmentQueueView, TreatmentListView, TreatmentSessionCreateView, AppointmentAddView, CompleteTreatmentView, GeneralAppointmentCreateView
+from .billing_page import BillingQueueView, BillingCompleteView
+from .soap_templates_page import SoapTemplateListCreateView, SoapTemplateDetailView, SoapTemplateImportView, SoapTemplateExportView, SoapTemplateTemplateDownloadView
+from .inventory_page import (
+    InventoryItemListCreateView, InventoryItemDetailView,
+    WarehouseListCreateView, WarehouseDetailView,
+    StockLevelView, InventoryBatchListView,
+    StockInView, StockOutView,
+    ItemSyncView,
+    InventoryItemImportView,
+)
+from .auth_views import UserListView, LoginView, LogoutView, ProfileUpdateView
+from .admin_views import (
+    DoctorListCreateAdminView, DoctorDetailAdminView,
+    PatientListCreateAdminView, PatientDetailAdminView,
+    TreatmentListCreateAdminView, TreatmentDetailAdminView,
+    TreatmentImportView,
+    BeauticianListCreateAdminView, BeauticianDetailAdminView,
+    AppUserListCreateAdminView, AppUserDetailAdminView,
+    TreatmentCategoryListCreateView, TreatmentCategoryDetailView,
+    ChartOfAccountsListCreateView, ChartOfAccountsDetailView,
+)
 from .medical_record_page import MedRecByPatientNoView
+from .photo_page import PatientPhotoUploadView, PatientPhotoListView
+from .medical_record_history import MedRecHistoryListView, MedRecHistoryDetailView
+from .invoice_page import InvoiceCreateView, InvoiceListView, InvoiceDetailView
+from .reports_page import DashboardReportView
+from .patient_notes_page import PatientNoteListCreateView, PatientNoteDetailView
+from .assessment_codes_page import AssessmentCodeListCreateView, AssessmentCodeDetailView
+from .promotion_page import PromotionListCreateView, PromotionDetailView, PromotionValidateView
+from .crm_page import PatientCRMListView, PatientCRMDetailView, PatientTierListCreateView, PatientTierDetailView
+from .hr_attendance_page import (
+    ClockInView, ClockOutView,
+    AttendanceListView, AttendanceSummaryView,
+    ShiftListCreateView, ShiftDetailView,
+    StaffScheduleView,
+)
+from .hr_performance_page import StaffPerformanceView, StaffPerformanceDailyView
 
 # Create your views here.
 def homepage(request):
@@ -26,12 +63,34 @@ class DoctorsListCreate(generics.ListCreateAPIView):
     serializer_class = DoctorsSerializer
 
 class BeauticiansListCreate(generics.ListCreateAPIView):
-    queryset = Beauticians.objects.all()
     serializer_class = BeauticiansSerializer
+
+    def get_queryset(self):
+        if self.request.GET.get('available') == 'true':
+            return Beauticians.objects.filter(available=True)
+        return Beauticians.objects.all()
 
 class MedRecListCreate(generics.ListCreateAPIView):
     queryset = MedRec.objects.all()
     serializer_class = MedRecSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        active = ActivePatient.objects.filter(
+            patient_no=instance.patient_no,
+            medrec__isnull=True,
+        ).order_by('-visit_time').first()
+        if active:
+            active.medrec = instance
+            active.status = 3
+            active.save(update_fields=['medrec_id', 'status'])
+        AuditLog.objects.create(
+            performed_by=self.request.user if isinstance(self.request.user, AppUser) else None,
+            action='CREATE',
+            entity_type='MedRec',
+            entity_id=str(instance.medrec_id),
+            description=f'Medical record created: {instance.medrec_id}',
+        )
 
 class patStatusListCreate(generics.ListCreateAPIView):
     queryset = patientStatus.objects.all()
@@ -61,3 +120,8 @@ class PatientSearchView(generics.ListAPIView):
     serializer_class = PatientSerializer
     filter_backends = [filters.SearchFilter]
     search_fields = ['name', 'patient_no']
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())[:10]
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
