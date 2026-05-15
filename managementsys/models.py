@@ -438,12 +438,18 @@ class TreatmentCategory(models.Model):
 
 
 class AssessmentCode(models.Model):
+    CATEGORY_CHOICES = [
+        (1, 'Common'),
+        (2, 'Uncommon'),
+    ]
+
     code = models.CharField(max_length=20, unique=True)
     description = models.CharField(max_length=200)
     active = models.BooleanField(default=True)
+    category = models.IntegerField(choices=CATEGORY_CHOICES, default=1)
 
     class Meta:
-        ordering = ['code']
+        ordering = ['category', 'code']
 
     def __str__(self):
         return f'{self.code} – {self.description}'

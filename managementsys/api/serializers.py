@@ -23,6 +23,7 @@ class ActivePatientSerializer(serializers.ModelSerializer):
     current_beautician_id = serializers.SerializerMethodField()
     treatment_session_ids = serializers.SerializerMethodField()
     current_treatments = serializers.SerializerMethodField()
+    soap_treatment = serializers.SerializerMethodField()
 
     class Meta:
         model = ActivePatient
@@ -33,6 +34,7 @@ class ActivePatientSerializer(serializers.ModelSerializer):
             "medrec_id",
             "treatment_session_ids",
             "current_treatments",
+            "soap_treatment",
         ]
 
     def get_patient_name(self, obj):
@@ -65,6 +67,11 @@ class ActivePatientSerializer(serializers.ModelSerializer):
             for t in session.treatments.all():
                 result.append({'id': t.id, 'name': t.name, 'price': str(t.price)})
         return result
+
+    def get_soap_treatment(self, obj):
+        if obj.medrec_id and obj.medrec and obj.medrec.treatment:
+            return obj.medrec.treatment
+        return None
 
 
 class DoctorsSerializer(serializers.ModelSerializer):
@@ -146,7 +153,7 @@ class AppUserPublicSerializer(serializers.ModelSerializer):
 class AssessmentCodeSerializer(serializers.ModelSerializer):
     class Meta:
         model = AssessmentCode
-        fields = ['id', 'code', 'description', 'active']
+        fields = ['id', 'code', 'description', 'active', 'category']
 
 
 # ── SOAP Templates ────────────────────────────────────────────────────────
