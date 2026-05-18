@@ -2,13 +2,18 @@ import io
 from decimal import Decimal
 
 import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 from django.db import transaction
 from django.db.models import Sum, Value
 from django.db.models.functions import Coalesce
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+_HEADER_FONT = Font(bold=True, color='FFFFFF')
+_HEADER_FILL = PatternFill('solid', fgColor='0284C7')
 
 from ..api.serializers import (
     InventoryBatchSerializer,
@@ -398,95 +403,239 @@ def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> int:
     return remaining  # 0 = fully deducted; >0 = shortfall
 
 
-# ── Excel import ──────────────────────────────────────────────────────────────
+# ── Excel template + import ───────────────────────────────────────────────────
+
+class InventoryItemTemplateView(APIView):
+    """GET — download a blank .xlsx template for bulk item import."""
+
+    def get(self, request):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Items'
+
+        headers = [
+            'code', 'name', 'selling_price',
+            'unit_small', 'unit_medium', 'unit_medium_qty',
+            'unit_large', 'unit_large_qty',
+            'min_stock', 'is_active',
+            'category', 'legal_code',
+        ]
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font      = _HEADER_FONT
+            cell.fill      = _HEADER_FILL
+            cell.alignment = Alignment(horizontal='center')
+
+        # Notes row explaining each column
+        notes = [
+            'Unique item code (required)',
+            'Item name (required)',
+            'Selling price (required, e.g. 85000)',
+            'Smallest unit, e.g. ml or pcs (required)',
+            'Medium unit, e.g. bottle (optional)',
+            'Small units per 1 medium unit (optional)',
+            'Large unit, e.g. box (optional)',
+            'Medium units per 1 large unit (optional)',
+            'Minimum stock level (optional, default 0)',
+            'yes / no (optional, default yes)',
+            'Item category (optional)',
+            'Legal/regulatory code (optional)',
+        ]
+        ws.append(notes)
+        note_font = Font(italic=True, color='595959')
+        for cell in ws[2]:
+            cell.font      = note_font
+            cell.alignment = Alignment(wrap_text=True)
+
+        # Example data rows
+        examples = [
+            ('ITEM-001', 'Vitamin C Serum',  85000,  'ml', 'bottle', 30,  '',    '',  10, 'yes', 'Skincare', ''),
+            ('ITEM-002', 'Facial Toner',     45000,  'ml', 'bottle', 200, 'box', 6,   5,  'yes', 'Skincare', 'REG-001'),
+            ('ITEM-003', 'Sunscreen SPF50',  120000, 'g',  '',       '',  '',    '',  0,  'yes', 'Suncare',  ''),
+        ]
+        for row in examples:
+            ws.append(list(row))
+
+        # Column widths
+        col_widths = [14, 28, 16, 12, 14, 18, 12, 16, 12, 12, 18, 18]
+        for i, width in enumerate(col_widths, start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+
+        ws.row_dimensions[2].height = 36
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        response = HttpResponse(
+            buf.read(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = 'attachment; filename="inventory_items_template.xlsx"'
+        return response
+
+
+def _parse_import_rows(rows):
+    """
+    Parse spreadsheet rows (skipping header row 1) into validated item dicts.
+    Returns (valid_rows, errors).
+    valid_rows: list of dicts with keys matching InventoryItem fields plus 'row' and 'action'.
+    errors: list of {row, message}.
+    """
+    def _int_or_none(v):
+        if v is None or str(v).strip() == '':
+            return None
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return None
+
+    existing_codes = set(InventoryItem.objects.values_list('code', flat=True))
+    valid_rows = []
+    errors = []
+
+    for i, row in enumerate(rows[1:], start=2):
+        padded = list(row) + [None] * 12
+        code           = str(padded[0]).strip() if padded[0] is not None else ''
+        name           = str(padded[1]).strip() if padded[1] is not None else ''
+        price_raw      = padded[2]
+        unit_small     = str(padded[3]).strip() if padded[3] is not None else ''
+        unit_medium    = str(padded[4]).strip() if padded[4] is not None else ''
+        unit_medium_qty_raw = padded[5]
+        unit_large     = str(padded[6]).strip() if padded[6] is not None else ''
+        unit_large_qty_raw  = padded[7]
+        min_stock_raw  = padded[8]
+        active_raw     = padded[9]
+        category       = str(padded[10]).strip() if padded[10] is not None else ''
+        legal_code     = str(padded[11]).strip() if padded[11] is not None else None
+        if legal_code == '':
+            legal_code = None
+
+        if not code:
+            errors.append({'row': i, 'message': 'Code is required.'})
+            continue
+        if not name:
+            errors.append({'row': i, 'message': f'Row {i}: name is required.'})
+            continue
+        if not unit_small:
+            errors.append({'row': i, 'message': f'Row {i}: unit_small is required.'})
+            continue
+        try:
+            selling_price = Decimal(str(price_raw)) if price_raw not in (None, '') else None
+            if selling_price is None:
+                raise ValueError
+        except (ValueError, TypeError):
+            errors.append({'row': i, 'message': f'Row {i}: invalid selling_price "{price_raw}".'})
+            continue
+
+        unit_medium_qty = _int_or_none(unit_medium_qty_raw)
+        unit_large_qty  = _int_or_none(unit_large_qty_raw)
+        min_stock       = _int_or_none(min_stock_raw) or 0
+
+        if active_raw is None or str(active_raw).strip() == '':
+            is_active = True
+        else:
+            is_active = str(active_raw).strip().lower() in ('yes', 'true', '1')
+
+        valid_rows.append({
+            'row': i,
+            'action': 'update' if code in existing_codes else 'create',
+            'code': code,
+            'name': name,
+            'selling_price': selling_price,
+            'unit_small': unit_small,
+            'unit_medium': unit_medium,
+            'unit_medium_qty': unit_medium_qty,
+            'unit_large': unit_large,
+            'unit_large_qty': unit_large_qty,
+            'min_stock': min_stock,
+            'is_active': is_active,
+            'category': category,
+            'legal_code': legal_code,
+        })
+
+    return valid_rows, errors
+
+
+def _load_workbook_from_request(request):
+    uploaded = request.FILES.get('file')
+    if not uploaded:
+        return None, None, Response({'error': 'No file uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(uploaded.read()), read_only=True, data_only=True)
+    except Exception:
+        return None, None, Response({'error': 'Could not parse file. Upload a valid .xlsx file.'}, status=status.HTTP_400_BAD_REQUEST)
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if not rows:
+        return None, None, Response({'error': 'File is empty.'}, status=status.HTTP_400_BAD_REQUEST)
+    return wb, rows, None
+
+
+class InventoryItemImportPreviewView(APIView):
+    """
+    POST multipart/form-data with file=<xlsx>
+    Parses and validates the file without writing to the database.
+    Returns { rows: [{row, action, code, name, ...}], errors: [{row, message}] }
+    where action is 'create' or 'update'.
+    """
+
+    def post(self, request):
+        _wb, rows, err = _load_workbook_from_request(request)
+        if err:
+            return err
+        valid_rows, errors = _parse_import_rows(rows)
+        preview_rows = [
+            {
+                'row': r['row'],
+                'action': r['action'],
+                'code': r['code'],
+                'name': r['name'],
+                'selling_price': str(r['selling_price']),
+                'unit_small': r['unit_small'],
+                'unit_medium': r['unit_medium'],
+                'category': r['category'],
+                'legal_code': r['legal_code'],
+                'is_active': r['is_active'],
+            }
+            for r in valid_rows
+        ]
+        return Response({'rows': preview_rows, 'errors': errors}, status=status.HTTP_200_OK)
+
 
 class InventoryItemImportView(APIView):
     """
     POST multipart/form-data with file=<xlsx>
     Columns (row 1 = header, skipped):
-      code | name | selling_price | unit_small | unit_medium | unit_medium_qty | unit_large | unit_large_qty | min_stock | is_active
+      code | name | selling_price | unit_small | unit_medium | unit_medium_qty | unit_large | unit_large_qty | min_stock | is_active | category | legal_code
+    Parses, validates, then commits all valid rows.
     Returns { created, updated, errors: [{row, message}] }
     """
 
     def post(self, request):
-        uploaded = request.FILES.get('file')
-        if not uploaded:
-            return Response({'error': 'No file uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            wb = openpyxl.load_workbook(io.BytesIO(uploaded.read()), read_only=True, data_only=True)
-        except Exception:
-            return Response({'error': 'Could not parse file. Upload a valid .xlsx file.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
-            return Response({'error': 'File is empty.'}, status=status.HTTP_400_BAD_REQUEST)
-
+        _wb, rows, err = _load_workbook_from_request(request)
+        if err:
+            return err
+        valid_rows, errors = _parse_import_rows(rows)
         created = updated = 0
-        errors = []
 
-        for i, row in enumerate(rows[1:], start=2):
-            padded = list(row) + [None] * 10
-            code           = str(padded[0]).strip() if padded[0] is not None else ''
-            name           = str(padded[1]).strip() if padded[1] is not None else ''
-            price_raw      = padded[2]
-            unit_small     = str(padded[3]).strip() if padded[3] is not None else ''
-            unit_medium    = str(padded[4]).strip() if padded[4] is not None else ''
-            unit_medium_qty_raw = padded[5]
-            unit_large     = str(padded[6]).strip() if padded[6] is not None else ''
-            unit_large_qty_raw  = padded[7]
-            min_stock_raw  = padded[8]
-            active_raw     = padded[9]
-
-            if not code:
-                errors.append({'row': i, 'message': 'Code is required.'})
-                continue
-            if not name:
-                errors.append({'row': i, 'message': f'Row {i}: name is required.'})
-                continue
-            if not unit_small:
-                errors.append({'row': i, 'message': f'Row {i}: unit_small is required.'})
-                continue
-            try:
-                selling_price = Decimal(str(price_raw)) if price_raw not in (None, '') else None
-                if selling_price is None:
-                    raise ValueError
-            except (ValueError, TypeError):
-                errors.append({'row': i, 'message': f'Row {i}: invalid selling_price "{price_raw}".'})
-                continue
-
-            def _int_or_none(v):
-                if v is None or str(v).strip() == '':
-                    return None
-                try:
-                    return int(v)
-                except (ValueError, TypeError):
-                    return None
-
-            unit_medium_qty = _int_or_none(unit_medium_qty_raw)
-            unit_large_qty  = _int_or_none(unit_large_qty_raw)
-            min_stock       = _int_or_none(min_stock_raw) or 0
-
-            if active_raw is None or str(active_raw).strip() == '':
-                is_active = True
-            else:
-                is_active = str(active_raw).strip().lower() in ('yes', 'true', '1')
-
+        for r in valid_rows:
             try:
                 with transaction.atomic():
                     obj, was_created = InventoryItem.objects.update_or_create(
-                        code=code,
+                        code=r['code'],
                         defaults={
-                            'name': name,
-                            'selling_price': selling_price,
-                            'unit_small': unit_small,
-                            'unit_medium': unit_medium,
-                            'unit_medium_qty': unit_medium_qty,
-                            'unit_large': unit_large,
-                            'unit_large_qty': unit_large_qty,
-                            'min_stock': min_stock,
-                            'is_active': is_active,
+                            'name': r['name'],
+                            'selling_price': r['selling_price'],
+                            'unit_small': r['unit_small'],
+                            'unit_medium': r['unit_medium'],
+                            'unit_medium_qty': r['unit_medium_qty'],
+                            'unit_large': r['unit_large'],
+                            'unit_large_qty': r['unit_large_qty'],
+                            'min_stock': r['min_stock'],
+                            'is_active': r['is_active'],
+                            'category': r['category'],
+                            'legal_code': r['legal_code'],
                         },
                     )
                     AuditLog.objects.create(
@@ -501,6 +650,6 @@ class InventoryItemImportView(APIView):
                 else:
                     updated += 1
             except Exception as exc:
-                errors.append({'row': i, 'message': f'Row {i}: {exc}'})
+                errors.append({'row': r['row'], 'message': f'Row {r["row"]}: {exc}'})
 
         return Response({'created': created, 'updated': updated, 'errors': errors}, status=status.HTTP_200_OK)

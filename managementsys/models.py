@@ -199,13 +199,17 @@ class AppUser(models.Model):
         ('superuser',  'Superuser'),
         ('doctor',     'Doctor'),
         ('beautician', 'Beautician'),
+        ('cashier',    'Cashier'),
     ]
 
     display_name    = models.CharField(max_length=50)
     pin_hash        = models.CharField(max_length=128)
     role            = models.CharField(max_length=20, choices=ROLE_CHOICES, default='superuser')
-    avatar_color    = models.CharField(max_length=7, default='#0284c7')
-    profile_picture = models.ImageField(upload_to='profile_pictures/', null=True, blank=True)
+    avatar_color      = models.CharField(max_length=7, default='#0284c7')
+    theme_primary     = models.CharField(max_length=7, default='#0284c7')
+    theme_secondary   = models.CharField(max_length=7, default='#7c3aed')
+    theme_background  = models.CharField(max_length=7, default='#f1f5f9')
+    profile_picture   = models.ImageField(upload_to='profile_pictures/', null=True, blank=True)
     is_active       = models.BooleanField(default=True)
     auth_token      = models.CharField(max_length=64, blank=True, default='')
     base_salary     = models.DecimalField(max_digits=14, decimal_places=2, default=0)
@@ -249,14 +253,16 @@ class SoapTemplate(models.Model):
 
 
 class InventoryItem(models.Model):
-    code = models.CharField(max_length=30, unique=True)
-    name = models.CharField(max_length=100)
+    code = models.CharField(max_length=60, unique=True)
+    name = models.CharField(max_length=60)
     selling_price = models.DecimalField(max_digits=14, decimal_places=2)
     unit_small = models.CharField(max_length=30)
     unit_medium = models.CharField(max_length=30, blank=True, default='')
     unit_medium_qty = models.PositiveIntegerField(null=True, blank=True)  # small per 1 medium
     unit_large = models.CharField(max_length=30, blank=True, default='')
     unit_large_qty = models.PositiveIntegerField(null=True, blank=True)  # medium per 1 large
+    category = models.CharField(max_length=100, blank=True, default='')
+    legal_code = models.CharField(max_length=100, null=True, blank=True)
     is_active = models.BooleanField(default=True)
     is_service = models.BooleanField(default=False)  # True for treatment-backed non-stock items
     min_stock = models.PositiveIntegerField(default=0)  # in smallest unit

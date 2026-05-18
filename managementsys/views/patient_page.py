@@ -96,18 +96,21 @@ class AppointmentAddView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
+        consult_status = bool(request.data.get('consult_status', False))
+
         active_patient = ActivePatient.objects.create(
             patient_no=patient,
             status=1,
-            consult_status=False,
+            consult_status=consult_status,
         )
 
+        visit_type = 'consultation' if consult_status else 'treatment'
         AuditLog.objects.create(
             performed_by=_actor(request),
             action='CREATE',
             entity_type='ActivePatient',
             entity_id=patient.patient_no,
-            description=f'Appointment added for {patient.name} ({patient.patient_no})',
+            description=f'Appointment added for {patient.name} ({patient.patient_no}) – {visit_type}',
         )
 
         serializer = ActivePatientSerializer(active_patient)
@@ -130,19 +133,22 @@ class GeneralAppointmentCreateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        consult_status = bool(request.data.get('consult_status', False))
+
         active_patient = ActivePatient.objects.create(
             patient_no=None,
             guest_name=guest_name,
             status=1,
-            consult_status=False,
+            consult_status=consult_status,
         )
 
+        visit_type = 'consultation' if consult_status else 'treatment'
         AuditLog.objects.create(
             performed_by=_actor(request),
             action='CREATE',
             entity_type='ActivePatient',
             entity_id=str(active_patient.id),
-            description=f'General appointment created for {guest_name}',
+            description=f'General appointment created for {guest_name} – {visit_type}',
         )
 
         serializer = ActivePatientSerializer(active_patient)

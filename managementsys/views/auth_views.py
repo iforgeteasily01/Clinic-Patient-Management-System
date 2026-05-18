@@ -102,6 +102,53 @@ class ProfileUpdateView(APIView):
         return Response(serializer.data)
 
 
+class ThemeUpdateView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
+    def _get_user(self, request):
+        token = request.headers.get('Authorization', '').replace('Bearer ', '').strip()
+        if not token:
+            return None
+        try:
+            return AppUser.objects.get(auth_token=token, is_active=True)
+        except AppUser.DoesNotExist:
+            return None
+
+    def patch(self, request):
+        user = self._get_user(request)
+        if not user:
+            return Response({'error': 'Authentication required.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        valid_hex = lambda v: isinstance(v, str) and len(v) == 7 and v.startswith('#')
+
+        theme_primary = request.data.get('theme_primary')
+        theme_secondary = request.data.get('theme_secondary')
+        theme_background = request.data.get('theme_background')
+
+        if theme_primary is not None:
+            if not valid_hex(theme_primary):
+                return Response({'error': 'theme_primary must be a 7-character hex colour (e.g. #0284c7).'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            user.theme_primary = theme_primary
+
+        if theme_secondary is not None:
+            if not valid_hex(theme_secondary):
+                return Response({'error': 'theme_secondary must be a 7-character hex colour.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            user.theme_secondary = theme_secondary
+
+        if theme_background is not None:
+            if not valid_hex(theme_background):
+                return Response({'error': 'theme_background must be a 7-character hex colour.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            user.theme_background = theme_background
+
+        user.save(update_fields=['theme_primary', 'theme_secondary', 'theme_background'])
+        serializer = AppUserPublicSerializer(user, context={'request': request})
+        return Response(serializer.data)
+
+
 class LogoutView(APIView):
     authentication_classes = []
     permission_classes = [AllowAny]
@@ -118,7 +165,8 @@ class LogoutView(APIView):
                     entity_id=str(user.id),
                     description=f'{user.display_name} logged out',
                 )
-                user.clear_token()
+                # Token is kept alive so other clients (e.g. the cashier app) that
+                # saved the same token are not suddenly de-authenticated.
             except AppUser.DoesNotExist:
                 pass
         return Response({"ok": True})

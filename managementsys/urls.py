@@ -7,6 +7,7 @@ urlpatterns = [
     path('api/auth/login/', views.LoginView.as_view(), name='auth-login'),
     path('api/auth/logout/', views.LogoutView.as_view(), name='auth-logout'),
     path('api/auth/profile/', views.ProfileUpdateView.as_view(), name='auth-profile'),
+    path('api/auth/profile/theme/', views.ThemeUpdateView.as_view(), name='auth-profile-theme'),
 
     # Admin CRUD
     path('api/admin/doctors/', views.DoctorListCreateAdminView.as_view(), name='admin-doctors'),
@@ -65,10 +66,14 @@ urlpatterns = [
     # Invoice
     path('api/invoices/', views.InvoiceListView.as_view(), name='invoice-list'),
     path('api/invoices/create/', views.InvoiceCreateView.as_view(), name='invoice-create'),
+    path('api/invoices/export/', views.InvoiceExportView.as_view(), name='invoice-export'),
+    path('api/invoices/import/', views.InvoiceImportView.as_view(), name='invoice-import'),
     path('api/invoices/<int:pk>/', views.InvoiceDetailView.as_view(), name='invoice-detail'),
 
     # Inventory
     path('api/inventory/items/', views.InventoryItemListCreateView.as_view(), name='inventory-items'),
+    path('api/inventory/items/template/', views.InventoryItemTemplateView.as_view(), name='inventory-items-template'),
+    path('api/inventory/items/import/preview/', views.InventoryItemImportPreviewView.as_view(), name='inventory-items-import-preview'),
     path('api/inventory/items/import/', views.InventoryItemImportView.as_view(), name='inventory-items-import'),
     path('api/inventory/items/<int:pk>/', views.InventoryItemDetailView.as_view(), name='inventory-item-detail'),
     path('api/inventory/warehouses/', views.WarehouseListCreateView.as_view(), name='inventory-warehouses'),

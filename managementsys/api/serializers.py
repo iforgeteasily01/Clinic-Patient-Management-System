@@ -138,7 +138,8 @@ class AppUserPublicSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AppUser
-        fields = ["id", "display_name", "role", "avatar_color", "profile_picture_url"]
+        fields = ["id", "display_name", "role", "avatar_color", "profile_picture_url",
+                  "theme_primary", "theme_secondary", "theme_background"]
 
     def get_profile_picture_url(self, obj):
         if not obj.profile_picture:
@@ -231,6 +232,7 @@ class InventoryItemSerializer(serializers.ModelSerializer):
             'id', 'code', 'name', 'selling_price',
             'unit_small', 'unit_medium', 'unit_medium_qty',
             'unit_large', 'unit_large_qty',
+            'category', 'legal_code',
             'is_active', 'is_service', 'min_stock',
             'created_by_name', 'created_at', 'updated_at', 'total_stock',
         ]
