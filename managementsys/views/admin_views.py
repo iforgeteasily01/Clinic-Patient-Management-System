@@ -1,12 +1,17 @@
 import io
 
 import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 from django.db import transaction
 from django.db.models import Q
+from django.http import HttpResponse
 from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
+_HEADER_FONT = Font(bold=True, color='FFFFFF')
+_HEADER_FILL = PatternFill('solid', fgColor='0284C7')
 
 from ..api.serializers import (
     AppUserAdminSerializer,
@@ -328,7 +333,61 @@ class TreatmentCategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
         instance.delete()
 
 
-# ── Excel import ──────────────────────────────────────────────────────────────
+# ── Excel template + import ───────────────────────────────────────────────────
+
+class TreatmentTemplateView(APIView):
+    """GET — download a blank .xlsx template for bulk treatment import."""
+
+    def get(self, request):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Treatments'
+
+        headers = ['code', 'name', 'category', 'price', 'active']
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font      = _HEADER_FONT
+            cell.fill      = _HEADER_FILL
+            cell.alignment = Alignment(horizontal='center')
+
+        notes = [
+            'Unique treatment code (required)',
+            'Treatment name (required)',
+            'Category name (optional)',
+            'Price in IDR (required, e.g. 150000)',
+            'yes / no (optional, default yes)',
+        ]
+        ws.append(notes)
+        note_font = Font(italic=True, color='595959')
+        for cell in ws[2]:
+            cell.font      = note_font
+            cell.alignment = Alignment(wrap_text=True)
+
+        examples = [
+            ('FC-001', 'Facial Basic',    'Facial',    150000, 'yes'),
+            ('FC-002', 'Facial Premium',  'Facial',    250000, 'yes'),
+            ('SK-001', 'Skin Brightening', 'Skincare', 320000, 'yes'),
+        ]
+        for row in examples:
+            ws.append(list(row))
+
+        col_widths = [16, 30, 20, 16, 12]
+        for i, width in enumerate(col_widths, start=1):
+            ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+
+        ws.row_dimensions[2].height = 36
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        response = HttpResponse(
+            buf.read(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = 'attachment; filename="treatments_template.xlsx"'
+        return response
+
 
 class TreatmentImportView(APIView):
     """
