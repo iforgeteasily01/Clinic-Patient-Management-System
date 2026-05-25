@@ -23,7 +23,7 @@ from .admin_views import (
     DoctorListCreateAdminView, DoctorDetailAdminView,
     PatientListCreateAdminView, PatientDetailAdminView,
     TreatmentListCreateAdminView, TreatmentDetailAdminView,
-    TreatmentImportView,
+    TreatmentImportView, TreatmentTemplateView,
     BeauticianListCreateAdminView, BeauticianDetailAdminView,
     AppUserListCreateAdminView, AppUserDetailAdminView,
     TreatmentCategoryListCreateView, TreatmentCategoryDetailView,
