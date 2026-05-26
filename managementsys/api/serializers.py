@@ -225,6 +225,14 @@ class BillingPatientSerializer(serializers.ModelSerializer):
 class InventoryItemSerializer(serializers.ModelSerializer):
     total_stock = serializers.IntegerField(read_only=True, default=0)
     created_by_name = serializers.SerializerMethodField()
+    item_category_id = serializers.PrimaryKeyRelatedField(
+        source='item_category',
+        queryset=TreatmentCategory.objects.all(),
+        allow_null=True, required=False,
+    )
+    item_category_name = serializers.CharField(
+        source='item_category.name', read_only=True, allow_null=True
+    )
 
     class Meta:
         model = InventoryItem
@@ -232,11 +240,14 @@ class InventoryItemSerializer(serializers.ModelSerializer):
             'id', 'code', 'name', 'selling_price',
             'unit_small', 'unit_medium', 'unit_medium_qty',
             'unit_large', 'unit_large_qty',
-            'category', 'legal_code',
+            'category', 'item_category_id', 'item_category_name', 'legal_code',
             'is_active', 'is_service', 'min_stock',
             'created_by_name', 'created_at', 'updated_at', 'total_stock',
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at', 'created_by_name', 'total_stock', 'is_service']
+        read_only_fields = [
+            'id', 'created_at', 'updated_at', 'created_by_name',
+            'total_stock', 'is_service', 'item_category_name',
+        ]
 
     def get_created_by_name(self, obj):
         return obj.created_by.display_name if obj.created_by_id else None
@@ -336,21 +347,25 @@ class MedRecHistorySerializer(serializers.ModelSerializer):
 # ── Invoice ────────────────────────────────────────────────────────────────
 
 class InvoiceItemInputSerializer(serializers.Serializer):
-    item_id  = serializers.IntegerField()
-    quantity = serializers.DecimalField(max_digits=14, decimal_places=3)
-    price    = serializers.DecimalField(max_digits=14, decimal_places=2)
+    item_id      = serializers.IntegerField(required=False, allow_null=True)
+    item_name    = serializers.CharField(required=False, allow_blank=True, default='')
+    quantity     = serializers.DecimalField(max_digits=14, decimal_places=3)
+    price        = serializers.DecimalField(max_digits=14, decimal_places=2)
+    discount_pct = serializers.DecimalField(max_digits=5, decimal_places=2, default=0)
 
 
 class InvoiceCreateSerializer(serializers.Serializer):
     datetime           = serializers.DateTimeField(required=False)
     patient_no         = serializers.CharField(required=False, allow_null=True, allow_blank=True)
-    payment_method_id  = serializers.IntegerField()
+    payment_method_id  = serializers.IntegerField(required=False, allow_null=True)
     discount           = serializers.DecimalField(max_digits=14, decimal_places=2, default=0)
     cashier_id         = serializers.IntegerField(required=False, allow_null=True)
     warehouse_id       = serializers.IntegerField(required=False, allow_null=True)
     tax                = serializers.DecimalField(max_digits=14, decimal_places=2, default=0)
     additional_charges = serializers.DecimalField(max_digits=14, decimal_places=2, default=0)
     grand_total        = serializers.DecimalField(max_digits=14, decimal_places=2)
+    notes              = serializers.CharField(required=False, allow_blank=True, default='')
+    promotion_code     = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     items              = InvoiceItemInputSerializer(many=True)
 
     def validate_items(self, value):
@@ -378,12 +393,19 @@ class InvoiceUpdateSerializer(serializers.Serializer):
 
 
 class InvoiceItemReadSerializer(serializers.ModelSerializer):
-    item_code = serializers.CharField(source='item.code', read_only=True)
-    item_name = serializers.CharField(source='item.name', read_only=True)
+    item_code    = serializers.SerializerMethodField()
+    item_name    = serializers.SerializerMethodField()
+    discount_pct = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
+
+    def get_item_code(self, obj):
+        return obj.item.code if obj.item_id else ''
+
+    def get_item_name(self, obj):
+        return obj.item.name if obj.item_id else obj.item_name
 
     class Meta:
         model = InvoiceItem
-        fields = ['id', 'item_id', 'item_code', 'item_name', 'quantity', 'price']
+        fields = ['id', 'item_id', 'item_code', 'item_name', 'quantity', 'price', 'discount_pct']
 
 
 class InvoiceReadSerializer(serializers.ModelSerializer):
@@ -473,11 +495,14 @@ class TreatmentCategorySerializer(serializers.ModelSerializer):
     revenue_account_number = serializers.IntegerField(
         source='revenue_account.account_number', read_only=True, allow_null=True
     )
+    cogs_account_number = serializers.IntegerField(
+        source='cogs_account.account_number', read_only=True, allow_null=True
+    )
 
     class Meta:
         model = TreatmentCategory
-        fields = ['id', 'name', 'revenue_account_number']
-        read_only_fields = ['id', 'revenue_account_number']
+        fields = ['id', 'name', 'revenue_account_number', 'cogs_account_number']
+        read_only_fields = ['id', 'revenue_account_number', 'cogs_account_number']
 
 
 # ── AppUser Admin ──────────────────────────────────────────────────────────

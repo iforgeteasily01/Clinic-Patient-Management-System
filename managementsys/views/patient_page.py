@@ -36,10 +36,11 @@ class PatientCreateWithActiveView(APIView):
 
         patient = patient_serializer.save()
 
+        consult_status = bool(request.data.get('consult_status', False))
         active_patient_data = {
             'patient_no': patient.patient_no,
-            'status': 1,
-            'consult_status': request.data.get('consult_status', False)
+            'status': 1 if consult_status else 3,
+            'consult_status': consult_status,
         }
         active_serializer = ActivePatientSerializer(data=active_patient_data)
         if active_serializer.is_valid():
@@ -100,7 +101,7 @@ class AppointmentAddView(APIView):
 
         active_patient = ActivePatient.objects.create(
             patient_no=patient,
-            status=1,
+            status=1 if consult_status else 3,
             consult_status=consult_status,
         )
 
@@ -138,7 +139,7 @@ class GeneralAppointmentCreateView(APIView):
         active_patient = ActivePatient.objects.create(
             patient_no=None,
             guest_name=guest_name,
-            status=1,
+            status=1 if consult_status else 3,
             consult_status=consult_status,
         )
 

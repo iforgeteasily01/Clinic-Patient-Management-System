@@ -4,6 +4,7 @@ from decimal import Decimal
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from django.db import transaction
+from django.db import models
 from django.db.models import Sum, Value
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
@@ -37,6 +38,10 @@ class InventoryItemListCreateView(APIView):
         ).filter(is_service=False)
         if request.GET.get('active_only') == '1':
             qs = qs.filter(is_active=True)
+        if search := request.GET.get('search', '').strip():
+            qs = qs.filter(
+                models.Q(code__icontains=search) | models.Q(name__icontains=search)
+            )
         return Response(InventoryItemSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -303,7 +308,7 @@ class StockOutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        shortfall = _fifo_deduct(item.id, warehouse.id, qty_small)
+        shortfall, _cogs = _fifo_deduct(item.id, warehouse.id, qty_small)
         if shortfall > 0:
             return Response(
                 {'error': 'Stock deduction failed due to a concurrent modification.'},
@@ -385,7 +390,8 @@ def _to_small(item: InventoryItem, qty: int, unit: str) -> int:
 
 
 @transaction.atomic
-def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> int:
+def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> tuple:
+    """Deduct stock FIFO. Returns (shortfall, cogs_amount). shortfall=0 means fully deducted."""
     batches = (
         InventoryBatch.objects
         .select_for_update()
@@ -393,14 +399,17 @@ def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> int:
         .order_by('input_date', 'created_at')
     )
     remaining = quantity
+    cogs = Decimal('0')
     for batch in batches:
         if remaining <= 0:
             break
         deduct = min(batch.quantity_remaining, remaining)
+        if batch.quantity_initial:
+            cogs += (batch.value / Decimal(batch.quantity_initial)) * deduct
         batch.quantity_remaining -= deduct
         batch.save(update_fields=['quantity_remaining'])
         remaining -= deduct
-    return remaining  # 0 = fully deducted; >0 = shortfall
+    return remaining, cogs
 
 
 # ── Excel template + import ───────────────────────────────────────────────────

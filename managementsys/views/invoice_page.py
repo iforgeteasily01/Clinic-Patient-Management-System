@@ -4,6 +4,7 @@ from decimal import Decimal, InvalidOperation
 
 import openpyxl
 from django.db import transaction
+from django.db.models import F
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
@@ -14,6 +15,7 @@ from rest_framework.views import APIView
 from ..api.serializers import InvoiceCreateSerializer, InvoiceReadSerializer, InvoiceUpdateSerializer
 from ..models import AppUser, AuditLog, ChartOfAccounts, InventoryItem, Invoice, InvoiceItem, Patient, PromotionUsage, Warehouse
 from .crm_page import refresh_crm_profile
+from .inventory_page import _fifo_deduct
 from .promotion_page import validate_promotion
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,55 @@ ITEM_HEADERS = ['invoice_number','item_code','item_name','quantity','price']
 
 def _actor(request):
     return request.user if isinstance(request.user, AppUser) else None
+
+
+def _post_accounting(invoice, line_items, items_by_id):
+    """
+    Post accounting entries for a completed invoice:
+      - Cash/payment account  += grand_total
+      - Per line: revenue account for the item's category += price * qty
+      - Per physical line (is_service=False): FIFO deduct stock, then
+        inventory asset -= COGS, COGS account += COGS
+    Falls back to system accounts (4200000, 5100000, 1300000) when an item
+    has no item_category assigned.
+    """
+    if invoice.payment_method_id:
+        ChartOfAccounts.objects.filter(pk=invoice.payment_method_id).update(
+            balance=F('balance') + invoice.grand_total
+        )
+
+    fallback_revenue = ChartOfAccounts.objects.filter(account_number=4200000).first()
+    fallback_cogs = ChartOfAccounts.objects.filter(account_number=5100000).first()
+    inventory_asset = ChartOfAccounts.objects.filter(account_number=1300000).first()
+
+    for line in line_items:
+        if not line.get('item_id'):
+            continue
+        item = items_by_id[line['item_id']]
+        line_revenue = line['price'] * line['quantity']
+        cat = item.item_category
+
+        revenue_acct = (cat.revenue_account if cat and cat.revenue_account_id else fallback_revenue)
+        cogs_acct = (cat.cogs_account if cat and cat.cogs_account_id else fallback_cogs)
+
+        if revenue_acct:
+            ChartOfAccounts.objects.filter(pk=revenue_acct.pk).update(
+                balance=F('balance') + line_revenue
+            )
+
+        if not item.is_service and invoice.warehouse_id:
+            qty_int = int(line['quantity'].to_integral_value())
+            if qty_int > 0:
+                _shortfall, cogs_amount = _fifo_deduct(item.id, invoice.warehouse_id, qty_int)
+                if cogs_amount > 0:
+                    if inventory_asset:
+                        ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
+                            balance=F('balance') - cogs_amount
+                        )
+                    if cogs_acct:
+                        ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
+                            balance=F('balance') + cogs_amount
+                        )
 
 
 class InvoiceCreateView(APIView):
@@ -78,24 +129,29 @@ class InvoiceCreateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        try:
-            payment_account = ChartOfAccounts.objects.get(
-                id=data['payment_method_id'],
-                account_number__gte=1100000,
-                account_number__lte=1199999,
-            )
-        except ChartOfAccounts.DoesNotExist:
-            return Response(
-                {'payment_method_id': 'Cash/cash-equivalent account not found.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        payment_account = None
+        if data.get('payment_method_id'):
+            try:
+                payment_account = ChartOfAccounts.objects.get(
+                    id=data['payment_method_id'],
+                    account_number__gte=1100000,
+                    account_number__lte=1199999,
+                )
+            except ChartOfAccounts.DoesNotExist:
+                return Response(
+                    {'payment_method_id': 'Cash/cash-equivalent account not found.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        # ── Validate all items exist before writing anything ──────────────────
+        # ── Validate all inventory items exist before writing anything ────────
 
-        item_ids = [i['item_id'] for i in data['items']]
+        item_ids = [i['item_id'] for i in data['items'] if i.get('item_id')]
         items_by_id = {
             obj.id: obj
-            for obj in InventoryItem.objects.filter(id__in=item_ids)
+            for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
+                'item_category__revenue_account',
+                'item_category__cogs_account',
+            )
         }
         missing = [iid for iid in item_ids if iid not in items_by_id]
         if missing:
@@ -116,6 +172,8 @@ class InvoiceCreateView(APIView):
             tax=data['tax'],
             additional_charges=data['additional_charges'],
             grand_total=data['grand_total'],
+            notes=data.get('notes', ''),
+            promotion_code=(data.get('promotion_code') or '').strip(),
         )
 
         # ── Create InvoiceItems ───────────────────────────────────────────────
@@ -123,12 +181,18 @@ class InvoiceCreateView(APIView):
         InvoiceItem.objects.bulk_create([
             InvoiceItem(
                 invoice=invoice,
-                item=items_by_id[i['item_id']],
+                item=items_by_id[i['item_id']] if i.get('item_id') else None,
+                item_name=i.get('item_name', '') if not i.get('item_id') else '',
                 quantity=i['quantity'],
                 price=i['price'],
+                discount_pct=i.get('discount_pct', 0),
             )
             for i in data['items']
         ])
+
+        # ── Accounting + stock deduction ──────────────────────────────────────
+
+        _post_accounting(invoice, data['items'], items_by_id)
 
         AuditLog.objects.create(
             performed_by=_actor(request),

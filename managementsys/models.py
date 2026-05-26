@@ -262,6 +262,12 @@ class InventoryItem(models.Model):
     unit_large = models.CharField(max_length=30, blank=True, default='')
     unit_large_qty = models.PositiveIntegerField(null=True, blank=True)  # medium per 1 large
     category = models.CharField(max_length=100, blank=True, default='')
+    item_category = models.ForeignKey(
+        'TreatmentCategory',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='inventory_items',
+    )
     legal_code = models.CharField(max_length=100, null=True, blank=True)
     is_active = models.BooleanField(default=True)
     is_service = models.BooleanField(default=False)  # True for treatment-backed non-stock items
@@ -374,6 +380,8 @@ class Invoice(models.Model):
     additional_charges = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     grand_total        = models.DecimalField(max_digits=14, decimal_places=2)
     promotion          = models.ForeignKey('Promotion', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoices')
+    notes              = models.CharField(max_length=500, blank=True, default='')
+    promotion_code     = models.CharField(max_length=50, blank=True, default='')
 
     class Meta:
         ordering = ['-datetime']
@@ -391,10 +399,12 @@ class Invoice(models.Model):
 
 
 class InvoiceItem(models.Model):
-    invoice  = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='items')
-    item     = models.ForeignKey('InventoryItem', on_delete=models.PROTECT, related_name='invoice_items')
-    quantity = models.DecimalField(max_digits=14, decimal_places=3)
-    price    = models.DecimalField(max_digits=14, decimal_places=2)
+    invoice      = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='items')
+    item         = models.ForeignKey('InventoryItem', on_delete=models.PROTECT, null=True, blank=True, related_name='invoice_items')
+    item_name    = models.CharField(max_length=255, blank=True, default='')
+    quantity     = models.DecimalField(max_digits=14, decimal_places=3)
+    price        = models.DecimalField(max_digits=14, decimal_places=2)
+    discount_pct = models.DecimalField(max_digits=5, decimal_places=2, default=0)
 
     class Meta:
         ordering = ['id']
@@ -411,6 +421,12 @@ class TreatmentCategory(models.Model):
         on_delete=models.SET_NULL,
         related_name='treatment_category',
     )
+    cogs_account = models.OneToOneField(
+        'ChartOfAccounts',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='cogs_category',
+    )
 
     class Meta:
         ordering = ['name']
@@ -421,25 +437,44 @@ class TreatmentCategory(models.Model):
 
     def save(self, *args, **kwargs):
         is_new = self.pk is None
-        if is_new and not self.revenue_account_id:
-            max_num = (
-                ChartOfAccounts.objects
-                .filter(account_number__gte=4400000, account_number__lte=4999999)
-                .aggregate(m=Max('account_number'))['m']
-            )
-            next_num = (max_num + 1000) if max_num is not None else 4400000
-            if next_num > 4999999:
-                raise ValueError('Revenue account range 4400000–4999999 is exhausted.')
-            account = ChartOfAccounts.objects.create(
-                account_number=next_num,
-                name=f'Treatment Revenue – {self.name}',
-                account_type='revenue',
-            )
-            self.revenue_account = account
-        elif not is_new and self.revenue_account_id:
-            ChartOfAccounts.objects.filter(pk=self.revenue_account_id).update(
-                name=f'Treatment Revenue – {self.name}',
-            )
+        if is_new:
+            if not self.revenue_account_id:
+                max_num = (
+                    ChartOfAccounts.objects
+                    .filter(account_number__gte=4400000, account_number__lte=4999999)
+                    .aggregate(m=Max('account_number'))['m']
+                )
+                next_num = (max_num + 1000) if max_num is not None else 4400000
+                if next_num > 4999999:
+                    raise ValueError('Revenue account range 4400000–4999999 is exhausted.')
+                self.revenue_account = ChartOfAccounts.objects.create(
+                    account_number=next_num,
+                    name=f'Treatment Revenue – {self.name}',
+                    account_type='revenue',
+                )
+            if not self.cogs_account_id:
+                max_num = (
+                    ChartOfAccounts.objects
+                    .filter(account_number__gte=5400000, account_number__lte=5999999)
+                    .aggregate(m=Max('account_number'))['m']
+                )
+                next_num = (max_num + 1000) if max_num is not None else 5400000
+                if next_num > 5999999:
+                    raise ValueError('COGS account range 5400000–5999999 is exhausted.')
+                self.cogs_account = ChartOfAccounts.objects.create(
+                    account_number=next_num,
+                    name=f'COGS – {self.name}',
+                    account_type='cogs',
+                )
+        else:
+            if self.revenue_account_id:
+                ChartOfAccounts.objects.filter(pk=self.revenue_account_id).update(
+                    name=f'Treatment Revenue – {self.name}',
+                )
+            if self.cogs_account_id:
+                ChartOfAccounts.objects.filter(pk=self.cogs_account_id).update(
+                    name=f'COGS – {self.name}',
+                )
         super().save(*args, **kwargs)
 
 
