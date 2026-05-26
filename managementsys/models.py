@@ -133,8 +133,22 @@ class patientStatus(models.Model):
 # Treatment
 
 
+class TreatmentQuerySet(models.QuerySet):
+    def delete(self):
+        catalog_ids = list(
+            self.filter(catalog_item_id__isnull=False)
+                .values_list('catalog_item_id', flat=True)
+        )
+        result = super().delete()
+        if catalog_ids:
+            InventoryItem.objects.filter(pk__in=catalog_ids, is_service=True).delete()
+        return result
+
+
 class Treatment(models.Model):
-    code = models.CharField(max_length=20, unique=True)
+    objects = TreatmentQuerySet.as_manager()
+
+    code = models.CharField(max_length=60, unique=True)
     name = models.CharField(max_length=100)
     category = models.CharField(max_length=50)
     price = models.DecimalField(max_digits=12, decimal_places=2)
@@ -142,7 +156,7 @@ class Treatment(models.Model):
     catalog_item = models.OneToOneField(
         'InventoryItem',
         null=True, blank=True,
-        on_delete=models.SET_NULL,
+        on_delete=models.PROTECT,
         related_name='treatment',
     )
 

@@ -395,8 +395,57 @@ class TreatmentImportView(APIView):
     Columns (row 1 = header, skipped):
       code | name | category | price | active
     active: yes/true/1 → True; no/false/0 → False; blank → True
-    Returns { created, updated, errors: [{row, message}] }
+
+    ?preview=true  — parse only, no DB writes.
+      Returns { rows: [{row, code, name, category, price, active, action, error}] }
+      action: 'create' | 'update' | 'error'
+
+    Normal POST — commits all valid rows.
+      Returns { created, updated, errors: [{row, message}] }
     """
+
+    @staticmethod
+    def _parse_rows(ws_rows):
+        """Parse worksheet rows (skipping header) into a list of dicts."""
+        result = []
+        for i, row in enumerate(ws_rows[1:], start=2):
+            padded = list(row) + [None] * 5
+            code       = str(padded[0]).strip() if padded[0] is not None else ''
+            name       = str(padded[1]).strip() if padded[1] is not None else ''
+            category   = str(padded[2]).strip() if padded[2] is not None else ''
+            price_raw  = padded[3]
+            active_raw = padded[4]
+
+            error = None
+            price = None
+
+            if not code:
+                error = 'Code is required.'
+            elif not name:
+                error = 'Name is required.'
+            else:
+                try:
+                    price = float(price_raw) if price_raw not in (None, '') else None
+                    if price is None:
+                        raise ValueError
+                except (ValueError, TypeError):
+                    error = f'Invalid price "{price_raw}".'
+
+            if active_raw is None or str(active_raw).strip() == '':
+                active = True
+            else:
+                active = str(active_raw).strip().lower() in ('yes', 'true', '1')
+
+            result.append({
+                'row': i,
+                'code': code,
+                'name': name,
+                'category': category,
+                'price': price,
+                'active': active,
+                'error': error,
+            })
+        return result
 
     def post(self, request):
         uploaded = request.FILES.get('file')
@@ -409,45 +458,57 @@ class TreatmentImportView(APIView):
             return Response({'error': 'Could not parse file. Upload a valid .xlsx file.'}, status=status.HTTP_400_BAD_REQUEST)
 
         ws = wb.active
-        rows = list(ws.iter_rows(values_only=True))
-        if not rows:
+        ws_rows = list(ws.iter_rows(values_only=True))
+        if not ws_rows:
             return Response({'error': 'File is empty.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        parsed = self._parse_rows(ws_rows)
+
+        # ── Preview mode ────────────────────────────────────────────────────
+        if request.query_params.get('preview') == 'true':
+            existing_codes = set(
+                Treatment.objects.filter(
+                    code__in=[r['code'] for r in parsed if not r['error']]
+                ).values_list('code', flat=True)
+            )
+            rows = []
+            for r in parsed:
+                if r['error']:
+                    action = 'error'
+                elif r['code'] in existing_codes:
+                    action = 'update'
+                else:
+                    action = 'create'
+                rows.append({
+                    'row':      r['row'],
+                    'code':     r['code'],
+                    'name':     r['name'],
+                    'category': r['category'],
+                    'price':    r['price'],
+                    'active':   r['active'],
+                    'action':   action,
+                    'error':    r['error'],
+                })
+            return Response({'rows': rows}, status=status.HTTP_200_OK)
+
+        # ── Commit mode ──────────────────────────────────────────────────────
         created = updated = 0
         errors = []
 
-        for i, row in enumerate(rows[1:], start=2):
-            padded = list(row) + [None] * 5
-            code      = str(padded[0]).strip() if padded[0] is not None else ''
-            name      = str(padded[1]).strip() if padded[1] is not None else ''
-            category  = str(padded[2]).strip() if padded[2] is not None else ''
-            price_raw = padded[3]
-            active_raw = padded[4]
-
-            if not code:
-                errors.append({'row': i, 'message': 'Code is required.'})
+        for r in parsed:
+            if r['error']:
+                errors.append({'row': r['row'], 'message': r['error']})
                 continue
-            if not name:
-                errors.append({'row': i, 'message': f'Row {i}: name is required.'})
-                continue
-            try:
-                price = float(price_raw) if price_raw not in (None, '') else None
-                if price is None:
-                    raise ValueError
-            except (ValueError, TypeError):
-                errors.append({'row': i, 'message': f'Row {i}: invalid price "{price_raw}".'})
-                continue
-
-            if active_raw is None or str(active_raw).strip() == '':
-                active = True
-            else:
-                active = str(active_raw).strip().lower() in ('yes', 'true', '1')
-
             try:
                 with transaction.atomic():
                     obj, was_created = Treatment.objects.update_or_create(
-                        code=code,
-                        defaults={'name': name, 'category': category, 'price': price, 'active': active},
+                        code=r['code'],
+                        defaults={
+                            'name':     r['name'],
+                            'category': r['category'],
+                            'price':    r['price'],
+                            'active':   r['active'],
+                        },
                     )
                     AuditLog.objects.create(
                         performed_by=_actor(request),
@@ -461,6 +522,6 @@ class TreatmentImportView(APIView):
                 else:
                     updated += 1
             except Exception as exc:
-                errors.append({'row': i, 'message': f'Row {i}: {exc}'})
+                errors.append({'row': r['row'], 'message': str(exc)})
 
         return Response({'created': created, 'updated': updated, 'errors': errors}, status=status.HTTP_200_OK)
