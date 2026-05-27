@@ -685,6 +685,139 @@ class AttendanceRecord(models.Model):
         return f'{self.staff} – {self.date} ({self.status})'
 
 
+# ── Treatment Packages ─────────────────────────────────────────────────────
+# A TreatmentPackage bundles a fixed number of treatment sessions sold for a
+# single upfront price. Sale → PatientPackage row. Each visit that uses a
+# session creates a PatientPackageRedemption (and a Rp 0 invoice line so the
+# audit trail stays consistent).
+
+
+class TreatmentPackage(models.Model):
+    code            = models.CharField(max_length=60, unique=True)
+    name            = models.CharField(max_length=150)
+    description     = models.TextField(blank=True, default='')
+    price           = models.DecimalField(max_digits=12, decimal_places=2)
+    active          = models.BooleanField(default=True)
+    catalog_item    = models.OneToOneField(
+        'InventoryItem',
+        null=True, blank=True,
+        on_delete=models.PROTECT,
+        related_name='treatment_package',
+    )
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def total_sessions(self):
+        return sum(i.sessions for i in self.items.all())
+
+    def _category_for_catalog(self):
+        first = self.items.select_related('treatment').first()
+        if not first:
+            return ''
+        return first.treatment.category
+
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        super().save(*args, **kwargs)
+        if is_new or not self.catalog_item_id:
+            item = InventoryItem.objects.create(
+                code=self.code,
+                name=self.name,
+                selling_price=self.price,
+                unit_small='package',
+                is_service=True,
+                is_active=self.active,
+                min_stock=0,
+                category=self._category_for_catalog(),
+            )
+            TreatmentPackage.objects.filter(pk=self.pk).update(catalog_item=item)
+            self.catalog_item_id = item.pk
+        else:
+            InventoryItem.objects.filter(pk=self.catalog_item_id).update(
+                code=self.code,
+                name=self.name,
+                selling_price=self.price,
+                is_active=self.active,
+            )
+
+    def delete(self, *args, **kwargs):
+        catalog_item_id = self.catalog_item_id
+        super().delete(*args, **kwargs)
+        if catalog_item_id:
+            InventoryItem.objects.filter(pk=catalog_item_id, is_service=True).delete()
+
+
+class TreatmentPackageItem(models.Model):
+    package   = models.ForeignKey(TreatmentPackage, on_delete=models.CASCADE, related_name='items')
+    treatment = models.ForeignKey(Treatment, on_delete=models.PROTECT, related_name='package_items')
+    sessions  = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        unique_together = [('package', 'treatment')]
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.package.name} · {self.treatment.name} ×{self.sessions}'
+
+
+class PatientPackage(models.Model):
+    STATUS_CHOICES = [
+        ('active',     'Active'),
+        ('exhausted',  'Exhausted'),
+    ]
+
+    patient            = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name='packages')
+    package            = models.ForeignKey(TreatmentPackage, on_delete=models.PROTECT, related_name='patient_packages')
+    purchased_invoice  = models.ForeignKey(Invoice, on_delete=models.SET_NULL, null=True, blank=True, related_name='packages_sold')
+    purchased_at       = models.DateTimeField(auto_now_add=True)
+    status             = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
+
+    class Meta:
+        ordering = ['-purchased_at']
+
+    def __str__(self):
+        return f'{self.patient_id} · {self.package.name} ({self.status})'
+
+    def remaining_for(self, treatment_id):
+        """Sessions left for a specific treatment in this package."""
+        entitled = (
+            self.package.items
+            .filter(treatment_id=treatment_id)
+            .aggregate(s=Sum('sessions'))['s'] or 0
+        )
+        used = self.redemptions.filter(treatment_id=treatment_id).count()
+        return max(entitled - used, 0)
+
+    def total_remaining(self):
+        entitled = self.package.total_sessions
+        used = self.redemptions.count()
+        return max(entitled - used, 0)
+
+    def refresh_status(self):
+        new_status = 'exhausted' if self.total_remaining() == 0 else 'active'
+        if new_status != self.status:
+            self.status = new_status
+            self.save(update_fields=['status'])
+
+
+class PatientPackageRedemption(models.Model):
+    patient_package = models.ForeignKey(PatientPackage, on_delete=models.CASCADE, related_name='redemptions')
+    treatment       = models.ForeignKey(Treatment, on_delete=models.PROTECT, related_name='package_redemptions')
+    invoice         = models.ForeignKey(Invoice, on_delete=models.SET_NULL, null=True, blank=True, related_name='package_redemptions')
+    redeemed_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-redeemed_at']
+
+    def __str__(self):
+        return f'{self.patient_package_id} · {self.treatment.name} @ {self.redeemed_at:%Y-%m-%d}'
+
+
 #####
 # END#
 #####

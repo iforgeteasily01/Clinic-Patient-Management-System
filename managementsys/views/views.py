@@ -24,11 +24,13 @@ from .admin_views import (
     PatientListCreateAdminView, PatientDetailAdminView,
     TreatmentListCreateAdminView, TreatmentDetailAdminView,
     TreatmentImportView, TreatmentTemplateView,
+    TreatmentPackageListCreateAdminView, TreatmentPackageDetailAdminView,
     BeauticianListCreateAdminView, BeauticianDetailAdminView,
     AppUserListCreateAdminView, AppUserDetailAdminView,
     TreatmentCategoryListCreateView, TreatmentCategoryDetailView,
     ChartOfAccountsListCreateView, ChartOfAccountsDetailView,
 )
+from .package_page import PatientPackagesView
 from .medical_record_page import MedRecByPatientNoView
 from .photo_page import PatientPhotoUploadView, PatientPhotoListView
 from .medical_record_history import MedRecHistoryListView, MedRecHistoryDetailView

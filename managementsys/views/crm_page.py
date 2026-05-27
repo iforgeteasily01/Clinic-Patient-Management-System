@@ -69,6 +69,7 @@ class PatientCRMListView(APIView):
         qs = (
             Patient.objects
             .select_related('crm_profile__tier')
+            .annotate(active_packages_count=Count('packages', filter=Q(packages__status='active')))
             .order_by('name')
         )
 
@@ -257,6 +258,9 @@ def _serialize_crm_row(patient):
     tier = None
     if crm and crm.tier_id:
         tier = {'name': crm.tier.name, 'color_hex': crm.tier.color_hex}
+    active_packages = getattr(patient, 'active_packages_count', None)
+    if active_packages is None:
+        active_packages = patient.packages.filter(status='active').count()
     return {
         'patient_no': patient.patient_no,
         'name': patient.name,
@@ -265,4 +269,5 @@ def _serialize_crm_row(patient):
         'total_spend': str(crm.total_spend) if crm else '0.00',
         'total_visits': crm.total_visits if crm else 0,
         'last_visit_date': str(crm.last_visit_date) if (crm and crm.last_visit_date) else None,
+        'active_packages': active_packages,
     }

@@ -13,7 +13,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..api.serializers import InvoiceCreateSerializer, InvoiceReadSerializer, InvoiceUpdateSerializer
-from ..models import AppUser, AuditLog, ChartOfAccounts, InventoryItem, Invoice, InvoiceItem, Patient, PromotionUsage, Warehouse
+from ..models import (
+    AppUser, AuditLog, ChartOfAccounts, InventoryItem, Invoice, InvoiceItem,
+    Patient, PatientPackage, PatientPackageRedemption, PromotionUsage,
+    Treatment, TreatmentPackage, Warehouse,
+)
 from .crm_page import refresh_crm_profile
 from .inventory_page import _fifo_deduct
 from .promotion_page import validate_promotion
@@ -84,6 +88,71 @@ def _post_accounting(invoice, line_items, items_by_id):
                         ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
                             balance=F('balance') + cogs_amount
                         )
+
+
+def _handle_packages(invoice, patient, line_items, items_by_id):
+    """Process package sales and redemptions for a saved invoice.
+
+    Silently skips redemptions whose package has no remaining sessions for the
+    requested treatment — the line still posts at the price the cashier sent
+    (cashier sees remaining count in the UI, so this is a defensive fallback,
+    not an authorization check).
+    """
+    # ── Sales ──
+    if patient is not None:
+        package_by_catalog = {
+            tp.catalog_item_id: tp
+            for tp in TreatmentPackage.objects.filter(
+                catalog_item_id__in=[i for i in items_by_id]
+            )
+        }
+        for line in line_items:
+            if not line.get('item_id'):
+                continue
+            tp = package_by_catalog.get(line['item_id'])
+            if not tp:
+                continue
+            qty = int(line['quantity'].to_integral_value())
+            for _ in range(max(qty, 0)):
+                PatientPackage.objects.create(
+                    patient=patient,
+                    package=tp,
+                    purchased_invoice=invoice,
+                )
+
+    # ── Redemptions ──
+    touched = set()
+    for line in line_items:
+        pp_id = line.get('redeem_patient_package_id')
+        treatment_id = line.get('treatment_id')
+        if not pp_id or not treatment_id:
+            continue
+        try:
+            pp = PatientPackage.objects.select_related('package').get(pk=pp_id)
+        except PatientPackage.DoesNotExist:
+            continue
+        if pp.remaining_for(treatment_id) <= 0:
+            continue
+        try:
+            treatment = Treatment.objects.get(pk=treatment_id)
+        except Treatment.DoesNotExist:
+            continue
+        qty = max(int(line['quantity'].to_integral_value()), 1)
+        for _ in range(qty):
+            if pp.remaining_for(treatment_id) <= 0:
+                break
+            PatientPackageRedemption.objects.create(
+                patient_package=pp,
+                treatment=treatment,
+                invoice=invoice,
+            )
+        touched.add(pp.id)
+
+    for pp_id in touched:
+        try:
+            PatientPackage.objects.get(pk=pp_id).refresh_status()
+        except PatientPackage.DoesNotExist:
+            pass
 
 
 class InvoiceCreateView(APIView):
@@ -193,6 +262,13 @@ class InvoiceCreateView(APIView):
         # ── Accounting + stock deduction ──────────────────────────────────────
 
         _post_accounting(invoice, data['items'], items_by_id)
+
+        # ── Treatment Packages: sales + redemptions ───────────────────────────
+        # Sale: any line whose item is a TreatmentPackage.catalog_item creates
+        #   one PatientPackage per quantity (rounded down).
+        # Redemption: any line with redeem_patient_package_id consumes one
+        #   session from that PatientPackage for the given treatment.
+        _handle_packages(invoice, patient, data['items'], items_by_id)
 
         AuditLog.objects.create(
             performed_by=_actor(request),

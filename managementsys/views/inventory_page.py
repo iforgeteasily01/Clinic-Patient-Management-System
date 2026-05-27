@@ -35,7 +35,11 @@ class InventoryItemListCreateView(APIView):
     def get(self, request):
         qs = InventoryItem.objects.annotate(
             total_stock=Coalesce(Sum('batches__quantity_remaining'), Value(0))
-        ).filter(is_service=False)
+        )
+        # Inventory admin pages pass stock_only=1 to hide service mirror items.
+        # The POS omits this flag so package mirror items are scannable by code.
+        if request.GET.get('stock_only') == '1':
+            qs = qs.filter(is_service=False)
         if request.GET.get('active_only') == '1':
             qs = qs.filter(is_active=True)
         if search := request.GET.get('search', '').strip():

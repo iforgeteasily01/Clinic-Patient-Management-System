@@ -20,9 +20,13 @@ from ..api.serializers import (
     DoctorsSerializer,
     PatientSerializer,
     TreatmentCategorySerializer,
+    TreatmentPackageSerializer,
     TreatmentSerializer,
 )
-from ..models import AppUser, AuditLog, Beauticians, ChartOfAccounts, Doctors, Patient, Treatment, TreatmentCategory
+from ..models import (
+    AppUser, AuditLog, Beauticians, ChartOfAccounts, Doctors, Patient,
+    Treatment, TreatmentCategory, TreatmentPackage,
+)
 
 
 def _actor(request):
@@ -525,3 +529,46 @@ class TreatmentImportView(APIView):
                 errors.append({'row': r['row'], 'message': str(exc)})
 
         return Response({'created': created, 'updated': updated, 'errors': errors}, status=status.HTTP_200_OK)
+
+
+# ── Treatment Packages ─────────────────────────────────────────────────────
+
+class TreatmentPackageListCreateAdminView(generics.ListCreateAPIView):
+    queryset = TreatmentPackage.objects.prefetch_related('items__treatment').order_by('name')
+    serializer_class = TreatmentPackageSerializer
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        AuditLog.objects.create(
+            performed_by=_actor(self.request),
+            action='CREATE',
+            entity_type='TreatmentPackage',
+            entity_id=str(instance.id),
+            description=f'Package added: {instance.name} ({instance.code})',
+        )
+
+
+class TreatmentPackageDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = TreatmentPackage.objects.prefetch_related('items__treatment')
+    serializer_class = TreatmentPackageSerializer
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        AuditLog.objects.create(
+            performed_by=_actor(self.request),
+            action='UPDATE',
+            entity_type='TreatmentPackage',
+            entity_id=str(instance.id),
+            description=f'Package updated: {instance.name} ({instance.code})',
+        )
+
+    def perform_destroy(self, instance):
+        AuditLog.objects.create(
+            performed_by=_actor(self.request),
+            action='DELETE',
+            entity_type='TreatmentPackage',
+            entity_id=str(instance.id),
+            description=f'Package deleted: {instance.name} ({instance.code})',
+        )
+        instance.delete()
+

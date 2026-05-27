@@ -5,8 +5,9 @@ from rest_framework import serializers
 from ..models import (
     ActivePatient, AppUser, AssessmentCode, AttendanceRecord, Beauticians, ChartOfAccounts,
     Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem, MedRec, Patient,
-    PatientCRMProfile, PatientNote, PatientPhoto, PatientTier, Promotion, SoapTemplate,
-    StaffSchedule, Treatment, TreatmentCategory, TreatmentSession, Warehouse, WorkShift,
+    PatientCRMProfile, PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto,
+    PatientTier, Promotion, SoapTemplate, StaffSchedule, Treatment, TreatmentCategory,
+    TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift,
     patientStatus,
 )
 
@@ -168,9 +169,23 @@ class SoapTemplateSerializer(serializers.ModelSerializer):
 # ── Billing ────────────────────────────────────────────────────────────────
 
 class BillingTreatmentSerializer(serializers.ModelSerializer):
+    """Includes package_coverage if the patient (from context) has an active
+    package with sessions remaining for this treatment.
+
+    `package_coverage` shape: { patient_package_id, package_name, remaining }
+    """
+    package_coverage = serializers.SerializerMethodField()
+
     class Meta:
         model = Treatment
-        fields = ["id", "code", "name", "price"]
+        fields = ["id", "code", "name", "price", "package_coverage"]
+
+    def get_package_coverage(self, obj):
+        packages_by_treatment = self.context.get('packages_by_treatment')
+        if not packages_by_treatment:
+            return None
+        match = packages_by_treatment.get(obj.id)
+        return match  # may be None
 
 
 class BillingSessionSerializer(serializers.ModelSerializer):
@@ -199,13 +214,46 @@ class BillingMedRecSerializer(serializers.ModelSerializer):
 
 class BillingPatientSerializer(serializers.ModelSerializer):
     patient_name = serializers.SerializerMethodField()
-    sessions = BillingSessionSerializer(many=True, source='treatmentsession_set', read_only=True)
+    sessions = serializers.SerializerMethodField()
     total = serializers.SerializerMethodField()
     medrec = BillingMedRecSerializer(read_only=True)
 
     class Meta:
         model = ActivePatient
         fields = ["id", "patient_no", "patient_name", "guest_name", "visit_time", "sessions", "total", "medrec"]
+
+    def _packages_by_treatment(self, obj):
+        """Map treatment_id → best active package coverage for this patient."""
+        if not obj.patient_no_id:
+            return {}
+        from ..models import PatientPackage
+        coverage = {}
+        qs = (
+            PatientPackage.objects
+            .filter(patient_id=obj.patient_no_id, status='active')
+            .select_related('package')
+            .prefetch_related('package__items', 'redemptions')
+            .order_by('purchased_at')  # FIFO: oldest package consumed first
+        )
+        for pp in qs:
+            for item in pp.package.items.all():
+                remaining = pp.remaining_for(item.treatment_id)
+                if remaining <= 0:
+                    continue
+                if item.treatment_id in coverage:
+                    continue  # already covered by an older package
+                coverage[item.treatment_id] = {
+                    'patient_package_id': pp.id,
+                    'package_name': pp.package.name,
+                    'remaining': remaining,
+                }
+        return coverage
+
+    def get_sessions(self, obj):
+        ctx = {**self.context, 'packages_by_treatment': self._packages_by_treatment(obj)}
+        return BillingSessionSerializer(
+            obj.treatmentsession_set.all(), many=True, context=ctx,
+        ).data
 
     def get_patient_name(self, obj):
         if obj.patient_no_id:
@@ -352,6 +400,10 @@ class InvoiceItemInputSerializer(serializers.Serializer):
     quantity     = serializers.DecimalField(max_digits=14, decimal_places=3)
     price        = serializers.DecimalField(max_digits=14, decimal_places=2)
     discount_pct = serializers.DecimalField(max_digits=5, decimal_places=2, default=0)
+    # Package redemption: when set, this line is a Rp 0 redemption of one
+    # session from the given PatientPackage (validated against treatment_id).
+    redeem_patient_package_id = serializers.IntegerField(required=False, allow_null=True)
+    treatment_id              = serializers.IntegerField(required=False, allow_null=True)
 
 
 class InvoiceCreateSerializer(serializers.Serializer):
@@ -670,3 +722,106 @@ class AttendanceSummarySerializer(serializers.Serializer):
     days_late = serializers.IntegerField()
     days_absent = serializers.IntegerField()
     total_hours = serializers.FloatField()
+
+
+# ── Treatment Packages ─────────────────────────────────────────────────────
+
+class TreatmentPackageItemSerializer(serializers.ModelSerializer):
+    treatment_code = serializers.CharField(source='treatment.code', read_only=True)
+    treatment_name = serializers.CharField(source='treatment.name', read_only=True)
+
+    class Meta:
+        model = TreatmentPackageItem
+        fields = ['id', 'treatment', 'treatment_code', 'treatment_name', 'sessions']
+
+
+class TreatmentPackageSerializer(serializers.ModelSerializer):
+    items = TreatmentPackageItemSerializer(many=True)
+    total_sessions = serializers.IntegerField(read_only=True)
+    catalog_item_id = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = TreatmentPackage
+        fields = [
+            'id', 'code', 'name', 'description', 'price', 'active',
+            'catalog_item_id', 'total_sessions', 'items',
+        ]
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError('A package must include at least one treatment.')
+        seen = set()
+        for item in value:
+            tid = item['treatment'].id
+            if tid in seen:
+                raise serializers.ValidationError('Duplicate treatment in package.')
+            seen.add(tid)
+            if item['sessions'] < 1:
+                raise serializers.ValidationError('Sessions must be at least 1 per treatment.')
+        return value
+
+    def create(self, validated_data):
+        items_data = validated_data.pop('items')
+        package = TreatmentPackage.objects.create(**validated_data)
+        TreatmentPackageItem.objects.bulk_create([
+            TreatmentPackageItem(package=package, treatment=i['treatment'], sessions=i['sessions'])
+            for i in items_data
+        ])
+        return package
+
+    def update(self, instance, validated_data):
+        items_data = validated_data.pop('items', None)
+        for attr, val in validated_data.items():
+            setattr(instance, attr, val)
+        instance.save()
+        if items_data is not None:
+            instance.items.all().delete()
+            TreatmentPackageItem.objects.bulk_create([
+                TreatmentPackageItem(package=instance, treatment=i['treatment'], sessions=i['sessions'])
+                for i in items_data
+            ])
+        return instance
+
+
+class PatientPackageRedemptionSerializer(serializers.ModelSerializer):
+    treatment_name = serializers.CharField(source='treatment.name', read_only=True)
+    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = PatientPackageRedemption
+        fields = ['id', 'treatment', 'treatment_name', 'invoice_number', 'redeemed_at']
+
+
+class PatientPackageSerializer(serializers.ModelSerializer):
+    package_code = serializers.CharField(source='package.code', read_only=True)
+    package_name = serializers.CharField(source='package.name', read_only=True)
+    total_sessions = serializers.SerializerMethodField()
+    remaining = serializers.SerializerMethodField()
+    per_treatment = serializers.SerializerMethodField()
+    redemptions = PatientPackageRedemptionSerializer(many=True, read_only=True)
+    purchased_invoice_number = serializers.CharField(source='purchased_invoice.invoice_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = PatientPackage
+        fields = [
+            'id', 'patient', 'package', 'package_code', 'package_name',
+            'purchased_invoice', 'purchased_invoice_number', 'purchased_at',
+            'status', 'total_sessions', 'remaining', 'per_treatment', 'redemptions',
+        ]
+
+    def get_total_sessions(self, obj):
+        return obj.package.total_sessions
+
+    def get_remaining(self, obj):
+        return obj.total_remaining()
+
+    def get_per_treatment(self, obj):
+        return [
+            {
+                'treatment_id': item.treatment_id,
+                'treatment_name': item.treatment.name,
+                'entitled': item.sessions,
+                'remaining': obj.remaining_for(item.treatment_id),
+            }
+            for item in obj.package.items.select_related('treatment').all()
+        ]
