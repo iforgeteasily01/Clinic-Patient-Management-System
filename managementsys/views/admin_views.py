@@ -252,7 +252,9 @@ class ChartOfAccountsListCreateView(generics.ListCreateAPIView):
         qs = ChartOfAccounts.objects.all().order_by('account_number')
         range_param = self.request.query_params.get('range', '').strip()
         if range_param == 'cash':
-            qs = qs.filter(account_number__gte=1100000, account_number__lte=1199999)
+            # Return sub-accounts of the system cash head (account 1100000).
+            # This is the authoritative filter for POS payment method accounts.
+            qs = qs.filter(parent__account_number=1100000, is_head=False)
         elif range_param == 'inventory':
             qs = qs.filter(account_number__gte=1200000, account_number__lte=1299999)
         return qs
@@ -285,6 +287,10 @@ class ChartOfAccountsDetailView(generics.RetrieveUpdateDestroyAPIView):
     def perform_destroy(self, instance):
         if instance.is_system:
             raise ValidationError('System accounts cannot be deleted.')
+        if instance.is_head:
+            if instance.sub_accounts.exists():
+                raise ValidationError('Head accounts with sub-accounts cannot be deleted. Remove all sub-accounts first.')
+            raise ValidationError('Head accounts cannot be deleted.')
         AuditLog.objects.create(
             performed_by=_actor(self.request),
             action='DELETE',

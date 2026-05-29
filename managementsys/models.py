@@ -343,6 +343,16 @@ class ChartOfAccounts(models.Model):
     account_type   = models.CharField(max_length=20, choices=ACCOUNT_TYPE_CHOICES)
     balance        = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     is_system      = models.BooleanField(default=False)
+    # Head accounts are the top-level grouping accounts (one per account type).
+    # Sub-accounts (is_head=False) belong to a head via parent FK.
+    is_head        = models.BooleanField(default=False)
+    parent         = models.ForeignKey(
+        'self',
+        null=True, blank=True,
+        on_delete=models.PROTECT,
+        related_name='sub_accounts',
+        limit_choices_to={'is_head': True},
+    )
 
     class Meta:
         ordering = ['account_number']

@@ -45,7 +45,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'django_extensions',
-    "managementsys",
+    "managementsys.apps.ManagementsysConfig",
     "rest_framework",
 ]
 

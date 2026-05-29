@@ -203,8 +203,8 @@ class InvoiceCreateView(APIView):
             try:
                 payment_account = ChartOfAccounts.objects.get(
                     id=data['payment_method_id'],
-                    account_number__gte=1100000,
-                    account_number__lte=1199999,
+                    parent__account_number=1100000,
+                    is_head=False,
                 )
             except ChartOfAccounts.DoesNotExist:
                 return Response(
@@ -387,8 +387,8 @@ class InvoiceDetailView(APIView):
                 try:
                     invoice.payment_method = ChartOfAccounts.objects.get(
                         id=data['payment_method_id'],
-                        account_number__gte=1100000,
-                        account_number__lte=1199999,
+                        parent__account_number=1100000,
+                        is_head=False,
                     )
                 except ChartOfAccounts.DoesNotExist:
                     return Response({'payment_method_id': 'Cash/cash-equivalent account not found.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -623,8 +623,8 @@ class InvoiceImportView(APIView):
 
             payment = ChartOfAccounts.objects.filter(
                 name=row['payment_method'],
-                account_number__gte=1100000,
-                account_number__lte=1199999,
+                parent__account_number=1100000,
+                is_head=False,
             ).first()
 
             try:

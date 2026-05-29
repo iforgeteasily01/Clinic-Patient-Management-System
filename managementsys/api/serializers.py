@@ -510,15 +510,22 @@ class ChartOfAccountsSerializer(serializers.ModelSerializer):
     account_type_display = serializers.CharField(
         source='get_account_type_display', read_only=True
     )
+    parent_name = serializers.CharField(
+        source='parent.name', read_only=True, allow_null=True
+    )
+    parent_number = serializers.IntegerField(
+        source='parent.account_number', read_only=True, allow_null=True
+    )
 
     class Meta:
         model = ChartOfAccounts
         fields = [
             'id', 'account_number', 'name',
             'account_type', 'account_type_display',
-            'balance', 'is_system',
+            'balance', 'is_system', 'is_head',
+            'parent', 'parent_name', 'parent_number',
         ]
-        read_only_fields = ['id', 'balance', 'account_type_display', 'is_system']
+        read_only_fields = ['id', 'balance', 'account_type_display', 'is_system', 'is_head']
 
     def validate(self, data):
         account_type = data.get(
@@ -538,6 +545,11 @@ class ChartOfAccountsSerializer(serializers.ModelSerializer):
                         f'{label} accounts must be numbered {low:,}–{high:,}.'
                     )
                 })
+        # Sub-accounts must have a parent; head accounts must not.
+        is_head = getattr(self.instance, 'is_head', False)
+        parent = data.get('parent', getattr(self.instance, 'parent', None))
+        if not is_head and not parent:
+            raise serializers.ValidationError({'parent': 'Sub-accounts must be assigned to a head account.'})
         return data
 
 
