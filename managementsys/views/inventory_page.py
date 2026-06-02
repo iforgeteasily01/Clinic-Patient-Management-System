@@ -338,22 +338,30 @@ class StockOutView(APIView):
 
 class ItemSyncView(APIView):
     """
-    GET /api/inventory/sync/items/?since=<ISO-8601-datetime>
+    GET /api/inventory/sync/items/?since=<ISO-8601>&page=<n>&page_size=<n>
 
-    Returns all inventory items whose updated_at >= since.
+    Returns inventory items updated since the given timestamp, paginated.
     Omit `since` for a full sync (first-time setup).
-    The response includes a `synced_at` timestamp the cashier should store
-    and pass as `since` on the next call.
+    Default page_size=200, max=1000.
     """
     def get(self, request):
+        from django.utils.dateparse import parse_datetime
         synced_at = timezone.now()
         since_raw = request.GET.get('since')
 
-        qs = InventoryItem.objects.all()
+        try:
+            page = max(1, int(request.GET.get('page', 1)))
+            page_size = min(max(1, int(request.GET.get('page_size', 200))), 1000)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid `page` or `page_size` value.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = InventoryItem.objects.all().order_by('updated_at', 'id')
 
         if since_raw:
             try:
-                from django.utils.dateparse import parse_datetime
                 since_dt = parse_datetime(since_raw)
                 if since_dt is None:
                     return Response(
@@ -369,10 +377,18 @@ class ItemSyncView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        items = ItemSyncSerializer(qs.order_by('updated_at'), many=True).data
+        total_count = qs.count()
+        start = (page - 1) * page_size
+        end = start + page_size
+        items = ItemSyncSerializer(qs[start:end], many=True).data
+        has_more = end < total_count
+
         return Response({
             'synced_at': synced_at,
             'count': len(items),
+            'total_count': total_count,
+            'has_more': has_more,
+            'next_page': page + 1 if has_more else None,
             'items': items,
         })
 

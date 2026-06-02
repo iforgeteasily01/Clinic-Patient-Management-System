@@ -42,6 +42,7 @@ urlpatterns = [
     path("api/medicalrecords/<str:patient_no_id>/", views.MedRecByPatientNoView.as_view(), name="medical-record-by-patient"),
     path("beautician/update/<str:patient_id>/", views.BeauticianUpdateActPat.as_view(), name = "beautician-update-actpat"),
     path('api/patients/search/', views.PatientSearchView.as_view(), name='patient-search'),
+    path('api/patients/sync/', views.PatientSyncView.as_view(), name='patient-sync'),
     path('api/activepatients/update-status/', views.ActivePatientUpdateStatusView.as_view(), name='activepatient-update-status'),
     path('api/activepatients/clear/', views.ActivePatientClearView.as_view(), name='activepatient-clear'),
     path('api/activepatients/treatment/', views.TreatmentQueueView.as_view(), name='treatment-queue'),
@@ -87,6 +88,11 @@ urlpatterns = [
     path('api/inventory/stock-in/', views.StockInView.as_view(), name='inventory-stock-in'),
     path('api/inventory/stock-out/', views.StockOutView.as_view(), name='inventory-stock-out'),
     path('api/inventory/sync/items/', views.ItemSyncView.as_view(), name='inventory-sync-items'),
+
+    # Stock Opname
+    path('api/stock-opname/', views.StockOpnameSessionListCreateView.as_view(), name='stock-opname-list'),
+    path('api/stock-opname/<int:pk>/', views.StockOpnameSessionDetailView.as_view(), name='stock-opname-detail'),
+    path('api/stock-opname/<int:pk>/complete/', views.StockOpnameCompleteView.as_view(), name='stock-opname-complete'),
 
     # Reports
     path('api/reports/dashboard/', views.DashboardReportView.as_view(), name='reports-dashboard'),

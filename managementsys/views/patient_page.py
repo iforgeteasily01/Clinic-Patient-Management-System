@@ -1,10 +1,12 @@
 from ..models import Patient, ActivePatient, patientStatus, Treatment, Beauticians, TreatmentSession, AppUser, AuditLog
 from django.http import HttpResponse
 from django.db.models import Q
+from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
-from ..api.serializers import PatientSerializer, ActivePatientSerializer, TreatmentSerializer
+from ..api.serializers import PatientSerializer, PatientSyncSerializer, ActivePatientSerializer, TreatmentSerializer
 
 
 def _actor(request):
@@ -293,3 +295,59 @@ class CompleteTreatmentView(APIView):
         )
         serializer = ActivePatientSerializer(active_patient)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class PatientSyncView(APIView):
+    """
+    GET /api/patients/sync/?since=<ISO-8601>&page=<n>&page_size=<n>
+
+    Returns patients updated since the given timestamp, paginated.
+    Omit `since` for a full sync (first-time setup).
+    Default page_size=200, max=1000.
+    """
+    def get(self, request):
+        synced_at = timezone.now()
+        since_raw = request.GET.get('since')
+
+        try:
+            page = max(1, int(request.GET.get('page', 1)))
+            page_size = min(max(1, int(request.GET.get('page_size', 200))), 1000)
+        except (ValueError, TypeError):
+            return Response(
+                {'error': 'Invalid `page` or `page_size` value.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        qs = Patient.objects.all().order_by('updated_at', 'patient_no')
+
+        if since_raw:
+            try:
+                since_dt = parse_datetime(since_raw)
+                if since_dt is None:
+                    return Response(
+                        {'error': 'Invalid `since` value. Use ISO 8601 format, e.g. 2025-01-01T00:00:00Z.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if timezone.is_naive(since_dt):
+                    since_dt = timezone.make_aware(since_dt)
+                qs = qs.filter(updated_at__gte=since_dt)
+            except (ValueError, TypeError):
+                return Response(
+                    {'error': 'Invalid `since` value. Use ISO 8601 format, e.g. 2025-01-01T00:00:00Z.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        total_count = qs.count()
+        start = (page - 1) * page_size
+        end = start + page_size
+        patients = PatientSyncSerializer(qs[start:end], many=True).data
+        has_more = end < total_count
+
+        return Response({
+            'synced_at': synced_at,
+            'count': len(patients),
+            'total_count': total_count,
+            'has_more': has_more,
+            'next_page': page + 1 if has_more else None,
+            'patients': patients,
+        })

@@ -14,6 +14,7 @@ class Patient(models.Model):
     address = models.CharField(max_length=100, null=True)
     phone_number = models.CharField(max_length=15, null=True)
     NIK = models.CharField(max_length=16, null=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
         return self.name
@@ -826,6 +827,39 @@ class PatientPackageRedemption(models.Model):
 
     def __str__(self):
         return f'{self.patient_package_id} · {self.treatment.name} @ {self.redeemed_at:%Y-%m-%d}'
+
+
+class StockOpnameSession(models.Model):
+    STATUS_CHOICES = [('draft', 'Draft'), ('completed', 'Selesai')]
+
+    date = models.DateField()
+    conducted_by = models.CharField(max_length=200)
+    notes = models.TextField(blank=True, default='')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    started_at = models.DateTimeField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'StockOpname #{self.id} – {self.date} – {self.conducted_by}'
+
+
+class StockOpnameItem(models.Model):
+    session = models.ForeignKey(StockOpnameSession, on_delete=models.CASCADE, related_name='items')
+    item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT)
+    warehouse = models.ForeignKey(Warehouse, on_delete=models.PROTECT)
+    shelf1_qty = models.PositiveIntegerField(default=0)
+    shelf2_qty = models.PositiveIntegerField(default=0)
+    system_qty = models.PositiveIntegerField(default=0)
+    is_loss = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = [('session', 'item', 'warehouse')]
 
 
 #####

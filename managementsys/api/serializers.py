@@ -301,6 +301,13 @@ class InventoryItemSerializer(serializers.ModelSerializer):
         return obj.created_by.display_name if obj.created_by_id else None
 
 
+class PatientSyncSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Patient
+        fields = ['patient_no', 'name', 'address', 'phone_number', 'NIK', 'updated_at']
+        read_only_fields = fields
+
+
 class ItemSyncSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventoryItem
