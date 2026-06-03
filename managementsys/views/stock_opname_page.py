@@ -61,7 +61,7 @@ def _detail_qs(pk):
                 'items',
                 queryset=StockOpnameItem.objects
                     .select_related('item', 'warehouse')
-                    .order_by('item__name'),
+                    .order_by('item__code'),
             )
         )
         .get(pk=pk)
@@ -118,7 +118,7 @@ class StockOpnameSessionListCreateView(APIView):
                     'items',
                     queryset=StockOpnameItem.objects
                         .select_related('warehouse')
-                        .order_by('item__name'),
+                        .order_by('item__code'),
                 )
             )
             .annotate(item_count_ann=Count('items', distinct=True))
