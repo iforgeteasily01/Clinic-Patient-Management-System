@@ -19,7 +19,7 @@ from ..models import (
     Treatment, TreatmentPackage, Warehouse,
 )
 from .crm_page import refresh_crm_profile
-from .inventory_page import _fifo_deduct
+from .inventory_page import _fifo_deduct, _fifo_restock
 from .promotion_page import validate_promotion
 
 logger = logging.getLogger(__name__)
@@ -87,6 +87,51 @@ def _post_accounting(invoice, line_items, items_by_id):
                     if cogs_acct:
                         ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
                             balance=F('balance') + cogs_amount
+                        )
+
+
+def _reverse_accounting_instances(payment_method_id, grand_total, item_instances, warehouse_id):
+    """
+    Reverse every accounting entry that _post_accounting originally made,
+    using InvoiceItem model instances (with item relations already prefetched).
+    Called at the start of a PUT/PATCH so the edit can be re-applied cleanly.
+    """
+    if payment_method_id:
+        ChartOfAccounts.objects.filter(pk=payment_method_id).update(
+            balance=F('balance') - grand_total
+        )
+
+    fallback_revenue = ChartOfAccounts.objects.filter(account_number=4200000).first()
+    fallback_cogs    = ChartOfAccounts.objects.filter(account_number=5100000).first()
+    inventory_asset  = ChartOfAccounts.objects.filter(account_number=1300000).first()
+
+    for inst in item_instances:
+        if not inst.item_id:
+            continue
+        item = inst.item
+        line_revenue = inst.price * inst.quantity
+        cat = item.item_category
+
+        revenue_acct = (cat.revenue_account if cat and cat.revenue_account_id else fallback_revenue)
+        cogs_acct    = (cat.cogs_account    if cat and cat.cogs_account_id    else fallback_cogs)
+
+        if revenue_acct:
+            ChartOfAccounts.objects.filter(pk=revenue_acct.pk).update(
+                balance=F('balance') - line_revenue
+            )
+
+        if not item.is_service and warehouse_id:
+            qty_int = int(inst.quantity.to_integral_value())
+            if qty_int > 0:
+                cogs_amount = _fifo_restock(item.id, warehouse_id, qty_int)
+                if cogs_amount > 0:
+                    if inventory_asset:
+                        ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
+                            balance=F('balance') + cogs_amount
+                        )
+                    if cogs_acct:
+                        ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
+                            balance=F('balance') - cogs_amount
                         )
 
 
@@ -376,6 +421,19 @@ class InvoiceDetailView(APIView):
         data = serializer.validated_data
         changes = []
 
+        # ── Capture old state before any modifications ────────────────────────
+        old_grand_total       = invoice.grand_total
+        old_payment_method_id = invoice.payment_method_id
+        old_warehouse_id      = invoice.warehouse_id
+        old_item_instances    = list(
+            invoice.items
+            .select_related(
+                'item__item_category__revenue_account',
+                'item__item_category__cogs_account',
+            )
+            .all()
+        )
+
         # ── Scalar fields ─────────────────────────────────────────────────────
 
         if 'datetime' in data:
@@ -441,13 +499,19 @@ class InvoiceDetailView(APIView):
 
         # ── Line items (replace-all strategy) ────────────────────────────────
 
+        new_line_items_data = None  # None = items unchanged
+        new_items_by_id: dict = {}
+
         if 'items' in data:
-            item_ids = [i['item_id'] for i in data['items']]
-            items_by_id = {
+            item_ids = [i['item_id'] for i in data['items'] if i.get('item_id')]
+            new_items_by_id = {
                 obj.id: obj
-                for obj in InventoryItem.objects.filter(id__in=item_ids)
+                for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
+                    'item_category__revenue_account',
+                    'item_category__cogs_account',
+                )
             }
-            missing = [iid for iid in item_ids if iid not in items_by_id]
+            missing = [iid for iid in item_ids if iid not in new_items_by_id]
             if missing:
                 return Response({'items': f'Item IDs not found: {missing}'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -455,13 +519,36 @@ class InvoiceDetailView(APIView):
             InvoiceItem.objects.bulk_create([
                 InvoiceItem(
                     invoice=invoice,
-                    item=items_by_id[i['item_id']],
+                    item=new_items_by_id.get(i['item_id']) if i.get('item_id') else None,
+                    item_name=i.get('item_name', '') if not i.get('item_id') else '',
                     quantity=i['quantity'],
                     price=i['price'],
                 )
                 for i in data['items']
             ])
+            new_line_items_data = data['items']
             changes.append('items')
+
+        # ── Accounting: reverse old entries, re-apply for new state ──────────
+
+        _reverse_accounting_instances(
+            old_payment_method_id, old_grand_total, old_item_instances, old_warehouse_id
+        )
+
+        if new_line_items_data is not None:
+            _post_accounting(invoice, new_line_items_data, new_items_by_id)
+        else:
+            # Items unchanged — re-apply using old instances converted to dict format
+            old_lines_as_dicts = [
+                {'item_id': inst.item_id, 'quantity': inst.quantity, 'price': inst.price}
+                for inst in old_item_instances
+            ]
+            old_items_by_id = {
+                inst.item_id: inst.item
+                for inst in old_item_instances
+                if inst.item_id
+            }
+            _post_accounting(invoice, old_lines_as_dicts, old_items_by_id)
 
         AuditLog.objects.create(
             performed_by=_actor(request),

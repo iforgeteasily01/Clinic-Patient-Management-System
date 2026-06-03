@@ -432,6 +432,32 @@ def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> tuple:
     return remaining, cogs
 
 
+@transaction.atomic
+def _fifo_restock(item_id: int, warehouse_id: int, quantity: int) -> Decimal:
+    """Return stock to batches (newest-first). Returns the COGS amount reversed."""
+    batches = (
+        InventoryBatch.objects
+        .select_for_update()
+        .filter(item_id=item_id, warehouse_id=warehouse_id)
+        .order_by('-input_date', '-created_at')
+    )
+    remaining = quantity
+    cogs = Decimal('0')
+    for batch in batches:
+        if remaining <= 0:
+            break
+        capacity = (batch.quantity_initial or 0) - batch.quantity_remaining
+        if capacity <= 0:
+            continue
+        restock = min(capacity, remaining)
+        if batch.quantity_initial:
+            cogs += (batch.value / Decimal(batch.quantity_initial)) * restock
+        batch.quantity_remaining += restock
+        batch.save(update_fields=['quantity_remaining'])
+        remaining -= restock
+    return cogs
+
+
 # ── Excel template + import ───────────────────────────────────────────────────
 
 class InventoryItemTemplateView(APIView):
