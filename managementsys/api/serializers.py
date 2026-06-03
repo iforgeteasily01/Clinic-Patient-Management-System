@@ -6,7 +6,7 @@ from ..models import (
     ActivePatient, AppUser, AssessmentCode, AttendanceRecord, Beauticians, ChartOfAccounts,
     Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem, MedRec, Patient,
     PatientCRMProfile, PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto,
-    PatientTier, Promotion, SoapTemplate, StaffSchedule, Treatment, TreatmentCategory,
+    PatientTier, Promotion, SiteConfig, SoapTemplate, StaffSchedule, Treatment, TreatmentCategory,
     TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift,
     patientStatus,
 )
@@ -169,23 +169,9 @@ class SoapTemplateSerializer(serializers.ModelSerializer):
 # ── Billing ────────────────────────────────────────────────────────────────
 
 class BillingTreatmentSerializer(serializers.ModelSerializer):
-    """Includes package_coverage if the patient (from context) has an active
-    package with sessions remaining for this treatment.
-
-    `package_coverage` shape: { patient_package_id, package_name, remaining }
-    """
-    package_coverage = serializers.SerializerMethodField()
-
     class Meta:
         model = Treatment
-        fields = ["id", "code", "name", "price", "package_coverage"]
-
-    def get_package_coverage(self, obj):
-        packages_by_treatment = self.context.get('packages_by_treatment')
-        if not packages_by_treatment:
-            return None
-        match = packages_by_treatment.get(obj.id)
-        return match  # may be None
+        fields = ["id", "code", "name", "price"]
 
 
 class BillingSessionSerializer(serializers.ModelSerializer):
@@ -222,37 +208,9 @@ class BillingPatientSerializer(serializers.ModelSerializer):
         model = ActivePatient
         fields = ["id", "patient_no", "patient_name", "guest_name", "visit_time", "sessions", "total", "medrec"]
 
-    def _packages_by_treatment(self, obj):
-        """Map treatment_id → best active package coverage for this patient."""
-        if not obj.patient_no_id:
-            return {}
-        from ..models import PatientPackage
-        coverage = {}
-        qs = (
-            PatientPackage.objects
-            .filter(patient_id=obj.patient_no_id, status='active')
-            .select_related('package')
-            .prefetch_related('package__items', 'redemptions')
-            .order_by('purchased_at')  # FIFO: oldest package consumed first
-        )
-        for pp in qs:
-            for item in pp.package.items.all():
-                remaining = pp.remaining_for(item.treatment_id)
-                if remaining <= 0:
-                    continue
-                if item.treatment_id in coverage:
-                    continue  # already covered by an older package
-                coverage[item.treatment_id] = {
-                    'patient_package_id': pp.id,
-                    'package_name': pp.package.name,
-                    'remaining': remaining,
-                }
-        return coverage
-
     def get_sessions(self, obj):
-        ctx = {**self.context, 'packages_by_treatment': self._packages_by_treatment(obj)}
         return BillingSessionSerializer(
-            obj.treatmentsession_set.all(), many=True, context=ctx,
+            obj.treatmentsession_set.all(), many=True, context=self.context,
         ).data
 
     def get_patient_name(self, obj):
@@ -549,7 +507,8 @@ class ChartOfAccountsSerializer(serializers.ModelSerializer):
                 label = dict(ChartOfAccounts.ACCOUNT_TYPE_CHOICES).get(account_type, account_type)
                 raise serializers.ValidationError({
                     'account_number': (
-                        f'{label} accounts must be numbered {low:,}–{high:,}.'
+                        f'{label} accounts must be numbered '
+                        f'{low:,}–{high:,}.'.replace(',', '.')
                     )
                 })
         # Sub-accounts must have a parent; head accounts must not.
@@ -844,3 +803,12 @@ class PatientPackageSerializer(serializers.ModelSerializer):
             }
             for item in obj.package.items.select_related('treatment').all()
         ]
+
+
+
+
+class SiteConfigSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SiteConfig
+        fields = ["clinic_name", "address_line1", "address_line2", "phone_fax",
+                  "receipt_header_extra", "receipt_footer"]

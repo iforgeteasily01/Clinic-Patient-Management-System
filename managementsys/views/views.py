@@ -37,7 +37,12 @@ from .medical_record_history import MedRecHistoryListView, MedRecHistoryDetailVi
 from .invoice_page import InvoiceCreateView, InvoiceListView, InvoiceDetailView, InvoiceExportView, InvoiceImportView
 from .reports_page import DashboardReportView
 from .patient_notes_page import PatientNoteListCreateView, PatientNoteDetailView
-from .assessment_codes_page import AssessmentCodeListCreateView, AssessmentCodeDetailView
+from .assessment_codes_page import (
+    AssessmentCodeListCreateView,
+    AssessmentCodeDetailView,
+    AssessmentCodeImportPreviewView,
+    AssessmentCodeImportConfirmView,
+)
 from .promotion_page import PromotionListCreateView, PromotionDetailView, PromotionValidateView
 from .crm_page import PatientCRMListView, PatientCRMDetailView, PatientTierListCreateView, PatientTierDetailView
 from .hr_attendance_page import (

@@ -297,6 +297,15 @@ class CompleteTreatmentView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+class PatientCountView(APIView):
+    """
+    GET /api/patients/count/
+    Returns the total number of patients. Lightweight — no data serialization.
+    """
+    def get(self, request):
+        return Response({'total': Patient.objects.count()})
+
+
 class PatientSyncView(APIView):
     """
     GET /api/patients/sync/?since=<ISO-8601>&page=<n>&page_size=<n>

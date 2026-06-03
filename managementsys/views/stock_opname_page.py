@@ -1,16 +1,13 @@
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Sum
-from django.db.models.functions import Coalesce
-from django.db.models import Value
+from django.db.models import Count, Prefetch, Sum
 from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..models import (
     AppUser, AuditLog,
-    InventoryBatch, InventoryItem, Warehouse,
     StockOpnameSession, StockOpnameItem,
 )
 from .inventory_page import _fifo_deduct
@@ -20,8 +17,11 @@ def _actor(request):
     return request.user if isinstance(request.user, AppUser) else None
 
 
-def _serialize_session(session, include_items=False):
-    data = {
+def _serialize_session_detail(session):
+    """Serialise one session including all item lines. Expects items pre-fetched."""
+    items = list(session.items.all())
+    first = items[0] if items else None
+    return {
         'id': session.id,
         'date': str(session.date),
         'conducted_by': session.conducted_by,
@@ -30,13 +30,10 @@ def _serialize_session(session, include_items=False):
         'started_at': session.started_at.isoformat() if session.started_at else None,
         'completed_at': session.completed_at.isoformat() if session.completed_at else None,
         'created_at': session.created_at.isoformat(),
-        'created_by_name': session.created_by.full_name if session.created_by else None,
-    }
-    if include_items:
-        items = session.items.select_related('item', 'warehouse').all()
-        data['warehouse_id'] = items[0].warehouse_id if items else None
-        data['warehouse_name'] = items[0].warehouse.name if items else None
-        data['items'] = [
+        'created_by_name': session.created_by.display_name if session.created_by else None,
+        'warehouse_id': first.warehouse_id if first else None,
+        'warehouse_name': first.warehouse.name if first else None,
+        'items': [
             {
                 'item_id': it.item_id,
                 'item_code': it.item.code,
@@ -50,13 +47,23 @@ def _serialize_session(session, include_items=False):
                 'is_loss': it.is_loss,
             }
             for it in items
-        ]
-    else:
-        first = session.items.select_related('warehouse').first()
-        data['warehouse_id'] = first.warehouse_id if first else None
-        data['warehouse_name'] = first.warehouse.name if first else None
-        data['item_count'] = session.items.count()
-    return data
+        ],
+    }
+
+
+def _detail_qs(pk):
+    """Single-session queryset with all related data pre-fetched."""
+    return (
+        StockOpnameSession.objects
+        .select_related('created_by')
+        .prefetch_related(
+            Prefetch(
+                'items',
+                queryset=StockOpnameItem.objects.select_related('item', 'warehouse'),
+            )
+        )
+        .get(pk=pk)
+    )
 
 
 def _save_items(session, warehouse_id, items_data):
@@ -76,8 +83,37 @@ def _save_items(session, warehouse_id, items_data):
 
 class StockOpnameSessionListCreateView(APIView):
     def get(self, request):
-        sessions = StockOpnameSession.objects.all()
-        return Response([_serialize_session(s) for s in sessions])
+        # select_related + prefetch avoids N+1; Count annotation avoids item_count queries
+        sessions = (
+            StockOpnameSession.objects
+            .select_related('created_by')
+            .prefetch_related(
+                Prefetch(
+                    'items',
+                    queryset=StockOpnameItem.objects.select_related('warehouse').order_by('id'),
+                )
+            )
+            .annotate(item_count_ann=Count('items', distinct=True))
+        )
+        data = []
+        for s in sessions:
+            prefetched = list(s.items.all())
+            first = prefetched[0] if prefetched else None
+            data.append({
+                'id': s.id,
+                'date': str(s.date),
+                'conducted_by': s.conducted_by,
+                'notes': s.notes,
+                'status': s.status,
+                'started_at': s.started_at.isoformat() if s.started_at else None,
+                'completed_at': s.completed_at.isoformat() if s.completed_at else None,
+                'created_at': s.created_at.isoformat(),
+                'created_by_name': s.created_by.display_name if s.created_by else None,
+                'warehouse_id': first.warehouse_id if first else None,
+                'warehouse_name': first.warehouse.name if first else None,
+                'item_count': s.item_count_ann,
+            })
+        return Response(data)
 
     def post(self, request):
         data = request.data
@@ -114,25 +150,21 @@ class StockOpnameSessionListCreateView(APIView):
                 f'untuk tanggal {date}.'
             ),
         )
-        return Response(_serialize_session(session, include_items=True), status=201)
+        return Response(_serialize_session_detail(_detail_qs(session.id)), status=201)
 
 
 class StockOpnameSessionDetailView(APIView):
-    def _get(self, pk):
-        try:
-            return StockOpnameSession.objects.get(pk=pk)
-        except StockOpnameSession.DoesNotExist:
-            return None
-
     def get(self, request, pk):
-        session = self._get(pk)
-        if session is None:
+        try:
+            session = _detail_qs(pk)
+        except StockOpnameSession.DoesNotExist:
             return Response({'error': 'Tidak ditemukan.'}, status=404)
-        return Response(_serialize_session(session, include_items=True))
+        return Response(_serialize_session_detail(session))
 
     def put(self, request, pk):
-        session = self._get(pk)
-        if session is None:
+        try:
+            session = StockOpnameSession.objects.get(pk=pk)
+        except StockOpnameSession.DoesNotExist:
             return Response({'error': 'Tidak ditemukan.'}, status=404)
         if session.status == 'completed':
             return Response({'error': 'Sesi yang sudah selesai tidak dapat diubah.'}, status=400)
@@ -162,7 +194,7 @@ class StockOpnameSessionDetailView(APIView):
             entity_id=str(session.id),
             description=f'Draft stok opname #{session.id} diperbarui.',
         )
-        return Response(_serialize_session(session, include_items=True))
+        return Response(_serialize_session_detail(_detail_qs(pk)))
 
 
 class StockOpnameCompleteView(APIView):
@@ -229,4 +261,4 @@ class StockOpnameCompleteView(APIView):
                 f'Total susut: {total_loss_qty} unit (HPP Rp {total_loss_cogs:,.0f}).'
             ),
         )
-        return Response(_serialize_session(session, include_items=True))
+        return Response(_serialize_session_detail(_detail_qs(pk)))

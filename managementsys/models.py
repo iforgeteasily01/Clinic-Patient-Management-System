@@ -862,6 +862,24 @@ class StockOpnameItem(models.Model):
         unique_together = [('session', 'item', 'warehouse')]
 
 
+class SiteConfig(models.Model):
+    """Singleton row (always pk=1) holding clinic-wide receipt settings."""
+    clinic_name          = models.CharField(max_length=200, default='')
+    address_line1        = models.CharField(max_length=200, default='')
+    address_line2        = models.CharField(max_length=200, default='')
+    phone_fax            = models.CharField(max_length=200, default='')
+    receipt_header_extra = models.TextField(default='')
+    receipt_footer       = models.TextField(default='Terima kasih atas kunjungan Anda')
+
+    class Meta:
+        verbose_name = 'Site Configuration'
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
 #####
 # END#
 #####

@@ -19,13 +19,14 @@ from ..api.serializers import (
     ChartOfAccountsSerializer,
     DoctorsSerializer,
     PatientSerializer,
+    SiteConfigSerializer,
     TreatmentCategorySerializer,
     TreatmentPackageSerializer,
     TreatmentSerializer,
 )
 from ..models import (
     AppUser, AuditLog, Beauticians, ChartOfAccounts, Doctors, Patient,
-    Treatment, TreatmentCategory, TreatmentPackage,
+    SiteConfig, Treatment, TreatmentCategory, TreatmentPackage,
 )
 
 
@@ -578,3 +579,18 @@ class TreatmentPackageDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
         )
         instance.delete()
 
+
+
+class SiteConfigView(APIView):
+    """GET/PUT the singleton clinic receipt configuration."""
+
+    def get(self, request):
+        return Response(SiteConfigSerializer(SiteConfig.get_solo()).data)
+
+    def put(self, request):
+        obj = SiteConfig.get_solo()
+        serializer = SiteConfigSerializer(obj, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)

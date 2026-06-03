@@ -29,6 +29,7 @@ urlpatterns = [
     path('api/admin/treatment-categories/<int:pk>/', views.TreatmentCategoryDetailView.as_view(), name='admin-treatment-category-detail'),
     path('api/admin/accounts/', views.ChartOfAccountsListCreateView.as_view(), name='admin-accounts'),
     path('api/admin/accounts/<int:pk>/', views.ChartOfAccountsDetailView.as_view(), name='admin-account-detail'),
+    path('api/admin/site-config/', views.SiteConfigView.as_view(), name='admin-site-config'),
 
     path("", views.homepage, name = 'homepage'),
     path("patient/", views.PatientListCreate.as_view(), name = "Patient-view-create"),
@@ -42,6 +43,7 @@ urlpatterns = [
     path("api/medicalrecords/<str:patient_no_id>/", views.MedRecByPatientNoView.as_view(), name="medical-record-by-patient"),
     path("beautician/update/<str:patient_id>/", views.BeauticianUpdateActPat.as_view(), name = "beautician-update-actpat"),
     path('api/patients/search/', views.PatientSearchView.as_view(), name='patient-search'),
+    path('api/patients/count/', views.PatientCountView.as_view(), name='patient-count'),
     path('api/patients/sync/', views.PatientSyncView.as_view(), name='patient-sync'),
     path('api/activepatients/update-status/', views.ActivePatientUpdateStatusView.as_view(), name='activepatient-update-status'),
     path('api/activepatients/clear/', views.ActivePatientClearView.as_view(), name='activepatient-clear'),
@@ -103,6 +105,8 @@ urlpatterns = [
 
     # Assessment Codes (ICD-10)
     path('api/assessment-codes/', views.AssessmentCodeListCreateView.as_view(), name='assessment-codes'),
+    path('api/assessment-codes/import/preview/', views.AssessmentCodeImportPreviewView.as_view(), name='assessment-codes-import-preview'),
+    path('api/assessment-codes/import/confirm/', views.AssessmentCodeImportConfirmView.as_view(), name='assessment-codes-import-confirm'),
     path('api/assessment-codes/<int:pk>/', views.AssessmentCodeDetailView.as_view(), name='assessment-code-detail'),
 
     # Promotions
