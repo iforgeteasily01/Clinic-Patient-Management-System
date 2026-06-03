@@ -5,7 +5,7 @@ from rest_framework.exceptions import ValidationError
 from ..models import *
 from ..api.serializers import *
 from .beautician_page import *
-from .patient_page import PatientCreateWithActiveView, PatientSearchView, PatientSyncView, ActivePatientUpdateStatusView, ActivePatientClearView, TreatmentQueueView, TreatmentListView, TreatmentSessionCreateView, AppointmentAddView, CompleteTreatmentView, GeneralAppointmentCreateView
+from .patient_page import PatientCreateWithActiveView, PatientSearchView, PatientSyncView, PatientCountView, ActivePatientUpdateStatusView, ActivePatientClearView, TreatmentQueueView, TreatmentListView, TreatmentSessionCreateView, AppointmentAddView, CompleteTreatmentView, GeneralAppointmentCreateView
 from .billing_page import BillingQueueView, BillingCompleteView
 from .soap_templates_page import SoapTemplateListCreateView, SoapTemplateDetailView, SoapTemplateImportView, SoapTemplateExportView, SoapTemplateTemplateDownloadView
 from .inventory_page import (
@@ -29,6 +29,7 @@ from .admin_views import (
     AppUserListCreateAdminView, AppUserDetailAdminView,
     TreatmentCategoryListCreateView, TreatmentCategoryDetailView,
     ChartOfAccountsListCreateView, ChartOfAccountsDetailView,
+    SiteConfigView,
 )
 from .package_page import PatientPackagesView
 from .medical_record_page import MedRecByPatientNoView
@@ -52,6 +53,7 @@ from .hr_attendance_page import (
     StaffScheduleView,
 )
 from .hr_performance_page import StaffPerformanceView, StaffPerformanceDailyView
+from .tickets_page import IssueTicketListCreateView, IssueTicketDetailView, IssueTicketImageUploadView
 from .stock_opname_page import (
     StockOpnameSessionListCreateView,
     StockOpnameSessionDetailView,

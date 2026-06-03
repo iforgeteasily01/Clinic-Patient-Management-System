@@ -149,6 +149,10 @@ MEDIA_ROOT = BASE_DIR / 'media'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
+# Vercel dashboard integration
+CPMS_VERCEL_URL    = env.str('CPMS_VERCEL_URL', 'https://cpms-dashboard-api.vercel.app')
+CPMS_INGEST_SECRET = env.str('CPMS_INGEST_SECRET', '')
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'managementsys.auth_backend.AppUserAuthentication',

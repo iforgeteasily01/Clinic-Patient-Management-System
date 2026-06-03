@@ -215,6 +215,7 @@ class AppUser(models.Model):
         ('doctor',     'Doctor'),
         ('beautician', 'Beautician'),
         ('cashier',    'Cashier'),
+        ('manager',    'Manager'),
     ]
 
     display_name    = models.CharField(max_length=50)
@@ -878,6 +879,44 @@ class SiteConfig(models.Model):
     def get_solo(cls):
         obj, _ = cls.objects.get_or_create(pk=1)
         return obj
+
+
+class IssueTicket(models.Model):
+    STATUS_CHOICES = [
+        ('open', 'Open'),
+        ('in_progress', 'In Progress'),
+        ('resolved', 'Resolved'),
+        ('closed', 'Closed'),
+    ]
+    ticket_no    = models.CharField(max_length=20, unique=True, editable=False)
+    submitted_by = models.ForeignKey('AppUser', on_delete=models.PROTECT, related_name='tickets')
+    title        = models.CharField(max_length=255)
+    description  = models.TextField()
+    status       = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')
+    created_at   = models.DateTimeField(auto_now_add=True)
+    updated_at   = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def save(self, *args, **kwargs):
+        if not self.ticket_no:
+            from django.utils import timezone
+            today = timezone.now().strftime('%Y%m%d')
+            prefix = f'TKT-{today}-'
+            last = IssueTicket.objects.filter(ticket_no__startswith=prefix).order_by('-ticket_no').first()
+            seq = (int(last.ticket_no.split('-')[-1]) + 1) if last else 1
+            self.ticket_no = f'{prefix}{seq:04d}'
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f'{self.ticket_no} — {self.title}'
+
+
+class IssueTicketImage(models.Model):
+    ticket      = models.ForeignKey(IssueTicket, on_delete=models.CASCADE, related_name='images')
+    image       = models.ImageField(upload_to='ticket_images/')
+    uploaded_at = models.DateTimeField(auto_now_add=True)
 
 
 #####

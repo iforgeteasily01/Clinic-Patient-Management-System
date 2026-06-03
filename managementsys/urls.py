@@ -126,6 +126,11 @@ urlpatterns = [
     path('api/hr/performance/daily/',  views.StaffPerformanceDailyView.as_view(), name='hr-performance-daily'),
     path('api/hr/performance/',        views.StaffPerformanceView.as_view(),       name='hr-performance'),
 
+    # Issue Tickets
+    path('api/tickets/', views.IssueTicketListCreateView.as_view(), name='ticket-list'),
+    path('api/tickets/<int:pk>/', views.IssueTicketDetailView.as_view(), name='ticket-detail'),
+    path('api/tickets/<int:pk>/images/', views.IssueTicketImageUploadView.as_view(), name='ticket-image-upload'),
+
     # HR / Attendance
     path('api/hr/attendance/clock-in/',  views.ClockInView.as_view(),           name='hr-clock-in'),
     path('api/hr/attendance/clock-out/', views.ClockOutView.as_view(),           name='hr-clock-out'),

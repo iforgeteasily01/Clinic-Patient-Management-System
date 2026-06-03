@@ -4,11 +4,11 @@ from rest_framework import serializers
 
 from ..models import (
     ActivePatient, AppUser, AssessmentCode, AttendanceRecord, Beauticians, ChartOfAccounts,
-    Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem, MedRec, Patient,
-    PatientCRMProfile, PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto,
-    PatientTier, Promotion, SiteConfig, SoapTemplate, StaffSchedule, Treatment, TreatmentCategory,
-    TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift,
-    patientStatus,
+    Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem, IssueTicket, IssueTicketImage,
+    MedRec, Patient, PatientCRMProfile, PatientNote, PatientPackage, PatientPackageRedemption,
+    PatientPhoto, PatientTier, Promotion, SiteConfig, SoapTemplate, StaffSchedule, Treatment,
+    TreatmentCategory, TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse,
+    WorkShift, patientStatus,
 )
 
 
@@ -575,6 +575,37 @@ class AppUserAdminSerializer(serializers.ModelSerializer):
             instance.set_pin(pin)
         instance.save()
         return instance
+
+
+# ── Issue Tickets ──────────────────────────────────────────────────────────
+
+class IssueTicketImageSerializer(serializers.ModelSerializer):
+    image_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = IssueTicketImage
+        fields = ['id', 'image_url', 'uploaded_at']
+        read_only_fields = ['id', 'image_url', 'uploaded_at']
+
+    def get_image_url(self, obj):
+        request = self.context.get('request')
+        url = obj.image.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class IssueTicketSerializer(serializers.ModelSerializer):
+    submitted_by_username = serializers.CharField(source='submitted_by.display_name', read_only=True)
+    images = IssueTicketImageSerializer(many=True, read_only=True)
+    status_display = serializers.CharField(source='get_status_display', read_only=True)
+
+    class Meta:
+        model = IssueTicket
+        fields = [
+            'id', 'ticket_no', 'submitted_by', 'submitted_by_username',
+            'title', 'description', 'status', 'status_display',
+            'images', 'created_at', 'updated_at',
+        ]
+        read_only_fields = ['id', 'ticket_no', 'submitted_by_username', 'images', 'status_display', 'created_at', 'updated_at']
 
 
 # ── Patient Notes ──────────────────────────────────────────────────────────
