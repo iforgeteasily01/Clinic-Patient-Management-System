@@ -12,7 +12,7 @@ from .inventory_page import (
     InventoryItemListCreateView, InventoryItemDetailView,
     WarehouseListCreateView, WarehouseDetailView,
     StockLevelView, InventoryBatchListView,
-    StockInView, StockOutView,
+    StockInView, StockOutView, StockOutBatchListView,
     ItemSyncView,
     InventoryItemImportPreviewView,
     InventoryItemImportView,
