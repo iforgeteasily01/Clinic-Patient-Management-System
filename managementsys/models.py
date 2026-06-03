@@ -837,6 +837,7 @@ class StockOpnameSession(models.Model):
     conducted_by = models.CharField(max_length=200)
     notes = models.TextField(blank=True, default='')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='draft')
+    warehouse = models.ForeignKey('Warehouse', on_delete=models.SET_NULL, null=True, blank=True)
     started_at = models.DateTimeField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True)

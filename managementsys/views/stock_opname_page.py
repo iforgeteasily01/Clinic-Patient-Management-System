@@ -8,7 +8,7 @@ from rest_framework.views import APIView
 
 from ..models import (
     AppUser, AuditLog,
-    StockOpnameSession, StockOpnameItem,
+    StockOpnameSession, StockOpnameItem, Warehouse,
 )
 from .inventory_page import _fifo_deduct
 
@@ -20,7 +20,6 @@ def _actor(request):
 def _serialize_session_detail(session):
     """Serialise one session including all item lines. Expects items pre-fetched."""
     items = list(session.items.all())
-    first = items[0] if items else None
     return {
         'id': session.id,
         'date': str(session.date),
@@ -31,8 +30,8 @@ def _serialize_session_detail(session):
         'completed_at': session.completed_at.isoformat() if session.completed_at else None,
         'created_at': session.created_at.isoformat(),
         'created_by_name': session.created_by.display_name if session.created_by else None,
-        'warehouse_id': first.warehouse_id if first else None,
-        'warehouse_name': first.warehouse.name if first else None,
+        'warehouse_id': session.warehouse_id,
+        'warehouse_name': session.warehouse.name if session.warehouse else None,
         'items': [
             {
                 'item_id': it.item_id,
@@ -52,10 +51,10 @@ def _serialize_session_detail(session):
 
 
 def _detail_qs(pk):
-    """Single-session queryset with all related data pre-fetched, items sorted by name."""
+    """Single-session queryset with all related data pre-fetched, items sorted by code."""
     return (
         StockOpnameSession.objects
-        .select_related('created_by')
+        .select_related('created_by', 'warehouse')
         .prefetch_related(
             Prefetch(
                 'items',
@@ -112,22 +111,12 @@ class StockOpnameSessionListCreateView(APIView):
     def get(self, request):
         sessions = (
             StockOpnameSession.objects
-            .select_related('created_by')
-            .prefetch_related(
-                Prefetch(
-                    'items',
-                    queryset=StockOpnameItem.objects
-                        .select_related('warehouse')
-                        .order_by('item__code'),
-                )
-            )
+            .select_related('created_by', 'warehouse')
             .annotate(item_count_ann=Count('items', distinct=True))
             .order_by('-date', '-created_at')
         )
         data = []
         for s in sessions:
-            prefetched = list(s.items.all())
-            first = prefetched[0] if prefetched else None
             data.append({
                 'id': s.id,
                 'date': str(s.date),
@@ -138,8 +127,8 @@ class StockOpnameSessionListCreateView(APIView):
                 'completed_at': s.completed_at.isoformat() if s.completed_at else None,
                 'created_at': s.created_at.isoformat(),
                 'created_by_name': s.created_by.display_name if s.created_by else None,
-                'warehouse_id': first.warehouse_id if first else None,
-                'warehouse_name': first.warehouse.name if first else None,
+                'warehouse_id': s.warehouse_id,
+                'warehouse_name': s.warehouse.name if s.warehouse else None,
                 'item_count': s.item_count_ann,
             })
         return Response(data)
@@ -158,12 +147,14 @@ class StockOpnameSessionListCreateView(APIView):
                 status=400,
             )
 
+        warehouse = Warehouse.objects.filter(pk=warehouse_id).first()
         with transaction.atomic():
             session = StockOpnameSession.objects.create(
                 date=date,
                 conducted_by=conducted_by,
                 notes=notes,
                 status='draft',
+                warehouse=warehouse,
                 started_at=timezone.now(),
                 created_by=_actor(request),
             )
@@ -199,9 +190,7 @@ class StockOpnameSessionDetailView(APIView):
             return Response({'error': 'Sesi yang sudah selesai tidak dapat diubah.'}, status=400)
 
         data = request.data
-        warehouse_id = data.get('warehouse_id') or (
-            session.items.values_list('warehouse_id', flat=True).first()
-        )
+        warehouse_id = data.get('warehouse_id') or session.warehouse_id
         items_data = data.get('items', [])
 
         if 'conducted_by' in data and data['conducted_by']:
@@ -236,9 +225,7 @@ class StockOpnameCompleteView(APIView):
             return Response({'error': 'Sesi sudah diselesaikan.'}, status=400)
 
         data = request.data
-        warehouse_id = data.get('warehouse_id') or (
-            session.items.values_list('warehouse_id', flat=True).first()
-        )
+        warehouse_id = data.get('warehouse_id') or session.warehouse_id
         items_data = data.get('items', [])
         loss_item_ids = {int(row['item_id']) for row in items_data if row.get('is_loss')}
 
