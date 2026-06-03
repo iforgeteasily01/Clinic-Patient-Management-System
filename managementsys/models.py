@@ -888,8 +888,15 @@ class IssueTicket(models.Model):
         ('resolved', 'Resolved'),
         ('closed', 'Closed'),
     ]
+    CATEGORY_CHOICES = [
+        ('sistem',    'Sistem'),
+        ('peralatan', 'Peralatan'),
+        ('jaringan',  'Jaringan'),
+        ('produk',    'Produk'),
+    ]
     ticket_no    = models.CharField(max_length=20, unique=True, editable=False)
     submitted_by = models.ForeignKey('AppUser', on_delete=models.PROTECT, related_name='tickets')
+    category     = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='sistem')
     title        = models.CharField(max_length=255)
     description  = models.TextField()
     status       = models.CharField(max_length=20, choices=STATUS_CHOICES, default='open')

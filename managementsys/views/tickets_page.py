@@ -23,6 +23,7 @@ def _push_to_vercel(ticket: IssueTicket):
     payload = json.dumps({
         'ticket_no':    ticket.ticket_no,
         'submitted_by': ticket.submitted_by.display_name,
+        'category':     ticket.category,
         'title':        ticket.title,
         'description':  ticket.description,
         'image_count':  ticket.images.count(),

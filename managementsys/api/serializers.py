@@ -596,16 +596,18 @@ class IssueTicketImageSerializer(serializers.ModelSerializer):
 class IssueTicketSerializer(serializers.ModelSerializer):
     submitted_by_username = serializers.CharField(source='submitted_by.display_name', read_only=True)
     images = IssueTicketImageSerializer(many=True, read_only=True)
-    status_display = serializers.CharField(source='get_status_display', read_only=True)
+    status_display   = serializers.CharField(source='get_status_display', read_only=True)
+    category_display = serializers.CharField(source='get_category_display', read_only=True)
 
     class Meta:
         model = IssueTicket
         fields = [
             'id', 'ticket_no', 'submitted_by', 'submitted_by_username',
+            'category', 'category_display',
             'title', 'description', 'status', 'status_display',
             'images', 'created_at', 'updated_at',
         ]
-        read_only_fields = ['id', 'ticket_no', 'submitted_by_username', 'images', 'status_display', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'ticket_no', 'submitted_by_username', 'category_display', 'images', 'status_display', 'created_at', 'updated_at']
 
 
 # ── Patient Notes ──────────────────────────────────────────────────────────

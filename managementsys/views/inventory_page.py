@@ -235,6 +235,15 @@ class InventoryBatchListView(APIView):
 class StockInView(APIView):
     def post(self, request):
         data = request.data
+
+        # Bulk import path: { entries: [...] }
+        if 'entries' in data:
+            return self._handle_bulk(request, data['entries'])
+
+        # Single-entry path
+        return self._handle_single(request, data)
+
+    def _handle_single(self, request, data):
         try:
             item = InventoryItem.objects.get(pk=data['item_id'])
             warehouse = Warehouse.objects.get(pk=data['warehouse_id'])
@@ -276,12 +285,85 @@ class StockInView(APIView):
         )
         return Response(InventoryBatchSerializer(batch).data, status=status.HTTP_201_CREATED)
 
+    def _handle_bulk(self, request, entries):
+        actor = _actor(request)
+        created_batches = []
+        skipped = []
+
+        for i, entry in enumerate(entries):
+            try:
+                item = InventoryItem.objects.get(pk=entry['item_id'])
+                warehouse = Warehouse.objects.get(pk=entry['warehouse_id'])
+            except (InventoryItem.DoesNotExist, Warehouse.DoesNotExist, KeyError):
+                skipped.append({'index': i, 'reason': 'Invalid item or warehouse'})
+                continue
+
+            if item.is_service:
+                skipped.append({'index': i, 'reason': f'Item "{item.code}" is a service item'})
+                continue
+
+            try:
+                qty_raw = int(entry['quantity'])
+                unit = entry.get('unit', 'small')
+                qty_small = _to_small(item, qty_raw, unit)
+                value = Decimal(str(entry['value']))
+                input_date = entry['input_date']
+            except (KeyError, ValueError) as exc:
+                skipped.append({'index': i, 'reason': str(exc)})
+                continue
+
+            if qty_small <= 0:
+                skipped.append({'index': i, 'reason': 'Quantity must be positive'})
+                continue
+
+            batch = InventoryBatch.objects.create(
+                item=item,
+                warehouse=warehouse,
+                input_date=input_date,
+                quantity_initial=qty_small,
+                quantity_remaining=qty_small,
+                value=value,
+                created_by=actor,
+            )
+            AuditLog.objects.create(
+                performed_by=actor,
+                action='CREATE',
+                entity_type='InventoryBatch',
+                entity_id=str(batch.id),
+                description=(
+                    f'Stock in (bulk import): {qty_small} {item.unit_small} of '
+                    f'[{item.code}] {item.name} @ {warehouse.name}'
+                ),
+            )
+            created_batches.append(batch)
+
+        if not created_batches and skipped:
+            return Response(
+                {'error': 'All entries were invalid. Nothing was imported.', 'skipped': skipped},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'imported': len(created_batches),
+            'skipped': len(skipped),
+            'skipped_details': skipped,
+            'batches': InventoryBatchSerializer(created_batches, many=True).data,
+        }, status=status.HTTP_201_CREATED)
+
 
 # ── Stock Out (FIFO) ───────────────────────────────────────────────────────
 
 class StockOutView(APIView):
     def post(self, request):
         data = request.data
+
+        # Bulk import path: { entries: [...] }
+        if 'entries' in data:
+            return self._handle_bulk(request, data['entries'])
+
+        return self._handle_single(request, data)
+
+    def _handle_single(self, request, data):
         try:
             item = InventoryItem.objects.get(pk=data['item_id'])
             warehouse = Warehouse.objects.get(pk=data['warehouse_id'])
@@ -332,6 +414,76 @@ class StockOutView(APIView):
             ),
         )
         return Response({'deducted': qty_small, 'unit': item.unit_small})
+
+    def _handle_bulk(self, request, entries):
+        actor = _actor(request)
+        deducted_count = 0
+        skipped = []
+
+        for i, entry in enumerate(entries):
+            try:
+                item = InventoryItem.objects.get(pk=entry['item_id'])
+                warehouse = Warehouse.objects.get(pk=entry['warehouse_id'])
+                qty_raw = int(entry['quantity'])
+                unit = entry.get('unit', 'small')
+                qty_small = _to_small(item, qty_raw, unit)
+            except (InventoryItem.DoesNotExist, Warehouse.DoesNotExist, KeyError, ValueError) as exc:
+                skipped.append({'index': i, 'reason': str(exc)})
+                continue
+
+            if item.is_service:
+                skipped.append({'index': i, 'reason': f'Item "{item.code}" is a service item'})
+                continue
+
+            if qty_small <= 0:
+                skipped.append({'index': i, 'reason': 'Quantity must be positive'})
+                continue
+
+            available = (
+                InventoryBatch.objects
+                .filter(item=item, warehouse=warehouse, quantity_remaining__gt=0)
+                .aggregate(total=Sum('quantity_remaining'))['total'] or 0
+            )
+            if available < qty_small:
+                skipped.append({
+                    'index': i,
+                    'reason': (
+                        f'Insufficient stock for [{item.code}]. '
+                        f'Available: {available} {item.unit_small}, requested: {qty_small}.'
+                    ),
+                })
+                continue
+
+            shortfall, _cogs = _fifo_deduct(item.id, warehouse.id, qty_small)
+            if shortfall > 0:
+                skipped.append({'index': i, 'reason': f'Concurrent modification for [{item.code}]'})
+                continue
+
+            notes = entry.get('notes', '')
+            AuditLog.objects.create(
+                performed_by=actor,
+                action='CREATE',
+                entity_type='StockOut',
+                entity_id=str(item.id),
+                description=(
+                    f'Stock out (bulk import): {qty_small} {item.unit_small} of '
+                    f'[{item.code}] {item.name} @ {warehouse.name}'
+                    + (f'. Notes: {notes}' if notes else '')
+                ),
+            )
+            deducted_count += 1
+
+        if deducted_count == 0 and skipped:
+            return Response(
+                {'error': 'All entries were invalid. Nothing was deducted.', 'skipped': skipped},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            'imported': deducted_count,
+            'skipped': len(skipped),
+            'skipped_details': skipped,
+        }, status=status.HTTP_201_CREATED)
 
 
 # ── Cashier sync ───────────────────────────────────────────────────────────
