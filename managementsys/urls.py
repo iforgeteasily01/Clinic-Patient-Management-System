@@ -89,6 +89,7 @@ urlpatterns = [
     path('api/inventory/batches/', views.InventoryBatchListView.as_view(), name='inventory-batches'),
     path('api/inventory/stock-in/', views.StockInView.as_view(), name='inventory-stock-in'),
     path('api/inventory/stock-out/', views.StockOutView.as_view(), name='inventory-stock-out'),
+    path('api/inventory/stock-out/batches/', views.StockOutBatchListView.as_view(), name='inventory-stock-out-batches'),
     path('api/inventory/sync/items/', views.ItemSyncView.as_view(), name='inventory-sync-items'),
 
     # Stock Opname

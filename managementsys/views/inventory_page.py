@@ -22,7 +22,7 @@ from ..api.serializers import (
     ItemSyncSerializer,
     WarehouseSerializer,
 )
-from ..models import AppUser, AuditLog, InventoryBatch, InventoryItem, Warehouse
+from ..models import AppUser, AuditLog, InventoryBatch, InventoryItem, StockOutLog, Warehouse
 
 
 def _actor(request):
@@ -401,9 +401,12 @@ class StockOutView(APIView):
                 status=status.HTTP_409_CONFLICT,
             )
 
+        import datetime
         notes = data.get('notes', '')
+        out_date = data.get('out_date') or str(datetime.date.today())
+        actor = _actor(request)
         AuditLog.objects.create(
-            performed_by=_actor(request),
+            performed_by=actor,
             action='CREATE',
             entity_type='StockOut',
             entity_id=str(item.id),
@@ -412,6 +415,14 @@ class StockOutView(APIView):
                 f'[{item.code}] {item.name} @ {warehouse.name}'
                 + (f'. Notes: {notes}' if notes else '')
             ),
+        )
+        StockOutLog.objects.create(
+            item=item,
+            warehouse=warehouse,
+            out_date=out_date,
+            quantity=qty_small,
+            notes=notes,
+            created_by=actor,
         )
         return Response({'deducted': qty_small, 'unit': item.unit_small})
 
@@ -459,7 +470,9 @@ class StockOutView(APIView):
                 skipped.append({'index': i, 'reason': f'Concurrent modification for [{item.code}]'})
                 continue
 
+            import datetime
             notes = entry.get('notes', '')
+            out_date = entry.get('out_date') or str(datetime.date.today())
             AuditLog.objects.create(
                 performed_by=actor,
                 action='CREATE',
@@ -470,6 +483,14 @@ class StockOutView(APIView):
                     f'[{item.code}] {item.name} @ {warehouse.name}'
                     + (f'. Notes: {notes}' if notes else '')
                 ),
+            )
+            StockOutLog.objects.create(
+                item=item,
+                warehouse=warehouse,
+                out_date=out_date,
+                quantity=qty_small,
+                notes=notes,
+                created_by=actor,
             )
             deducted_count += 1
 
@@ -484,6 +505,35 @@ class StockOutView(APIView):
             'skipped': len(skipped),
             'skipped_details': skipped,
         }, status=status.HTTP_201_CREATED)
+
+
+# ── Stock-out history ──────────────────────────────────────────────────────
+
+class StockOutBatchListView(APIView):
+    def get(self, request):
+        qs = StockOutLog.objects.select_related('item', 'warehouse', 'created_by').order_by('-created_at')
+        if item_id := request.GET.get('item_id'):
+            qs = qs.filter(item_id=item_id)
+        if warehouse_id := request.GET.get('warehouse_id'):
+            qs = qs.filter(warehouse_id=warehouse_id)
+        data = [
+            {
+                'id': log.id,
+                'item_id': log.item_id,
+                'item_code': log.item.code,
+                'item_name': log.item.name,
+                'item_unit_small': log.item.unit_small,
+                'warehouse_id': log.warehouse_id,
+                'warehouse_name': log.warehouse.name,
+                'out_date': str(log.out_date),
+                'quantity': log.quantity,
+                'notes': log.notes,
+                'created_by_name': log.created_by.display_name if log.created_by else None,
+                'created_at': log.created_at.isoformat(),
+            }
+            for log in qs
+        ]
+        return Response(data)
 
 
 # ── Cashier sync ───────────────────────────────────────────────────────────

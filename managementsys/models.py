@@ -863,6 +863,19 @@ class StockOpnameItem(models.Model):
         unique_together = [('session', 'item', 'warehouse')]
 
 
+class StockOutLog(models.Model):
+    item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT, related_name='stock_out_logs')
+    warehouse = models.ForeignKey(Warehouse, on_delete=models.PROTECT, related_name='stock_out_logs')
+    out_date = models.DateField()
+    quantity = models.PositiveIntegerField()
+    notes = models.TextField(blank=True, default='')
+    created_by = models.ForeignKey(AppUser, null=True, blank=True, on_delete=models.SET_NULL, related_name='stock_out_logs')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
 class SiteConfig(models.Model):
     """Singleton row (always pk=1) holding clinic-wide receipt settings."""
     clinic_name          = models.CharField(max_length=200, default='')
