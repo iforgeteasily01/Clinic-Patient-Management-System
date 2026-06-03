@@ -52,29 +52,56 @@ def _serialize_session_detail(session):
 
 
 def _detail_qs(pk):
-    """Single-session queryset with all related data pre-fetched."""
+    """Single-session queryset with all related data pre-fetched, items sorted by name."""
     return (
         StockOpnameSession.objects
         .select_related('created_by')
         .prefetch_related(
             Prefetch(
                 'items',
-                queryset=StockOpnameItem.objects.select_related('item', 'warehouse'),
+                queryset=StockOpnameItem.objects
+                    .select_related('item', 'warehouse')
+                    .order_by('item__name'),
             )
         )
         .get(pk=pk)
     )
 
 
-def _save_items(session, warehouse_id, items_data):
+def _save_items(session, warehouse_id, items_data, merge=False):
+    """
+    Upsert opname items for a session.
+
+    When merge=True (collaborative saves), a zero incoming value does not
+    overwrite an existing non-zero value — only filled-in (> 0) values win.
+    This lets multiple users fill in different portions without clobbering
+    each other's work.
+    """
+    if not items_data:
+        return
+    wh_id = int(warehouse_id)
+    if merge:
+        existing_map = {
+            it.item_id: it
+            for it in StockOpnameItem.objects.filter(session=session, warehouse_id=wh_id)
+        }
     for row in items_data:
+        item_id = int(row['item_id'])
+        inc_s1 = int(row.get('shelf1_qty') or 0)
+        inc_s2 = int(row.get('shelf2_qty') or 0)
+        if merge:
+            ex = existing_map.get(item_id)
+            s1 = inc_s1 if inc_s1 > 0 else (ex.shelf1_qty if ex else 0)
+            s2 = inc_s2 if inc_s2 > 0 else (ex.shelf2_qty if ex else 0)
+        else:
+            s1, s2 = inc_s1, inc_s2
         StockOpnameItem.objects.update_or_create(
             session=session,
-            item_id=int(row['item_id']),
-            warehouse_id=int(warehouse_id),
+            item_id=item_id,
+            warehouse_id=wh_id,
             defaults={
-                'shelf1_qty': int(row.get('shelf1_qty') or 0),
-                'shelf2_qty': int(row.get('shelf2_qty') or 0),
+                'shelf1_qty': s1,
+                'shelf2_qty': s2,
                 'system_qty': int(row.get('system_qty') or 0),
                 'is_loss': bool(row.get('is_loss', False)),
             },
@@ -83,17 +110,19 @@ def _save_items(session, warehouse_id, items_data):
 
 class StockOpnameSessionListCreateView(APIView):
     def get(self, request):
-        # select_related + prefetch avoids N+1; Count annotation avoids item_count queries
         sessions = (
             StockOpnameSession.objects
             .select_related('created_by')
             .prefetch_related(
                 Prefetch(
                     'items',
-                    queryset=StockOpnameItem.objects.select_related('warehouse').order_by('id'),
+                    queryset=StockOpnameItem.objects
+                        .select_related('warehouse')
+                        .order_by('item__name'),
                 )
             )
             .annotate(item_count_ann=Count('items', distinct=True))
+            .order_by('-date', '-created_at')
         )
         data = []
         for s in sessions:
@@ -184,8 +213,7 @@ class StockOpnameSessionDetailView(APIView):
         session.save()
 
         with transaction.atomic():
-            session.items.all().delete()
-            _save_items(session, warehouse_id, items_data)
+            _save_items(session, warehouse_id, items_data, merge=True)
 
         AuditLog.objects.create(
             performed_by=_actor(request),
@@ -212,25 +240,26 @@ class StockOpnameCompleteView(APIView):
             session.items.values_list('warehouse_id', flat=True).first()
         )
         items_data = data.get('items', [])
+        loss_item_ids = {int(row['item_id']) for row in items_data if row.get('is_loss')}
 
         with transaction.atomic():
-            session.items.all().delete()
-            _save_items(session, warehouse_id, items_data)
+            # Merge counts — non-zero values from any contributor win.
+            _save_items(session, warehouse_id, items_data, merge=True)
+
+            # Apply is_loss decisions from this final submission.
+            session.items.filter(item_id__in=loss_item_ids).update(is_loss=True)
+            session.items.exclude(item_id__in=loss_item_ids).update(is_loss=False)
 
             total_loss_qty = 0
             total_loss_cogs = Decimal('0')
 
-            for row in items_data:
-                if not row.get('is_loss'):
-                    continue
-                item_id = int(row['item_id'])
-                physical_total = int(row.get('shelf1_qty') or 0) + int(row.get('shelf2_qty') or 0)
-                system_qty = int(row.get('system_qty') or 0)
-                shortage = system_qty - physical_total
+            for opname_item in session.items.select_related('item').filter(is_loss=True):
+                physical = opname_item.shelf1_qty + opname_item.shelf2_qty
+                shortage = opname_item.system_qty - physical
                 if shortage <= 0:
                     continue
 
-                shortfall, cogs = _fifo_deduct(item_id, int(warehouse_id), shortage)
+                shortfall, cogs = _fifo_deduct(opname_item.item_id, int(warehouse_id), shortage)
                 total_loss_qty += shortage - shortfall
                 total_loss_cogs += cogs
 
@@ -240,8 +269,8 @@ class StockOpnameCompleteView(APIView):
                     entity_type='StockOpnameLoss',
                     entity_id=str(session.id),
                     description=(
-                        f'Stok opname #{session.id}: item #{item_id} '
-                        f'dicatat susut {shortage} {row.get("item_unit_small", "unit")} '
+                        f'Stok opname #{session.id}: item #{opname_item.item_id} '
+                        f'dicatat susut {shortage} {opname_item.item.unit_small} '
                         f'(HPP Rp {cogs:,.0f}).'
                     ),
                 )
