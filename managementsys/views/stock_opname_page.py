@@ -427,10 +427,10 @@ class StockOpnameTemplateSampleView(APIView):
         if warehouse_id:
             item_ids = (
                 InventoryBatch.objects
-                .filter(warehouse_id=warehouse_id, quantity__gt=0,
+                .filter(warehouse_id=warehouse_id, quantity_remaining__gt=0,
                         item__is_active=True, item__is_service=False)
                 .values('item_id')
-                .annotate(total=Sum('quantity'))
+                .annotate(total=Sum('quantity_remaining'))
                 .filter(total__gt=0)
                 .values_list('item_id', flat=True)
             )
