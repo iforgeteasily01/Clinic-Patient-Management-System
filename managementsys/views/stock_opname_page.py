@@ -307,7 +307,7 @@ class StockOpnameTemplateView(APIView):
                 .get(warehouse_id=warehouse_id)
             )
         except StockOpnameTemplate.DoesNotExist:
-            return Response(None)
+            return Response({'sections': [], 'exists': False})
 
         sections: dict[str, list] = {}
         section_order_map: dict[str, int] = {}
