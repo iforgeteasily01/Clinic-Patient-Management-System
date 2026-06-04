@@ -15,11 +15,11 @@ from rest_framework.views import APIView
 from ..api.serializers import InvoiceCreateSerializer, InvoiceReadSerializer, InvoiceUpdateSerializer
 from ..models import (
     AppUser, AuditLog, ChartOfAccounts, InventoryItem, Invoice, InvoiceItem,
-    Patient, PatientPackage, PatientPackageRedemption, PromotionUsage,
+    LedgerEntry, Patient, PatientPackage, PatientPackageRedemption, PromotionUsage,
     Treatment, TreatmentPackage, Warehouse,
 )
 from .crm_page import refresh_crm_profile
-from .inventory_page import _fifo_deduct, _fifo_restock
+from .inventory_page import _fifo_deduct, _fifo_deduct_global, _fifo_restock
 from .promotion_page import validate_promotion
 
 logger = logging.getLogger(__name__)
@@ -41,20 +41,37 @@ def _actor(request):
     return request.user if isinstance(request.user, AppUser) else None
 
 
+def _le(account, entry_type, amount, invoice, description):
+    """Create a single LedgerEntry row."""
+    LedgerEntry.objects.create(
+        account=account,
+        date=invoice.datetime.date(),
+        description=description,
+        entry_type=entry_type,
+        amount=amount,
+        invoice=invoice,
+    )
+
+
 def _post_accounting(invoice, line_items, items_by_id):
     """
     Post accounting entries for a completed invoice:
-      - Cash/payment account  += grand_total
-      - Per line: revenue account for the item's category += price * qty
+      - Cash/payment account  += grand_total  (DEBIT asset)
+      - Per line: revenue account for the item's category += price * qty  (CREDIT revenue)
       - Per physical line (is_service=False): FIFO deduct stock, then
-        inventory asset -= COGS, COGS account += COGS
+        inventory asset -= COGS  (CREDIT asset),  COGS account += COGS  (DEBIT COGS)
     Falls back to system accounts (4200000, 5100000, 1300000) when an item
     has no item_category assigned.
+    Each balance change is mirrored as a LedgerEntry row for historical reporting.
     """
+    inv_no = invoice.invoice_number
+
     if invoice.payment_method_id:
         ChartOfAccounts.objects.filter(pk=invoice.payment_method_id).update(
             balance=F('balance') + invoice.grand_total
         )
+        _le(invoice.payment_method, 'debit', invoice.grand_total, invoice,
+            f'Invoice {inv_no} – Payment received')
 
     fallback_revenue = ChartOfAccounts.objects.filter(account_number=4200000).first()
     fallback_cogs = ChartOfAccounts.objects.filter(account_number=5100000).first()
@@ -74,6 +91,8 @@ def _post_accounting(invoice, line_items, items_by_id):
             ChartOfAccounts.objects.filter(pk=revenue_acct.pk).update(
                 balance=F('balance') + line_revenue
             )
+            _le(revenue_acct, 'credit', line_revenue, invoice,
+                f'Invoice {inv_no} – {item.name}')
 
         if not item.is_service and invoice.warehouse_id:
             qty_int = int(line['quantity'].to_integral_value())
@@ -84,22 +103,59 @@ def _post_accounting(invoice, line_items, items_by_id):
                         ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
                             balance=F('balance') - cogs_amount
                         )
+                        _le(inventory_asset, 'credit', cogs_amount, invoice,
+                            f'Invoice {inv_no} – FIFO deduction: {item.name}')
                     if cogs_acct:
                         ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
                             balance=F('balance') + cogs_amount
                         )
+                        _le(cogs_acct, 'debit', cogs_amount, invoice,
+                            f'Invoice {inv_no} – COGS: {item.name}')
+
+        if item.is_service:
+            treatment = getattr(item, 'treatment', None)
+            if treatment:
+                deduct_fn = (
+                    (lambda mid, qty: _fifo_deduct(mid, invoice.warehouse_id, int(qty.to_integral_value())))
+                    if invoice.warehouse_id
+                    else (lambda mid, qty: _fifo_deduct_global(mid, qty))
+                )
+                for material in treatment.materials.all():
+                    _shortfall, mat_cogs = deduct_fn(material.item_id, material.quantity_small)
+                    if mat_cogs <= 0:
+                        continue
+                    if inventory_asset:
+                        ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
+                            balance=F('balance') - mat_cogs
+                        )
+                        _le(inventory_asset, 'credit', mat_cogs, invoice,
+                            f'Invoice {inv_no} – material: {material.item.name} for {item.name}')
+                    if cogs_acct:
+                        ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
+                            balance=F('balance') + mat_cogs
+                        )
+                        _le(cogs_acct, 'debit', mat_cogs, invoice,
+                            f'Invoice {inv_no} – material COGS: {material.item.name} for {item.name}')
 
 
-def _reverse_accounting_instances(payment_method_id, grand_total, item_instances, warehouse_id):
+def _reverse_accounting_instances(payment_method_id, grand_total, item_instances, warehouse_id, invoice=None):
     """
     Reverse every accounting entry that _post_accounting originally made,
     using InvoiceItem model instances (with item relations already prefetched).
     Called at the start of a PUT/PATCH so the edit can be re-applied cleanly.
+    Each reversal is recorded as a LedgerEntry (opposite entry_type) when invoice is supplied.
     """
+    inv_no = invoice.invoice_number if invoice else '?'
+
     if payment_method_id:
         ChartOfAccounts.objects.filter(pk=payment_method_id).update(
             balance=F('balance') - grand_total
         )
+        if invoice:
+            payment_acct = ChartOfAccounts.objects.filter(pk=payment_method_id).first()
+            if payment_acct:
+                _le(payment_acct, 'credit', grand_total, invoice,
+                    f'Invoice {inv_no} – Payment correction')
 
     fallback_revenue = ChartOfAccounts.objects.filter(account_number=4200000).first()
     fallback_cogs    = ChartOfAccounts.objects.filter(account_number=5100000).first()
@@ -119,6 +175,9 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
             ChartOfAccounts.objects.filter(pk=revenue_acct.pk).update(
                 balance=F('balance') - line_revenue
             )
+            if invoice:
+                _le(revenue_acct, 'debit', line_revenue, invoice,
+                    f'Invoice {inv_no} – Correction: {item.name}')
 
         if not item.is_service and warehouse_id:
             qty_int = int(inst.quantity.to_integral_value())
@@ -129,10 +188,16 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
                         ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
                             balance=F('balance') + cogs_amount
                         )
+                        if invoice:
+                            _le(inventory_asset, 'debit', cogs_amount, invoice,
+                                f'Invoice {inv_no} – FIFO restock: {item.name}')
                     if cogs_acct:
                         ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
                             balance=F('balance') - cogs_amount
                         )
+                        if invoice:
+                            _le(cogs_acct, 'credit', cogs_amount, invoice,
+                                f'Invoice {inv_no} – COGS correction: {item.name}')
 
 
 def _handle_packages(invoice, patient, line_items, items_by_id):
@@ -265,7 +330,7 @@ class InvoiceCreateView(APIView):
             for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
                 'item_category__revenue_account',
                 'item_category__cogs_account',
-            )
+            ).prefetch_related('treatment__materials__item')
         }
         missing = [iid for iid in item_ids if iid not in items_by_id]
         if missing:
@@ -532,7 +597,8 @@ class InvoiceDetailView(APIView):
         # ── Accounting: reverse old entries, re-apply for new state ──────────
 
         _reverse_accounting_instances(
-            old_payment_method_id, old_grand_total, old_item_instances, old_warehouse_id
+            old_payment_method_id, old_grand_total, old_item_instances, old_warehouse_id,
+            invoice=invoice,
         )
 
         if new_line_items_data is not None:

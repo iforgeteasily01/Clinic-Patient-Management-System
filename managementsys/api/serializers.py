@@ -5,10 +5,10 @@ from rest_framework import serializers
 from ..models import (
     ActivePatient, AppUser, AssessmentCode, AttendanceRecord, Beauticians, ChartOfAccounts,
     Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem, IssueTicket, IssueTicketImage,
-    MedRec, Patient, PatientCRMProfile, PatientNote, PatientPackage, PatientPackageRedemption,
+    LedgerEntry, MedRec, Patient, PatientCRMProfile, PatientNote, PatientPackage, PatientPackageRedemption,
     PatientPhoto, PatientTier, Promotion, SiteConfig, SoapTemplate, StaffSchedule, Treatment,
-    TreatmentCategory, TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse,
-    WorkShift, patientStatus,
+    TreatmentCategory, TreatmentMaterial, TreatmentPackage, TreatmentPackageItem, TreatmentSession,
+    Warehouse, WorkShift, patientStatus,
 )
 
 
@@ -132,6 +132,17 @@ class TreatmentSerializer(serializers.ModelSerializer):
         model = Treatment
         fields = ["id", "code", "name", "category", "price", "active", "catalog_item_id"]
         read_only_fields = ["catalog_item_id"]
+
+
+class TreatmentMaterialSerializer(serializers.ModelSerializer):
+    item_name = serializers.CharField(source='item.name', read_only=True)
+    item_code = serializers.CharField(source='item.code', read_only=True)
+    unit_small = serializers.CharField(source='item.unit_small', read_only=True)
+
+    class Meta:
+        model = TreatmentMaterial
+        fields = ['id', 'treatment', 'item', 'item_name', 'item_code', 'unit_small', 'quantity_small']
+        read_only_fields = ['id', 'item_name', 'item_code', 'unit_small']
 
 
 class AppUserPublicSerializer(serializers.ModelSerializer):
@@ -522,17 +533,40 @@ class ChartOfAccountsSerializer(serializers.ModelSerializer):
 # ── Treatment Categories ───────────────────────────────────────────────────
 
 class TreatmentCategorySerializer(serializers.ModelSerializer):
-    revenue_account_number = serializers.IntegerField(
-        source='revenue_account.account_number', read_only=True, allow_null=True
-    )
-    cogs_account_number = serializers.IntegerField(
-        source='cogs_account.account_number', read_only=True, allow_null=True
-    )
+    revenue_account_id     = serializers.IntegerField(source='revenue_account.id',             read_only=True, allow_null=True)
+    revenue_account_number = serializers.IntegerField(source='revenue_account.account_number', read_only=True, allow_null=True)
+    revenue_account_name   = serializers.CharField(   source='revenue_account.name',           read_only=True, allow_null=True)
+    cogs_account_id        = serializers.IntegerField(source='cogs_account.id',                read_only=True, allow_null=True)
+    cogs_account_number    = serializers.IntegerField(source='cogs_account.account_number',    read_only=True, allow_null=True)
+    cogs_account_name      = serializers.CharField(   source='cogs_account.name',              read_only=True, allow_null=True)
+    expense_account_id     = serializers.IntegerField(source='expense_account.id',             read_only=True, allow_null=True)
+    expense_account_number = serializers.IntegerField(source='expense_account.account_number', read_only=True, allow_null=True)
+    expense_account_name   = serializers.CharField(   source='expense_account.name',           read_only=True, allow_null=True)
 
     class Meta:
         model = TreatmentCategory
-        fields = ['id', 'name', 'revenue_account_number', 'cogs_account_number']
-        read_only_fields = ['id', 'revenue_account_number', 'cogs_account_number']
+        fields = [
+            'id', 'name',
+            'revenue_account_id', 'revenue_account_number', 'revenue_account_name',
+            'cogs_account_id', 'cogs_account_number', 'cogs_account_name',
+            'expense_account_id', 'expense_account_number', 'expense_account_name',
+        ]
+        read_only_fields = [
+            'id',
+            'revenue_account_id', 'revenue_account_number', 'revenue_account_name',
+            'cogs_account_id', 'cogs_account_number', 'cogs_account_name',
+            'expense_account_id', 'expense_account_number', 'expense_account_name',
+        ]
+
+
+# ── Ledger ────────────────────────────────────────────────────────────────
+
+class LedgerEntrySerializer(serializers.ModelSerializer):
+    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = LedgerEntry
+        fields = ['id', 'date', 'description', 'entry_type', 'amount', 'invoice_number', 'created_at']
 
 
 # ── AppUser Admin ──────────────────────────────────────────────────────────

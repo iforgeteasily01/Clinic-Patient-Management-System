@@ -194,6 +194,29 @@ class Treatment(models.Model):
             InventoryItem.objects.filter(pk=catalog_item_id, is_service=True).delete()
 
 
+class TreatmentMaterial(models.Model):
+    """Stock items consumed during a treatment (e.g. 5 ml of cleanser per facial)."""
+    treatment = models.ForeignKey(
+        Treatment,
+        on_delete=models.CASCADE,
+        related_name='materials',
+    )
+    item = models.ForeignKey(
+        'InventoryItem',
+        on_delete=models.PROTECT,
+        related_name='treatment_materials',
+        limit_choices_to={'is_service': False},
+    )
+    quantity_small = models.DecimalField(max_digits=10, decimal_places=4)
+
+    class Meta:
+        unique_together = ('treatment', 'item')
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.treatment.name} — {self.quantity_small} {self.item.unit_small} of {self.item.name}'
+
+
 # TreatmentSession
 
 
@@ -439,6 +462,25 @@ class InvoiceItem(models.Model):
         return f"{self.invoice.invoice_number} – {self.item.name} ×{self.quantity}"
 
 
+class LedgerEntry(models.Model):
+    ENTRY_TYPE_CHOICES = [('debit', 'Debit'), ('credit', 'Credit')]
+
+    account    = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, related_name='ledger_entries')
+    date       = models.DateField()
+    description = models.CharField(max_length=255)
+    entry_type = models.CharField(max_length=6, choices=ENTRY_TYPE_CHOICES)
+    amount     = models.DecimalField(max_digits=18, decimal_places=2)
+    invoice    = models.ForeignKey('Invoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-date', '-created_at']
+        verbose_name_plural = 'Ledger Entries'
+
+    def __str__(self):
+        return f'{self.date} | {self.entry_type.upper()} {self.amount} → {self.account}'
+
+
 class TreatmentCategory(models.Model):
     name = models.CharField(max_length=50, unique=True)
     revenue_account = models.OneToOneField(
@@ -453,6 +495,12 @@ class TreatmentCategory(models.Model):
         on_delete=models.SET_NULL,
         related_name='cogs_category',
     )
+    expense_account = models.OneToOneField(
+        'ChartOfAccounts',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='expense_category',
+    )
 
     class Meta:
         ordering = ['name']
@@ -461,36 +509,75 @@ class TreatmentCategory(models.Model):
     def __str__(self):
         return self.name
 
+    @staticmethod
+    def _next_account_number(range_min, range_max, step=1000):
+        max_num = (
+            ChartOfAccounts.objects
+            .filter(account_number__gte=range_min, account_number__lte=range_max)
+            .aggregate(m=Max('account_number'))['m']
+        )
+        nxt = (max_num + step) if max_num is not None else range_min
+        if nxt > range_max:
+            raise ValueError(f'Account range {range_min}–{range_max} is exhausted.')
+        return nxt
+
+    def ensure_accounts(self):
+        """Create any missing COA accounts for this category.
+
+        Safe to call on existing categories. Persists via a direct queryset
+        update to avoid re-triggering the save() auto-create branch.
+        Returns a dict describing what was created (empty if nothing was needed).
+        """
+        created = {}
+        if not self.revenue_account_id:
+            self.revenue_account = ChartOfAccounts.objects.create(
+                account_number=self._next_account_number(4400000, 4999999),
+                name=f'Treatment Revenue – {self.name}',
+                account_type='revenue',
+            )
+            created['revenue_account'] = str(self.revenue_account)
+        if not self.cogs_account_id:
+            self.cogs_account = ChartOfAccounts.objects.create(
+                account_number=self._next_account_number(5400000, 5999999),
+                name=f'COGS – {self.name}',
+                account_type='cogs',
+            )
+            created['cogs_account'] = str(self.cogs_account)
+        if not self.expense_account_id:
+            self.expense_account = ChartOfAccounts.objects.create(
+                account_number=self._next_account_number(6900000, 6999999),
+                name=f'Expense – {self.name}',
+                account_type='expense',
+            )
+            created['expense_account'] = str(self.expense_account)
+        if created:
+            TreatmentCategory.objects.filter(pk=self.pk).update(
+                revenue_account_id=self.revenue_account_id,
+                cogs_account_id=self.cogs_account_id,
+                expense_account_id=self.expense_account_id,
+            )
+        return created
+
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         if is_new:
             if not self.revenue_account_id:
-                max_num = (
-                    ChartOfAccounts.objects
-                    .filter(account_number__gte=4400000, account_number__lte=4999999)
-                    .aggregate(m=Max('account_number'))['m']
-                )
-                next_num = (max_num + 1000) if max_num is not None else 4400000
-                if next_num > 4999999:
-                    raise ValueError('Revenue account range 4400000–4999999 is exhausted.')
                 self.revenue_account = ChartOfAccounts.objects.create(
-                    account_number=next_num,
+                    account_number=self._next_account_number(4400000, 4999999),
                     name=f'Treatment Revenue – {self.name}',
                     account_type='revenue',
                 )
             if not self.cogs_account_id:
-                max_num = (
-                    ChartOfAccounts.objects
-                    .filter(account_number__gte=5400000, account_number__lte=5999999)
-                    .aggregate(m=Max('account_number'))['m']
-                )
-                next_num = (max_num + 1000) if max_num is not None else 5400000
-                if next_num > 5999999:
-                    raise ValueError('COGS account range 5400000–5999999 is exhausted.')
                 self.cogs_account = ChartOfAccounts.objects.create(
-                    account_number=next_num,
+                    account_number=self._next_account_number(5400000, 5999999),
                     name=f'COGS – {self.name}',
                     account_type='cogs',
+                )
+            if not self.expense_account_id:
+                self.expense_account = ChartOfAccounts.objects.create(
+                    account_number=self._next_account_number(6900000, 6999999),
+                    name=f'Expense – {self.name}',
+                    account_type='expense',
                 )
         else:
             if self.revenue_account_id:
@@ -500,6 +587,10 @@ class TreatmentCategory(models.Model):
             if self.cogs_account_id:
                 ChartOfAccounts.objects.filter(pk=self.cogs_account_id).update(
                     name=f'COGS – {self.name}',
+                )
+            if self.expense_account_id:
+                ChartOfAccounts.objects.filter(pk=self.expense_account_id).update(
+                    name=f'Expense – {self.name}',
                 )
         super().save(*args, **kwargs)
 
@@ -875,6 +966,38 @@ class StockOutLog(models.Model):
 
     class Meta:
         ordering = ['-created_at']
+
+
+class StockOpnameTemplate(models.Model):
+    warehouse = models.OneToOneField(
+        'Warehouse', on_delete=models.CASCADE, related_name='so_template'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(
+        'AppUser', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='so_templates_created',
+    )
+
+    def __str__(self):
+        return f'SO Template – {self.warehouse}'
+
+
+class StockOpnameTemplateItem(models.Model):
+    template = models.ForeignKey(
+        StockOpnameTemplate, on_delete=models.CASCADE, related_name='template_items'
+    )
+    item = models.ForeignKey('InventoryItem', on_delete=models.CASCADE)
+    section = models.CharField(max_length=200)
+    section_order = models.PositiveIntegerField(default=0)
+    item_order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['section_order', 'item_order']
+        unique_together = [('template', 'item')]
+
+    def __str__(self):
+        return f'{self.template} – {self.item.code} @ {self.section}'
 
 
 class SiteConfig(models.Model):

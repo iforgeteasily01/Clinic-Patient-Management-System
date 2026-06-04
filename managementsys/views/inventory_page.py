@@ -634,6 +634,35 @@ def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> tuple:
     return remaining, cogs
 
 
+def _fifo_deduct_global(item_id: int, quantity_small: Decimal) -> tuple:
+    """
+    Deduct a decimal quantity (in unit_small) from any warehouse, FIFO by date.
+    Quantity is rounded to the nearest integer before deduction since batches use
+    integer quantities. Returns (shortfall, cogs_amount).
+    """
+    qty = int(quantity_small.to_integral_value())
+    if qty <= 0:
+        return 0, Decimal('0')
+    batches = (
+        InventoryBatch.objects
+        .select_for_update()
+        .filter(item_id=item_id, quantity_remaining__gt=0)
+        .order_by('input_date', 'created_at')
+    )
+    remaining = qty
+    cogs = Decimal('0')
+    for batch in batches:
+        if remaining <= 0:
+            break
+        deduct = min(batch.quantity_remaining, remaining)
+        if batch.quantity_initial:
+            cogs += (batch.value / Decimal(batch.quantity_initial)) * deduct
+        batch.quantity_remaining -= deduct
+        batch.save(update_fields=['quantity_remaining'])
+        remaining -= deduct
+    return remaining, cogs
+
+
 @transaction.atomic
 def _fifo_restock(item_id: int, warehouse_id: int, quantity: int) -> Decimal:
     """Return stock to batches (newest-first). Returns the COGS amount reversed."""

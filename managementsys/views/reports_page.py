@@ -1,3 +1,5 @@
+from zoneinfo import ZoneInfo
+
 from django.db.models import Count, F, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
@@ -6,15 +8,23 @@ from rest_framework.views import APIView
 
 from ..models import InventoryItem, Invoice
 
+_JAKARTA = ZoneInfo('Asia/Jakarta')
+
 
 class DashboardReportView(APIView):
     def get(self, request):
         now = timezone.now()
-        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Use Jakarta local time so "today" and "this month" match clinic hours.
+        local_now = now.astimezone(_JAKARTA)
 
-        if month_start.month == 1:
-            last_month_start = month_start.replace(year=month_start.year - 1, month=12)
+        today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        month_start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+        if local_now.month == 1:
+            last_month_start = local_now.replace(
+                year=local_now.year - 1, month=12, day=1,
+                hour=0, minute=0, second=0, microsecond=0,
+            )
         else:
             last_month_start = month_start.replace(month=month_start.month - 1)
 

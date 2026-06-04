@@ -1,7 +1,11 @@
+import io
 from decimal import Decimal
 
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 from django.db import transaction
 from django.db.models import Count, Prefetch, Sum
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -9,6 +13,8 @@ from rest_framework.views import APIView
 from ..models import (
     AppUser, AuditLog,
     StockOpnameSession, StockOpnameItem, Warehouse,
+    StockOpnameTemplate, StockOpnameTemplateItem,
+    InventoryItem, InventoryBatch,
 )
 from .inventory_page import _fifo_deduct
 
@@ -278,3 +284,193 @@ class StockOpnameCompleteView(APIView):
             ),
         )
         return Response(_serialize_session_detail(_detail_qs(pk)))
+
+
+# ── Stock Opname Template ──────────────────────────────────────────────────
+
+class StockOpnameTemplateView(APIView):
+    def get(self, request):
+        warehouse_id = request.GET.get('warehouse_id')
+        if not warehouse_id:
+            return Response({'error': 'warehouse_id required'}, status=400)
+        try:
+            template = (
+                StockOpnameTemplate.objects
+                .prefetch_related(
+                    Prefetch(
+                        'template_items',
+                        queryset=StockOpnameTemplateItem.objects
+                            .select_related('item')
+                            .order_by('section_order', 'item_order'),
+                    )
+                )
+                .get(warehouse_id=warehouse_id)
+            )
+        except StockOpnameTemplate.DoesNotExist:
+            return Response(None)
+
+        sections: dict[str, list] = {}
+        section_order_map: dict[str, int] = {}
+        for ti in template.template_items.all():
+            if ti.section not in sections:
+                sections[ti.section] = []
+                section_order_map[ti.section] = ti.section_order
+            sections[ti.section].append({
+                'item_id': ti.item_id,
+                'item_code': ti.item.code,
+                'item_name': ti.item.name,
+            })
+
+        return Response({
+            'warehouse_id': template.warehouse_id,
+            'sections': [
+                {'name': name, 'items': items}
+                for name, items in sorted(
+                    sections.items(), key=lambda x: section_order_map[x[0]]
+                )
+            ],
+            'updated_at': template.updated_at.isoformat(),
+        })
+
+    def post(self, request):
+        warehouse_id = request.data.get('warehouse_id')
+        file = request.FILES.get('file')
+        if not warehouse_id or not file:
+            return Response({'error': 'warehouse_id and file required.'}, status=400)
+
+        try:
+            warehouse = Warehouse.objects.get(pk=warehouse_id)
+        except Warehouse.DoesNotExist:
+            return Response({'error': 'Warehouse not found.'}, status=404)
+
+        try:
+            wb = openpyxl.load_workbook(file, read_only=True, data_only=True)
+            ws = wb.active
+        except Exception:
+            return Response({'error': 'Could not parse file. Upload a valid .xlsx file.'}, status=400)
+
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return Response({'error': 'File is empty.'}, status=400)
+
+        headers = [str(h).strip() if h else '' for h in rows[0]]
+        sections = [(i, h) for i, h in enumerate(headers) if h]
+        if not sections:
+            return Response({'error': 'No section headers found in row 1.'}, status=400)
+
+        all_codes: set[str] = set()
+        for row in rows[1:]:
+            for col_idx, _ in sections:
+                val = row[col_idx] if col_idx < len(row) else None
+                if val:
+                    all_codes.add(str(val).strip().upper())
+
+        item_map = {
+            item.code.upper(): item
+            for item in InventoryItem.objects.filter(code__in=all_codes)
+        }
+
+        errors = []
+        template_entries = []
+        seen_items: set[int] = set()
+
+        for section_order, (col_idx, section_name) in enumerate(sections):
+            item_order = 0
+            for row in rows[1:]:
+                val = row[col_idx] if col_idx < len(row) else None
+                if not val:
+                    continue
+                code = str(val).strip().upper()
+                item = item_map.get(code)
+                if not item:
+                    errors.append(f'Kode "{code}" di seksi "{section_name}" tidak ditemukan.')
+                    continue
+                if item.id in seen_items:
+                    continue
+                seen_items.add(item.id)
+                template_entries.append((section_order, section_name, item_order, item))
+                item_order += 1
+
+        if not template_entries:
+            return Response({'error': 'Tidak ada barang valid.\n' + '\n'.join(errors)}, status=400)
+
+        with transaction.atomic():
+            template_obj, _ = StockOpnameTemplate.objects.update_or_create(
+                warehouse=warehouse,
+                defaults={'created_by': _actor(request)},
+            )
+            StockOpnameTemplateItem.objects.filter(template=template_obj).delete()
+            StockOpnameTemplateItem.objects.bulk_create([
+                StockOpnameTemplateItem(
+                    template=template_obj,
+                    item=item,
+                    section=section_name,
+                    section_order=section_order,
+                    item_order=item_order,
+                )
+                for section_order, section_name, item_order, item in template_entries
+            ])
+
+        return Response({
+            'message': (
+                f'Template disimpan: {len(template_entries)} barang '
+                f'di {len(sections)} seksi.'
+            ),
+            'warnings': errors,
+        }, status=201)
+
+
+class StockOpnameTemplateSampleView(APIView):
+    def get(self, request):
+        warehouse_id = request.GET.get('warehouse_id')
+
+        if warehouse_id:
+            item_ids = (
+                InventoryBatch.objects
+                .filter(warehouse_id=warehouse_id, quantity__gt=0,
+                        item__is_active=True, item__is_service=False)
+                .values('item_id')
+                .annotate(total=Sum('quantity'))
+                .filter(total__gt=0)
+                .values_list('item_id', flat=True)
+            )
+            items = list(
+                InventoryItem.objects
+                .filter(pk__in=item_ids, is_service=False)
+                .order_by('code')
+            )
+        else:
+            items = list(
+                InventoryItem.objects
+                .filter(is_active=True, is_service=False)
+                .order_by('code')[:50]
+            )
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'SO Template'
+
+        blue_fill = PatternFill(fill_type='solid', fgColor='2563EB')
+        white_bold = Font(bold=True, color='FFFFFF')
+        center = Alignment(horizontal='center')
+
+        sample_sections = ['Seksi 1', 'Seksi 2', 'Seksi 3']
+        for col_idx, name in enumerate(sample_sections, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=name)
+            cell.font = white_bold
+            cell.fill = blue_fill
+            cell.alignment = center
+            ws.column_dimensions[cell.column_letter].width = 28
+
+        for row_idx, item in enumerate(items, start=2):
+            ws.cell(row=row_idx, column=1, value=item.code)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        response = HttpResponse(
+            buf.read(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = 'attachment; filename="so_template_sample.xlsx"'
+        return response

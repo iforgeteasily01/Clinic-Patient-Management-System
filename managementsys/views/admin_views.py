@@ -3,7 +3,7 @@ import io
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.http import HttpResponse
 from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
@@ -12,21 +12,22 @@ from rest_framework.views import APIView
 
 _HEADER_FONT = Font(bold=True, color='FFFFFF')
 _HEADER_FILL = PatternFill('solid', fgColor='0284C7')
-
 from ..api.serializers import (
     AppUserAdminSerializer,
     BeauticiansSerializer,
     ChartOfAccountsSerializer,
     DoctorsSerializer,
+    LedgerEntrySerializer,
     PatientSerializer,
     SiteConfigSerializer,
     TreatmentCategorySerializer,
+    TreatmentMaterialSerializer,
     TreatmentPackageSerializer,
     TreatmentSerializer,
 )
 from ..models import (
-    AppUser, AuditLog, Beauticians, ChartOfAccounts, Doctors, Patient,
-    SiteConfig, Treatment, TreatmentCategory, TreatmentPackage,
+    AppUser, AuditLog, Beauticians, ChartOfAccounts, Doctors, InventoryItem,
+    LedgerEntry, Patient, SiteConfig, Treatment, TreatmentCategory, TreatmentMaterial, TreatmentPackage,
 )
 
 
@@ -162,6 +163,85 @@ class TreatmentDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
             description=f'Treatment deleted: {instance.name} ({instance.code})',
         )
         instance.delete()
+
+
+class TreatmentMaterialListCreateView(APIView):
+    """GET/POST treatment materials for a given treatment (admin only)."""
+
+    def get(self, request, pk):
+        try:
+            treatment = Treatment.objects.get(pk=pk)
+        except Treatment.DoesNotExist:
+            return Response({'error': 'Treatment not found.'}, status=status.HTTP_404_NOT_FOUND)
+        materials = TreatmentMaterial.objects.filter(treatment=treatment).select_related('item')
+        return Response(TreatmentMaterialSerializer(materials, many=True).data)
+
+    def post(self, request, pk):
+        try:
+            treatment = Treatment.objects.get(pk=pk)
+        except Treatment.DoesNotExist:
+            return Response({'error': 'Treatment not found.'}, status=status.HTTP_404_NOT_FOUND)
+        data = {**request.data, 'treatment': treatment.id}
+        serializer = TreatmentMaterialSerializer(data=data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        item_id = serializer.validated_data['item'].id
+        if InventoryItem.objects.filter(pk=item_id, is_service=True).exists():
+            return Response(
+                {'error': 'Cannot use a service item as a treatment material.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        instance = serializer.save()
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='CREATE',
+            entity_type='TreatmentMaterial',
+            entity_id=str(instance.id),
+            description=f'Material added to {treatment.name}: {instance.quantity_small} {instance.item.unit_small} of {instance.item.name}',
+        )
+        return Response(TreatmentMaterialSerializer(instance).data, status=status.HTTP_201_CREATED)
+
+
+class TreatmentMaterialDetailView(APIView):
+    """PUT/DELETE a single treatment material (admin only)."""
+
+    def _get(self, pk, mid):
+        try:
+            return TreatmentMaterial.objects.select_related('item').get(pk=mid, treatment_id=pk)
+        except TreatmentMaterial.DoesNotExist:
+            return None
+
+    def put(self, request, pk, mid):
+        instance = self._get(pk, mid)
+        if instance is None:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        data = {**request.data, 'treatment': pk, 'item': instance.item_id}
+        serializer = TreatmentMaterialSerializer(instance, data=data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        updated = serializer.save()
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='UPDATE',
+            entity_type='TreatmentMaterial',
+            entity_id=str(updated.id),
+            description=f'Material updated: {updated.quantity_small} {updated.item.unit_small} of {updated.item.name}',
+        )
+        return Response(TreatmentMaterialSerializer(updated).data)
+
+    def delete(self, request, pk, mid):
+        instance = self._get(pk, mid)
+        if instance is None:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='DELETE',
+            entity_type='TreatmentMaterial',
+            entity_id=str(instance.id),
+            description=f'Material removed: {instance.quantity_small} {instance.item.unit_small} of {instance.item.name}',
+        )
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class BeauticianListCreateAdminView(generics.ListCreateAPIView):
@@ -302,6 +382,53 @@ class ChartOfAccountsDetailView(generics.RetrieveUpdateDestroyAPIView):
         instance.delete()
 
 
+class AccountLedgerView(APIView):
+    """GET /api/admin/accounts/<pk>/ledger/
+
+    Query params (all optional):
+      date_from   YYYY-MM-DD
+      date_to     YYYY-MM-DD
+      entry_type  'debit' | 'credit'
+    """
+
+    def get(self, request, pk):
+        try:
+            account = ChartOfAccounts.objects.get(pk=pk)
+        except ChartOfAccounts.DoesNotExist:
+            return Response({'error': 'Account not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        qs = LedgerEntry.objects.filter(account=account).select_related('invoice')
+
+        date_from = request.query_params.get('date_from', '').strip()
+        date_to   = request.query_params.get('date_to', '').strip()
+        etype     = request.query_params.get('entry_type', '').strip().lower()
+
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+        if etype in ('debit', 'credit'):
+            qs = qs.filter(entry_type=etype)
+
+        totals = qs.aggregate(
+            total_debit=Sum('amount', filter=Q(entry_type='debit')),
+            total_credit=Sum('amount', filter=Q(entry_type='credit')),
+        )
+
+        return Response({
+            'account': {
+                'id': account.id,
+                'account_number': account.account_number,
+                'name': account.name,
+                'account_type': account.account_type,
+                'balance': str(account.balance),
+            },
+            'entries': LedgerEntrySerializer(qs, many=True).data,
+            'total_debit': str(totals['total_debit'] or 0),
+            'total_credit': str(totals['total_credit'] or 0),
+        })
+
+
 # ── Treatment Categories ────────────────────────────────────────────────────
 
 class TreatmentCategoryListCreateView(generics.ListCreateAPIView):
@@ -342,6 +469,62 @@ class TreatmentCategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
             description=f'Treatment category deleted: {instance.name}',
         )
         instance.delete()
+
+
+class TreatmentCategoryAuditAccountsView(APIView):
+    """GET — return every category with per-account presence flags."""
+
+    def get(self, request):
+        cats = TreatmentCategory.objects.select_related(
+            'revenue_account', 'cogs_account', 'expense_account'
+        ).order_by('name')
+        results = []
+        for cat in cats:
+            results.append({
+                'id': cat.id,
+                'name': cat.name,
+                'revenue_account': str(cat.revenue_account) if cat.revenue_account_id else None,
+                'cogs_account': str(cat.cogs_account) if cat.cogs_account_id else None,
+                'expense_account': str(cat.expense_account) if cat.expense_account_id else None,
+                'needs_provisioning': not (
+                    cat.revenue_account_id and cat.cogs_account_id and cat.expense_account_id
+                ),
+            })
+        any_missing = any(r['needs_provisioning'] for r in results)
+        return Response({'categories': results, 'any_missing': any_missing})
+
+
+class TreatmentCategoryProvisionAccountsView(APIView):
+    """POST — create missing COA accounts for all (or specified) categories.
+
+    Body (optional): { "category_ids": [1, 2, 3] }
+    Omit body / send empty list to provision ALL categories that need it.
+    """
+
+    def post(self, request):
+        category_ids = request.data.get('category_ids') or []
+        qs = TreatmentCategory.objects.select_related(
+            'revenue_account', 'cogs_account', 'expense_account'
+        )
+        if category_ids:
+            qs = qs.filter(pk__in=category_ids)
+
+        provisioned = []
+        for cat in qs:
+            needs = not (cat.revenue_account_id and cat.cogs_account_id and cat.expense_account_id)
+            if needs:
+                created = cat.ensure_accounts()
+                if created:
+                    provisioned.append({'id': cat.id, 'name': cat.name, 'created': created})
+                    AuditLog.objects.create(
+                        performed_by=_actor(request),
+                        action='CREATE',
+                        entity_type='TreatmentCategory',
+                        entity_id=str(cat.id),
+                        description=f'Auto-provisioned COA accounts for category: {cat.name} ({", ".join(created)})',
+                    )
+
+        return Response({'provisioned': provisioned, 'count': len(provisioned)})
 
 
 # ── Excel template + import ───────────────────────────────────────────────────
@@ -579,6 +762,12 @@ class TreatmentPackageDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
         )
         instance.delete()
 
+
+
+class TreatmentPackageSyncView(generics.ListAPIView):
+    """Read-only active package list — accessible to all authenticated users for POS sync."""
+    queryset = TreatmentPackage.objects.filter(active=True).prefetch_related('items__treatment').order_by('name')
+    serializer_class = TreatmentPackageSerializer
 
 
 class SiteConfigView(APIView):

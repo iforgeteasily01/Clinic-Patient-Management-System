@@ -23,12 +23,14 @@ from .admin_views import (
     DoctorListCreateAdminView, DoctorDetailAdminView,
     PatientListCreateAdminView, PatientDetailAdminView,
     TreatmentListCreateAdminView, TreatmentDetailAdminView,
+    TreatmentMaterialListCreateView, TreatmentMaterialDetailView,
     TreatmentImportView, TreatmentTemplateView,
-    TreatmentPackageListCreateAdminView, TreatmentPackageDetailAdminView,
+    TreatmentPackageListCreateAdminView, TreatmentPackageDetailAdminView, TreatmentPackageSyncView,
     BeauticianListCreateAdminView, BeauticianDetailAdminView,
     AppUserListCreateAdminView, AppUserDetailAdminView,
     TreatmentCategoryListCreateView, TreatmentCategoryDetailView,
-    ChartOfAccountsListCreateView, ChartOfAccountsDetailView,
+    TreatmentCategoryAuditAccountsView, TreatmentCategoryProvisionAccountsView,
+    ChartOfAccountsListCreateView, ChartOfAccountsDetailView, AccountLedgerView,
     SiteConfigView,
 )
 from .package_page import PatientPackagesView
@@ -58,6 +60,8 @@ from .stock_opname_page import (
     StockOpnameSessionListCreateView,
     StockOpnameSessionDetailView,
     StockOpnameCompleteView,
+    StockOpnameTemplateView,
+    StockOpnameTemplateSampleView,
 )
 
 # Create your views here.
