@@ -464,14 +464,26 @@ class InvoiceItem(models.Model):
 
 class LedgerEntry(models.Model):
     ENTRY_TYPE_CHOICES = [('debit', 'Debit'), ('credit', 'Credit')]
+    SOURCE_TYPE_CHOICES = [
+        ('invoice',    'Sales Invoice'),
+        ('purchase',   'Purchase Invoice'),
+        ('transfer',   'Account Transfer'),
+        ('adjustment', 'Manual Adjustment'),
+        ('stock',      'Stock Movement'),
+        ('opname',     'Stock Opname'),
+        ('manual',     'Manual Entry'),
+    ]
 
-    account    = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, related_name='ledger_entries')
-    date       = models.DateField()
-    description = models.CharField(max_length=255)
-    entry_type = models.CharField(max_length=6, choices=ENTRY_TYPE_CHOICES)
-    amount     = models.DecimalField(max_digits=18, decimal_places=2)
-    invoice    = models.ForeignKey('Invoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
-    created_at = models.DateTimeField(auto_now_add=True)
+    account          = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, related_name='ledger_entries')
+    date             = models.DateField()
+    description      = models.CharField(max_length=255)
+    entry_type       = models.CharField(max_length=6, choices=ENTRY_TYPE_CHOICES)
+    amount           = models.DecimalField(max_digits=18, decimal_places=2)
+    source_type      = models.CharField(max_length=15, choices=SOURCE_TYPE_CHOICES, blank=True, default='')
+    invoice          = models.ForeignKey('Invoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
+    purchase_invoice = models.ForeignKey('PurchaseInvoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
+    transfer         = models.ForeignKey('AccountTransfer', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
+    created_at       = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ['-date', '-created_at']
@@ -1061,6 +1073,106 @@ class IssueTicketImage(models.Model):
     ticket      = models.ForeignKey(IssueTicket, on_delete=models.CASCADE, related_name='images')
     image       = models.ImageField(upload_to='ticket_images/')
     uploaded_at = models.DateTimeField(auto_now_add=True)
+
+
+# ── Accounting: Suppliers & Purchase Invoices ─────────────────────────────────
+
+class Supplier(models.Model):
+    name         = models.CharField(max_length=100)
+    contact_name = models.CharField(max_length=100, blank=True)
+    phone        = models.CharField(max_length=50, blank=True)
+    email        = models.EmailField(blank=True)
+    address      = models.TextField(blank=True)
+    is_active    = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class PurchaseInvoice(models.Model):
+    STATUS_CHOICES = [
+        ('unpaid',  'Belum Dibayar'),
+        ('partial', 'Sebagian Dibayar'),
+        ('paid',    'Lunas'),
+    ]
+
+    internal_id          = models.CharField(max_length=30, unique=True, blank=True)
+    external_invoice_no  = models.CharField(max_length=100, blank=True)
+    supplier             = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_invoices')
+    payment_account      = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        related_name='purchase_invoices',
+        limit_choices_to={'account_type': 'asset'},
+    )
+    purchase_date = models.DateField()
+    due_date      = models.DateField(null=True, blank=True)
+    status        = models.CharField(max_length=10, choices=STATUS_CHOICES, default='unpaid')
+    notes         = models.TextField(blank=True)
+    total_amount  = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    amount_paid   = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    created_at    = models.DateTimeField(auto_now_add=True)
+    created_by    = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_invoices')
+
+    class Meta:
+        ordering = ['-purchase_date', '-created_at']
+
+    def __str__(self):
+        return self.internal_id or f'PO-{self.id}'
+
+    def save(self, *args, **kwargs):
+        if not self.internal_id:
+            from django.utils import timezone as tz
+            today = tz.now().strftime('%Y%m%d')
+            base  = f'PO-{today}'
+            count = PurchaseInvoice.objects.filter(internal_id__startswith=base).count()
+            self.internal_id = f'{base}-{count + 1}'
+        super().save(*args, **kwargs)
+
+    def refresh_status(self):
+        if self.amount_paid <= 0:
+            self.status = 'unpaid'
+        elif self.amount_paid >= self.total_amount:
+            self.status = 'paid'
+        else:
+            self.status = 'partial'
+
+
+class PurchaseInvoiceItem(models.Model):
+    invoice   = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='items')
+    item      = models.ForeignKey('InventoryItem', on_delete=models.PROTECT, null=True, blank=True, related_name='purchase_items')
+    item_name = models.CharField(max_length=255)
+    quantity  = models.DecimalField(max_digits=14, decimal_places=3)
+    unit      = models.CharField(max_length=50, blank=True)
+    unit_cost = models.DecimalField(max_digits=14, decimal_places=2)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.invoice.internal_id} – {self.item_name}'
+
+
+# ── Accounting: Account Transfers & Manual Adjustments ────────────────────────
+
+class AccountTransfer(models.Model):
+    transfer_date = models.DateField()
+    from_account  = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, related_name='transfers_out')
+    to_account    = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, related_name='transfers_in')
+    amount        = models.DecimalField(max_digits=14, decimal_places=2)
+    description   = models.CharField(max_length=255)
+    reference     = models.CharField(max_length=100, blank=True)
+    created_at    = models.DateTimeField(auto_now_add=True)
+    created_by    = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='account_transfers')
+
+    class Meta:
+        ordering = ['-transfer_date', '-created_at']
+
+    def __str__(self):
+        return f'{self.transfer_date} | {self.from_account} → {self.to_account}'
 
 
 #####

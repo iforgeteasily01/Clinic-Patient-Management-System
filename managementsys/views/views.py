@@ -63,6 +63,18 @@ from .stock_opname_page import (
     StockOpnameTemplateView,
     StockOpnameTemplateSampleView,
 )
+from .accounting_page import (
+    AccountingDashboardView,
+    SupplierListCreateView,
+    SupplierDetailView,
+    PurchaseInvoiceListCreateView,
+    PurchaseInvoiceDetailView,
+    PurchaseInvoicePayView,
+    AccountTransferListCreateView,
+    AccountTransferDetailView,
+    JournalAdjustmentView,
+    JournalHistoryView,
+)
 
 # Create your views here.
 def homepage(request):

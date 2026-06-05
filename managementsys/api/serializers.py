@@ -3,12 +3,13 @@ from decimal import Decimal
 from rest_framework import serializers
 
 from ..models import (
-    ActivePatient, AppUser, AssessmentCode, AttendanceRecord, Beauticians, ChartOfAccounts,
-    Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem, IssueTicket, IssueTicketImage,
-    LedgerEntry, MedRec, Patient, PatientCRMProfile, PatientNote, PatientPackage, PatientPackageRedemption,
-    PatientPhoto, PatientTier, Promotion, SiteConfig, SoapTemplate, StaffSchedule, Treatment,
-    TreatmentCategory, TreatmentMaterial, TreatmentPackage, TreatmentPackageItem, TreatmentSession,
-    Warehouse, WorkShift, patientStatus,
+    AccountTransfer, ActivePatient, AppUser, AssessmentCode, AttendanceRecord, Beauticians,
+    ChartOfAccounts, Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
+    IssueTicket, IssueTicketImage, LedgerEntry, MedRec, Patient, PatientCRMProfile,
+    PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
+    Promotion, PurchaseInvoice, PurchaseInvoiceItem, SiteConfig, SoapTemplate, StaffSchedule,
+    Supplier, Treatment, TreatmentCategory, TreatmentMaterial, TreatmentPackage,
+    TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift, patientStatus,
 )
 
 
@@ -562,11 +563,21 @@ class TreatmentCategorySerializer(serializers.ModelSerializer):
 # ── Ledger ────────────────────────────────────────────────────────────────
 
 class LedgerEntrySerializer(serializers.ModelSerializer):
-    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True, allow_null=True)
+    invoice_number        = serializers.CharField(source='invoice.invoice_number', read_only=True, allow_null=True)
+    purchase_invoice_id   = serializers.IntegerField(source='purchase_invoice.id', read_only=True, allow_null=True)
+    purchase_internal_id  = serializers.CharField(source='purchase_invoice.internal_id', read_only=True, allow_null=True)
+    transfer_id           = serializers.IntegerField(source='transfer.id', read_only=True, allow_null=True)
+    account_number        = serializers.IntegerField(source='account.account_number', read_only=True)
+    account_name          = serializers.CharField(source='account.name', read_only=True)
+    account_type          = serializers.CharField(source='account.account_type', read_only=True)
 
     class Meta:
         model = LedgerEntry
-        fields = ['id', 'date', 'description', 'entry_type', 'amount', 'invoice_number', 'created_at']
+        fields = [
+            'id', 'date', 'description', 'entry_type', 'amount', 'source_type',
+            'invoice_number', 'purchase_invoice_id', 'purchase_internal_id',
+            'transfer_id', 'account_number', 'account_name', 'account_type', 'created_at',
+        ]
 
 
 # ── AppUser Admin ──────────────────────────────────────────────────────────
@@ -879,3 +890,65 @@ class SiteConfigSerializer(serializers.ModelSerializer):
         model = SiteConfig
         fields = ["clinic_name", "address_line1", "address_line2", "phone_fax",
                   "receipt_header_extra", "receipt_footer"]
+
+
+# ── Accounting serializers ─────────────────────────────────────────────────────
+
+class SupplierSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Supplier
+        fields = ['id', 'name', 'contact_name', 'phone', 'email', 'address', 'is_active']
+
+
+class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
+    item_code = serializers.CharField(source='item.code', read_only=True, allow_null=True)
+    subtotal  = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PurchaseInvoiceItem
+        fields = ['id', 'item', 'item_code', 'item_name', 'quantity', 'unit', 'unit_cost', 'subtotal']
+
+    def get_subtotal(self, obj):
+        return str(obj.quantity * obj.unit_cost)
+
+
+class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
+    supplier_name        = serializers.CharField(source='supplier.name', read_only=True)
+    payment_account_name = serializers.CharField(source='payment_account.name', read_only=True)
+    payment_account_no   = serializers.IntegerField(source='payment_account.account_number', read_only=True)
+    balance_due          = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PurchaseInvoice
+        fields = [
+            'id', 'internal_id', 'external_invoice_no', 'supplier', 'supplier_name',
+            'payment_account', 'payment_account_name', 'payment_account_no',
+            'purchase_date', 'due_date', 'status', 'total_amount', 'amount_paid',
+            'balance_due', 'notes', 'created_at',
+        ]
+
+    def get_balance_due(self, obj):
+        return str(obj.total_amount - obj.amount_paid)
+
+
+class PurchaseInvoiceDetailSerializer(PurchaseInvoiceListSerializer):
+    items = PurchaseInvoiceItemSerializer(many=True, read_only=True)
+
+    class Meta(PurchaseInvoiceListSerializer.Meta):
+        fields = PurchaseInvoiceListSerializer.Meta.fields + ['items']
+
+
+class AccountTransferSerializer(serializers.ModelSerializer):
+    from_account_name   = serializers.CharField(source='from_account.name', read_only=True)
+    from_account_number = serializers.IntegerField(source='from_account.account_number', read_only=True)
+    to_account_name     = serializers.CharField(source='to_account.name', read_only=True)
+    to_account_number   = serializers.IntegerField(source='to_account.account_number', read_only=True)
+    created_by_name     = serializers.CharField(source='created_by.display_name', read_only=True, allow_null=True)
+
+    class Meta:
+        model = AccountTransfer
+        fields = [
+            'id', 'transfer_date', 'from_account', 'from_account_name', 'from_account_number',
+            'to_account', 'to_account_name', 'to_account_number',
+            'amount', 'description', 'reference', 'created_at', 'created_by_name',
+        ]
