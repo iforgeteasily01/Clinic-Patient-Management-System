@@ -34,7 +34,7 @@ def _actor(request):
 class InventoryItemListCreateView(APIView):
     def get(self, request):
         qs = InventoryItem.objects.annotate(
-            total_stock=Coalesce(Sum('batches__quantity_remaining'), Value(0))
+            total_stock=Coalesce(Sum('batches__quantity_remaining'), Value(Decimal('0')), output_field=models.DecimalField())
         )
         # Inventory admin pages pass stock_only=1 to hide service mirror items.
         # The POS omits this flag so package mirror items are scannable by code.
