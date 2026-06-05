@@ -253,7 +253,7 @@ class StockInView(APIView):
             return Response({'error': 'Service items have no physical stock.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            qty_raw = int(data['quantity'])
+            qty_raw = Decimal(str(data['quantity']))
             unit = data.get('unit', 'small')
             qty_small = _to_small(item, qty_raw, unit)
             value = Decimal(str(data['value']))
@@ -303,7 +303,7 @@ class StockInView(APIView):
                 continue
 
             try:
-                qty_raw = int(entry['quantity'])
+                qty_raw = Decimal(str(entry['quantity']))
                 unit = entry.get('unit', 'small')
                 qty_small = _to_small(item, qty_raw, unit)
                 value = Decimal(str(entry['value']))
@@ -367,7 +367,7 @@ class StockOutView(APIView):
         try:
             item = InventoryItem.objects.get(pk=data['item_id'])
             warehouse = Warehouse.objects.get(pk=data['warehouse_id'])
-            qty_raw = int(data['quantity'])
+            qty_raw = Decimal(str(data['quantity']))
             unit = data.get('unit', 'small')
             qty_small = _to_small(item, qty_raw, unit)
         except (InventoryItem.DoesNotExist, Warehouse.DoesNotExist, KeyError, ValueError) as exc:
@@ -435,7 +435,7 @@ class StockOutView(APIView):
             try:
                 item = InventoryItem.objects.get(pk=entry['item_id'])
                 warehouse = Warehouse.objects.get(pk=entry['warehouse_id'])
-                qty_raw = int(entry['quantity'])
+                qty_raw = Decimal(str(entry['quantity']))
                 unit = entry.get('unit', 'small')
                 qty_small = _to_small(item, qty_raw, unit)
             except (InventoryItem.DoesNotExist, Warehouse.DoesNotExist, KeyError, ValueError) as exc:
@@ -597,22 +597,22 @@ class ItemSyncView(APIView):
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _to_small(item: InventoryItem, qty: int, unit: str) -> int:
+def _to_small(item: InventoryItem, qty: Decimal, unit: str) -> Decimal:
     if unit == 'large':
         if not item.unit_large or not item.unit_large_qty:
             raise ValueError('This item has no large unit defined.')
         if not item.unit_medium or not item.unit_medium_qty:
             raise ValueError('Large unit requires a medium unit to be defined.')
-        return qty * item.unit_large_qty * item.unit_medium_qty
+        return qty * Decimal(item.unit_large_qty) * Decimal(item.unit_medium_qty)
     if unit == 'medium':
         if not item.unit_medium or not item.unit_medium_qty:
             raise ValueError('This item has no medium unit defined.')
-        return qty * item.unit_medium_qty
+        return qty * Decimal(item.unit_medium_qty)
     return qty
 
 
 @transaction.atomic
-def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> tuple:
+def _fifo_deduct(item_id: int, warehouse_id: int, quantity: Decimal) -> tuple:
     """Deduct stock FIFO. Returns (shortfall, cogs_amount). shortfall=0 means fully deducted."""
     batches = (
         InventoryBatch.objects
@@ -620,14 +620,14 @@ def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> tuple:
         .filter(item_id=item_id, warehouse_id=warehouse_id, quantity_remaining__gt=0)
         .order_by('input_date', 'created_at')
     )
-    remaining = quantity
+    remaining = Decimal(quantity)
     cogs = Decimal('0')
     for batch in batches:
         if remaining <= 0:
             break
         deduct = min(batch.quantity_remaining, remaining)
         if batch.quantity_initial:
-            cogs += (batch.value / Decimal(batch.quantity_initial)) * deduct
+            cogs += (batch.value / batch.quantity_initial) * deduct
         batch.quantity_remaining -= deduct
         batch.save(update_fields=['quantity_remaining'])
         remaining -= deduct
@@ -637,12 +637,11 @@ def _fifo_deduct(item_id: int, warehouse_id: int, quantity: int) -> tuple:
 def _fifo_deduct_global(item_id: int, quantity_small: Decimal) -> tuple:
     """
     Deduct a decimal quantity (in unit_small) from any warehouse, FIFO by date.
-    Quantity is rounded to the nearest integer before deduction since batches use
-    integer quantities. Returns (shortfall, cogs_amount).
+    Returns (shortfall, cogs_amount).
     """
-    qty = int(quantity_small.to_integral_value())
+    qty = Decimal(quantity_small)
     if qty <= 0:
-        return 0, Decimal('0')
+        return Decimal('0'), Decimal('0')
     batches = (
         InventoryBatch.objects
         .select_for_update()
@@ -656,7 +655,7 @@ def _fifo_deduct_global(item_id: int, quantity_small: Decimal) -> tuple:
             break
         deduct = min(batch.quantity_remaining, remaining)
         if batch.quantity_initial:
-            cogs += (batch.value / Decimal(batch.quantity_initial)) * deduct
+            cogs += (batch.value / batch.quantity_initial) * deduct
         batch.quantity_remaining -= deduct
         batch.save(update_fields=['quantity_remaining'])
         remaining -= deduct
@@ -664,7 +663,7 @@ def _fifo_deduct_global(item_id: int, quantity_small: Decimal) -> tuple:
 
 
 @transaction.atomic
-def _fifo_restock(item_id: int, warehouse_id: int, quantity: int) -> Decimal:
+def _fifo_restock(item_id: int, warehouse_id: int, quantity: Decimal) -> Decimal:
     """Return stock to batches (newest-first). Returns the COGS amount reversed."""
     batches = (
         InventoryBatch.objects
@@ -672,17 +671,17 @@ def _fifo_restock(item_id: int, warehouse_id: int, quantity: int) -> Decimal:
         .filter(item_id=item_id, warehouse_id=warehouse_id)
         .order_by('-input_date', '-created_at')
     )
-    remaining = quantity
+    remaining = Decimal(quantity)
     cogs = Decimal('0')
     for batch in batches:
         if remaining <= 0:
             break
-        capacity = (batch.quantity_initial or 0) - batch.quantity_remaining
+        capacity = (batch.quantity_initial or Decimal('0')) - batch.quantity_remaining
         if capacity <= 0:
             continue
         restock = min(capacity, remaining)
         if batch.quantity_initial:
-            cogs += (batch.value / Decimal(batch.quantity_initial)) * restock
+            cogs += (batch.value / batch.quantity_initial) * restock
         batch.quantity_remaining += restock
         batch.save(update_fields=['quantity_remaining'])
         remaining -= restock

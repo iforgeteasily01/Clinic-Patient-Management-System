@@ -338,8 +338,8 @@ class InventoryBatch(models.Model):
     item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT, related_name='batches')
     warehouse = models.ForeignKey(Warehouse, on_delete=models.PROTECT, related_name='batches')
     input_date = models.DateField()
-    quantity_initial = models.PositiveIntegerField()    # in smallest unit
-    quantity_remaining = models.PositiveIntegerField()  # in smallest unit; decremented FIFO
+    quantity_initial = models.DecimalField(max_digits=14, decimal_places=4)    # in smallest unit
+    quantity_remaining = models.DecimalField(max_digits=14, decimal_places=4)  # in smallest unit; decremented FIFO
     value = models.DecimalField(max_digits=14, decimal_places=2)  # total batch purchase value
     created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='inv_batches_created')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -959,7 +959,7 @@ class StockOutLog(models.Model):
     item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT, related_name='stock_out_logs')
     warehouse = models.ForeignKey(Warehouse, on_delete=models.PROTECT, related_name='stock_out_logs')
     out_date = models.DateField()
-    quantity = models.PositiveIntegerField()
+    quantity = models.DecimalField(max_digits=14, decimal_places=4)
     notes = models.TextField(blank=True, default='')
     created_by = models.ForeignKey(AppUser, null=True, blank=True, on_delete=models.SET_NULL, related_name='stock_out_logs')
     created_at = models.DateTimeField(auto_now_add=True)

@@ -252,7 +252,7 @@ class StockOpnameCompleteView(APIView):
                 if shortage <= 0:
                     continue
 
-                shortfall, cogs = _fifo_deduct(opname_item.item_id, int(warehouse_id), shortage)
+                shortfall, cogs = _fifo_deduct(opname_item.item_id, int(warehouse_id), Decimal(shortage))
                 total_loss_qty += shortage - shortfall
                 total_loss_cogs += cogs
 

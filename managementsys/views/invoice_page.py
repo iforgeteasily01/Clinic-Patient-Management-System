@@ -95,9 +95,8 @@ def _post_accounting(invoice, line_items, items_by_id):
                 f'Invoice {inv_no} – {item.name}')
 
         if not item.is_service and invoice.warehouse_id:
-            qty_int = int(line['quantity'].to_integral_value())
-            if qty_int > 0:
-                _shortfall, cogs_amount = _fifo_deduct(item.id, invoice.warehouse_id, qty_int)
+            if line['quantity'] > 0:
+                _shortfall, cogs_amount = _fifo_deduct(item.id, invoice.warehouse_id, line['quantity'])
                 if cogs_amount > 0:
                     if inventory_asset:
                         ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
@@ -116,7 +115,7 @@ def _post_accounting(invoice, line_items, items_by_id):
             treatment = getattr(item, 'treatment', None)
             if treatment:
                 deduct_fn = (
-                    (lambda mid, qty: _fifo_deduct(mid, invoice.warehouse_id, int(qty.to_integral_value())))
+                    (lambda mid, qty: _fifo_deduct(mid, invoice.warehouse_id, qty))
                     if invoice.warehouse_id
                     else (lambda mid, qty: _fifo_deduct_global(mid, qty))
                 )
@@ -180,9 +179,8 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
                     f'Invoice {inv_no} – Correction: {item.name}')
 
         if not item.is_service and warehouse_id:
-            qty_int = int(inst.quantity.to_integral_value())
-            if qty_int > 0:
-                cogs_amount = _fifo_restock(item.id, warehouse_id, qty_int)
+            if inst.quantity > 0:
+                cogs_amount = _fifo_restock(item.id, warehouse_id, inst.quantity)
                 if cogs_amount > 0:
                     if inventory_asset:
                         ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
