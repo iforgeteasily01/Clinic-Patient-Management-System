@@ -11,9 +11,9 @@ class Patient(models.Model):
     patient_no = models.CharField(
         max_length=10, unique=True, primary_key=True, blank=True)
     name = models.CharField(max_length=100, null=True)
-    address = models.CharField(max_length=100, null=True)
-    phone_number = models.CharField(max_length=15, null=True)
-    NIK = models.CharField(max_length=16, null=True)
+    address = models.CharField(max_length=100, null=True, blank=True)
+    phone_number = models.CharField(max_length=15, null=True, blank=True)
+    NIK = models.CharField(max_length=16, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
