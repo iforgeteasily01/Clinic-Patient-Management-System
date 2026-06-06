@@ -737,7 +737,7 @@ class DailySalesView(APIView):
                 by_account[key] = {
                     'account_id':     pm.id             if pm else None,
                     'account_number': pm.account_number if pm else None,
-                    'account_name':   pm.account_name   if pm else 'Tidak Diketahui',
+                    'account_name':   pm.name           if pm else 'Tidak Diketahui',
                     'total':          Decimal('0'),
                     'invoice_count':  0,
                 }
