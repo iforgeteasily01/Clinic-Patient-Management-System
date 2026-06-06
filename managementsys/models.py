@@ -495,6 +495,7 @@ class LedgerEntry(models.Model):
 
 class TreatmentCategory(models.Model):
     name = models.CharField(max_length=50, unique=True)
+    show_to_beautician = models.BooleanField(default=True)
     revenue_account = models.OneToOneField(
         'ChartOfAccounts',
         null=True, blank=True,
@@ -1108,14 +1109,15 @@ class PurchaseInvoice(models.Model):
         related_name='purchase_invoices',
         limit_choices_to={'account_type': 'asset'},
     )
-    purchase_date = models.DateField()
-    due_date      = models.DateField(null=True, blank=True)
-    status        = models.CharField(max_length=10, choices=STATUS_CHOICES, default='unpaid')
-    notes         = models.TextField(blank=True)
-    total_amount  = models.DecimalField(max_digits=14, decimal_places=2, default=0)
-    amount_paid   = models.DecimalField(max_digits=14, decimal_places=2, default=0)
-    created_at    = models.DateTimeField(auto_now_add=True)
-    created_by    = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_invoices')
+    purchase_date  = models.DateField()
+    due_date       = models.DateField(null=True, blank=True)
+    status         = models.CharField(max_length=10, choices=STATUS_CHOICES, default='unpaid')
+    notes          = models.TextField(blank=True)
+    total_amount   = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    amount_paid    = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    invoice_image  = models.ImageField(upload_to='purchase_invoices/', null=True, blank=True)
+    created_at     = models.DateTimeField(auto_now_add=True)
+    created_by     = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_invoices')
 
     class Meta:
         ordering = ['-purchase_date', '-created_at']
@@ -1142,12 +1144,27 @@ class PurchaseInvoice(models.Model):
 
 
 class PurchaseInvoiceItem(models.Model):
-    invoice   = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='items')
-    item      = models.ForeignKey('InventoryItem', on_delete=models.PROTECT, null=True, blank=True, related_name='purchase_items')
-    item_name = models.CharField(max_length=255)
-    quantity  = models.DecimalField(max_digits=14, decimal_places=3)
-    unit      = models.CharField(max_length=50, blank=True)
-    unit_cost = models.DecimalField(max_digits=14, decimal_places=2)
+    LINE_TYPE_CHOICES = [('stock', 'Stok'), ('expense', 'Beban')]
+
+    invoice          = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='items')
+    line_type        = models.CharField(max_length=10, choices=LINE_TYPE_CHOICES, default='stock')
+    item             = models.ForeignKey('InventoryItem', on_delete=models.PROTECT, null=True, blank=True, related_name='purchase_items')
+    item_name        = models.CharField(max_length=255)
+    quantity         = models.DecimalField(max_digits=14, decimal_places=3)
+    unit             = models.CharField(max_length=50, blank=True)
+    unit_cost        = models.DecimalField(max_digits=14, decimal_places=2)
+    expense_account  = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name='purchase_expense_items',
+    )
+    warehouse        = models.ForeignKey(
+        'Warehouse',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='purchase_items',
+    )
 
     class Meta:
         ordering = ['id']

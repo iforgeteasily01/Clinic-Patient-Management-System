@@ -153,12 +153,14 @@ urlpatterns = [
     path('api/accounting/dashboard/',              views.AccountingDashboardView.as_view(),      name='accounting-dashboard'),
     path('api/accounting/suppliers/',              views.SupplierListCreateView.as_view(),       name='accounting-suppliers'),
     path('api/accounting/suppliers/<int:pk>/',     views.SupplierDetailView.as_view(),           name='accounting-supplier-detail'),
-    path('api/accounting/purchases/',              views.PurchaseInvoiceListCreateView.as_view(), name='accounting-purchases'),
-    path('api/accounting/purchases/<int:pk>/',     views.PurchaseInvoiceDetailView.as_view(),    name='accounting-purchase-detail'),
-    path('api/accounting/purchases/<int:pk>/pay/', views.PurchaseInvoicePayView.as_view(),       name='accounting-purchase-pay'),
+    path('api/accounting/purchases/',                   views.PurchaseInvoiceListCreateView.as_view(), name='accounting-purchases'),
+    path('api/accounting/purchases/last-price/',        views.PurchaseLastPriceView.as_view(),          name='accounting-purchase-last-price'),
+    path('api/accounting/purchases/<int:pk>/',          views.PurchaseInvoiceDetailView.as_view(),      name='accounting-purchase-detail'),
+    path('api/accounting/purchases/<int:pk>/pay/',      views.PurchaseInvoicePayView.as_view(),         name='accounting-purchase-pay'),
     path('api/accounting/transfers/',              views.AccountTransferListCreateView.as_view(), name='accounting-transfers'),
     path('api/accounting/transfers/<int:pk>/',     views.AccountTransferDetailView.as_view(),    name='accounting-transfer-detail'),
     path('api/accounting/adjustments/',            views.JournalAdjustmentView.as_view(),        name='accounting-adjustments'),
     path('api/accounting/journal/',                views.JournalHistoryView.as_view(),           name='accounting-journal'),
+    path('api/accounting/daily-sales/',            views.DailySalesView.as_view(),               name='accounting-daily-sales'),
 ]
 

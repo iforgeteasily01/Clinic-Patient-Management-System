@@ -26,7 +26,7 @@ class PatientSearchView(APIView):
         if address := request.GET.get('address', '').strip():
             qs = qs.filter(address__icontains=address)
 
-        serializer = PatientSerializer(qs[:20], many=True)
+        serializer = PatientSerializer(qs.order_by('name', 'patient_no')[:100], many=True)
         return Response(serializer.data)
 
 
@@ -202,7 +202,13 @@ class ActivePatientUpdateStatusView(APIView):
 
 class TreatmentListView(APIView):
     def get(self, request):
+        from ..models import TreatmentCategory
         treatments = Treatment.objects.filter(active=True)
+        if request.GET.get('for_beautician') == '1':
+            hidden = TreatmentCategory.objects.filter(
+                show_to_beautician=False
+            ).values_list('name', flat=True)
+            treatments = treatments.exclude(category__in=hidden)
         serializer = TreatmentSerializer(treatments, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 

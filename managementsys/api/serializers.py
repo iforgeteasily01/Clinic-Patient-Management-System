@@ -547,7 +547,7 @@ class TreatmentCategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = TreatmentCategory
         fields = [
-            'id', 'name',
+            'id', 'name', 'show_to_beautician',
             'revenue_account_id', 'revenue_account_number', 'revenue_account_name',
             'cogs_account_id', 'cogs_account_number', 'cogs_account_name',
             'expense_account_id', 'expense_account_number', 'expense_account_name',
@@ -901,12 +901,19 @@ class SupplierSerializer(serializers.ModelSerializer):
 
 
 class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
-    item_code = serializers.CharField(source='item.code', read_only=True, allow_null=True)
-    subtotal  = serializers.SerializerMethodField()
+    item_code            = serializers.CharField(source='item.code', read_only=True, allow_null=True)
+    expense_account_name = serializers.CharField(source='expense_account.name', read_only=True, allow_null=True)
+    warehouse_name       = serializers.CharField(source='warehouse.name', read_only=True, allow_null=True)
+    subtotal             = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseInvoiceItem
-        fields = ['id', 'item', 'item_code', 'item_name', 'quantity', 'unit', 'unit_cost', 'subtotal']
+        fields = [
+            'id', 'line_type', 'item', 'item_code', 'item_name',
+            'quantity', 'unit', 'unit_cost', 'subtotal',
+            'expense_account', 'expense_account_name',
+            'warehouse', 'warehouse_name',
+        ]
 
     def get_subtotal(self, obj):
         return str(obj.quantity * obj.unit_cost)
@@ -917,6 +924,7 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
     payment_account_name = serializers.CharField(source='payment_account.name', read_only=True)
     payment_account_no   = serializers.IntegerField(source='payment_account.account_number', read_only=True)
     balance_due          = serializers.SerializerMethodField()
+    invoice_image_url    = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseInvoice
@@ -924,11 +932,19 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
             'id', 'internal_id', 'external_invoice_no', 'supplier', 'supplier_name',
             'payment_account', 'payment_account_name', 'payment_account_no',
             'purchase_date', 'due_date', 'status', 'total_amount', 'amount_paid',
-            'balance_due', 'notes', 'created_at',
+            'balance_due', 'notes', 'invoice_image_url', 'created_at',
         ]
 
     def get_balance_due(self, obj):
         return str(obj.total_amount - obj.amount_paid)
+
+    def get_invoice_image_url(self, obj):
+        if not obj.invoice_image:
+            return None
+        request = self.context.get('request')
+        if request:
+            return request.build_absolute_uri(obj.invoice_image.url)
+        return obj.invoice_image.url
 
 
 class PurchaseInvoiceDetailSerializer(PurchaseInvoiceListSerializer):

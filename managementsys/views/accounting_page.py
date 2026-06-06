@@ -1,3 +1,4 @@
+import json
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
@@ -17,7 +18,8 @@ from ..api.serializers import (
 )
 from ..models import (
     AccountTransfer, AppUser, AuditLog, ChartOfAccounts,
-    LedgerEntry, PurchaseInvoice, PurchaseInvoiceItem, Supplier,
+    InventoryBatch, InventoryItem, Invoice, LedgerEntry,
+    PurchaseInvoice, PurchaseInvoiceItem, Supplier, Warehouse,
 )
 
 
@@ -143,14 +145,24 @@ class PurchaseInvoiceListCreateView(APIView):
         return Response(PurchaseInvoiceListSerializer(qs, many=True).data)
 
     def post(self, request):
-        data  = request.data
-        items = data.get('items', [])
+        data = request.data
+
+        # Support multipart (with image) or plain JSON
+        items_raw = data.get('items', [])
+        if isinstance(items_raw, str):
+            try:
+                items = json.loads(items_raw)
+            except (json.JSONDecodeError, ValueError):
+                return Response({'error': 'Invalid items JSON.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            items = items_raw
+
         if not items:
             return Response({'error': 'At least one item is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            supplier       = Supplier.objects.get(pk=data['supplier'])
-            payment_acct   = ChartOfAccounts.objects.get(pk=data['payment_account'], account_type='asset')
+            supplier     = Supplier.objects.get(pk=data['supplier'])
+            payment_acct = ChartOfAccounts.objects.get(pk=data['payment_account'], account_type='asset')
         except (Supplier.DoesNotExist, ChartOfAccounts.DoesNotExist, KeyError):
             return Response({'error': 'Invalid supplier or payment account.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -165,24 +177,60 @@ class PurchaseInvoiceListCreateView(APIView):
                 created_by=_actor(request),
             )
 
+            # Attach image if uploaded
+            image_file = request.FILES.get('invoice_image')
+            if image_file:
+                invoice.invoice_image = image_file
+                invoice.save(update_fields=['invoice_image'])
+
             total = Decimal('0')
             item_objs = []
+            batches_to_create = []
+
             for row in items:
-                item_ser = PurchaseInvoiceItemSerializer(data=row)
-                item_ser.is_valid(raise_exception=True)
-                qty  = _safe_decimal(row.get('quantity', 0))
-                cost = _safe_decimal(row.get('unit_cost', 0))
-                total += qty * cost
+                qty       = _safe_decimal(row.get('quantity', 0))
+                cost      = _safe_decimal(row.get('unit_cost', 0))
+                line_type = row.get('line_type', 'stock')
+                total    += qty * cost
+
+                expense_acct_id = row.get('expense_account') or None
+                warehouse_id    = row.get('warehouse') or None
+                item_id         = row.get('item') or None
+
                 item_objs.append(PurchaseInvoiceItem(
                     invoice=invoice,
-                    item_id=row.get('item') or None,
+                    line_type=line_type,
+                    item_id=item_id,
                     item_name=row.get('item_name', ''),
                     quantity=qty,
                     unit=row.get('unit', ''),
                     unit_cost=cost,
+                    expense_account_id=expense_acct_id,
+                    warehouse_id=warehouse_id,
                 ))
 
+                # Queue InventoryBatch creation for stock lines
+                if line_type == 'stock' and item_id and warehouse_id:
+                    batches_to_create.append({
+                        'item_id': item_id,
+                        'warehouse_id': warehouse_id,
+                        'qty': qty,
+                        'cost': cost,
+                    })
+
             PurchaseInvoiceItem.objects.bulk_create(item_objs)
+
+            # Create inventory batches (FIFO stock-in)
+            for b in batches_to_create:
+                InventoryBatch.objects.create(
+                    item_id=b['item_id'],
+                    warehouse_id=b['warehouse_id'],
+                    input_date=invoice.purchase_date,
+                    quantity_initial=b['qty'],
+                    quantity_remaining=b['qty'],
+                    value=b['cost'],
+                )
+
             invoice.total_amount = total
             invoice.save(update_fields=['total_amount'])
 
@@ -195,7 +243,7 @@ class PurchaseInvoiceListCreateView(APIView):
             )
 
         return Response(
-            PurchaseInvoiceDetailSerializer(invoice).data,
+            PurchaseInvoiceDetailSerializer(invoice, context={'request': request}).data,
             status=status.HTTP_201_CREATED,
         )
 
@@ -213,7 +261,7 @@ class PurchaseInvoiceDetailView(APIView):
         obj = self._get(pk)
         if not obj:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
-        return Response(PurchaseInvoiceDetailSerializer(obj).data)
+        return Response(PurchaseInvoiceDetailSerializer(obj, context={'request': request}).data)
 
     def patch(self, request, pk):
         """Update notes, due_date, external_invoice_no only. Status is computed from payments."""
@@ -234,7 +282,7 @@ class PurchaseInvoiceDetailView(APIView):
             entity_id=str(obj.id),
             description=f'Purchase invoice updated: {obj.internal_id}',
         )
-        return Response(PurchaseInvoiceDetailSerializer(obj).data)
+        return Response(PurchaseInvoiceDetailSerializer(obj, context={'request': request}).data)
 
     def delete(self, request, pk):
         obj = self._get(pk)
@@ -314,7 +362,35 @@ class PurchaseInvoicePayView(APIView):
                 description=f'Payment Rp{amount:,.0f} recorded for {invoice.internal_id}, status → {invoice.status}',
             )
 
-        return Response(PurchaseInvoiceDetailSerializer(invoice).data)
+        return Response(PurchaseInvoiceDetailSerializer(invoice, context={'request': request}).data)
+
+
+class PurchaseLastPriceView(APIView):
+    """GET /api/accounting/purchases/last-price/?item=<id>"""
+
+    def get(self, request):
+        item_id = request.query_params.get('item', '').strip()
+        if not item_id:
+            return Response({'error': 'item parameter is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            item_id = int(item_id)
+        except ValueError:
+            return Response({'error': 'Invalid item id.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        last = (
+            PurchaseInvoiceItem.objects
+            .filter(item_id=item_id, line_type='stock')
+            .select_related('invoice')
+            .order_by('-invoice__purchase_date', '-id')
+            .first()
+        )
+        if last:
+            return Response({
+                'last_price': str(last.unit_cost),
+                'last_date':  str(last.invoice.purchase_date),
+                'invoice_id': last.invoice.internal_id,
+            })
+        return Response({'last_price': None, 'last_date': None, 'invoice_id': None})
 
 
 # ── Account Transfers ──────────────────────────────────────────────────────────
@@ -608,4 +684,73 @@ class AccountingDashboardView(APIView):
             'unpaid_invoices': PurchaseInvoiceListSerializer(unpaid_qs, many=True).data,
             'overdue_count':   overdue_count,
             'total_unpaid':    str(total_unpaid),
+        })
+
+
+# ── Daily Sales ────────────────────────────────────────────────────────────────
+
+class DailySalesView(APIView):
+    """
+    GET /api/accounting/daily-sales/?date=YYYY-MM-DD
+    Returns total sales and breakdown per cash (payment) account for the given date.
+    Defaults to today in Jakarta time (WIB, UTC+7).
+    """
+
+    def get(self, request):
+        import datetime
+        from zoneinfo import ZoneInfo
+
+        WIB = ZoneInfo('Asia/Jakarta')
+        date_str = request.query_params.get('date', '').strip()
+        if date_str:
+            try:
+                target_date = datetime.date.fromisoformat(date_str)
+            except ValueError:
+                return Response(
+                    {'error': 'Invalid date. Use YYYY-MM-DD.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            target_date = timezone.now().astimezone(WIB).date()
+
+        # Filter invoices for the target date (database stores UTC; compare naive date in local time)
+        day_start = datetime.datetime(target_date.year, target_date.month, target_date.day,
+                                      tzinfo=WIB)
+        day_end   = day_start + datetime.timedelta(days=1)
+
+        invoices = (
+            Invoice.objects
+            .filter(datetime__gte=day_start, datetime__lt=day_end)
+            .select_related('payment_method')
+        )
+
+        grand_total = Decimal('0')
+        by_account: dict = {}
+        total_count = 0
+
+        for inv in invoices:
+            grand_total += inv.grand_total
+            total_count += 1
+            pm = inv.payment_method
+            key = pm.id if pm else 0
+            if key not in by_account:
+                by_account[key] = {
+                    'account_id':     pm.id             if pm else None,
+                    'account_number': pm.account_number if pm else None,
+                    'account_name':   pm.account_name   if pm else 'Tidak Diketahui',
+                    'total':          Decimal('0'),
+                    'invoice_count':  0,
+                }
+            by_account[key]['total']         += inv.grand_total
+            by_account[key]['invoice_count'] += 1
+
+        breakdown = sorted(by_account.values(), key=lambda x: -x['total'])
+        for row in breakdown:
+            row['total'] = str(row['total'])
+
+        return Response({
+            'date':          str(target_date),
+            'total':         str(grand_total),
+            'invoice_count': total_count,
+            'by_account':    breakdown,
         })

@@ -65,11 +65,13 @@ from .stock_opname_page import (
 )
 from .accounting_page import (
     AccountingDashboardView,
+    DailySalesView,
     SupplierListCreateView,
     SupplierDetailView,
     PurchaseInvoiceListCreateView,
     PurchaseInvoiceDetailView,
     PurchaseInvoicePayView,
+    PurchaseLastPriceView,
     AccountTransferListCreateView,
     AccountTransferDetailView,
     JournalAdjustmentView,
