@@ -57,6 +57,28 @@ class BillingCompleteView(APIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        # When the POS app (Medya-Cashier) calls this endpoint it has already
+        # created the invoice via POST /api/invoices/create/.  It passes
+        # ?skip_invoice=1 to tell us to just clear the queue entry without
+        # creating a duplicate invoice.
+        skip_invoice = request.query_params.get('skip_invoice') == '1'
+
+        if skip_invoice:
+            label = (
+                active_patient.patient_no.name
+                if active_patient.patient_no_id
+                else active_patient.guest_name
+            )
+            AuditLog.objects.create(
+                performed_by=_actor(request),
+                action='DELETE',
+                entity_type='ActivePatient',
+                entity_id=str(active_patient.id),
+                description=f'Billing queue entry cleared for {label} (invoice created by POS)',
+            )
+            active_patient.delete()
+            return Response({'invoice_number': ''}, status=status.HTTP_200_OK)
+
         # ── Collect treatment lines from all sessions ─────────────────────────
         sessions = (
             active_patient.treatmentsession_set

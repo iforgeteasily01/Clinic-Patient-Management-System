@@ -1,6 +1,6 @@
 from zoneinfo import ZoneInfo
 
-from django.db.models import Count, F, Sum, Value
+from django.db.models import Count, DecimalField, F, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework.response import Response
@@ -46,7 +46,7 @@ class DashboardReportView(APIView):
         )
 
         items_qs = InventoryItem.objects.filter(is_service=False, is_active=True).annotate(
-            total_stock=Coalesce(Sum('batches__quantity_remaining'), Value(0))
+            total_stock=Coalesce(Sum('batches__quantity_remaining'), Value(0, output_field=DecimalField()))
         )
         low_stock_items = list(
             items_qs
