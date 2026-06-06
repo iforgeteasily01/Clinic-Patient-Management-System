@@ -1,4 +1,4 @@
-from ..models import Patient, ActivePatient, patientStatus, Treatment, Beauticians, TreatmentSession, AppUser, AuditLog
+from ..models import Patient, ActivePatient, patientStatus, Treatment, Beauticians, TreatmentSession, AppUser, AuditLog, PatientNote
 from django.http import HttpResponse
 from django.db.models import Q
 from django.utils import timezone
@@ -184,6 +184,25 @@ class ActivePatientUpdateStatusView(APIView):
                 {"error": f"No active patient found with id '{active_patient_id}'."},
                 status=status.HTTP_404_NOT_FOUND
             )
+
+        if target_status in (0, 6):
+            if active_patient.patient_no_id:
+                arrive_str = active_patient.visit_time.strftime('%H:%M') if active_patient.visit_time else 'unknown time'
+                PatientNote.objects.create(
+                    patient_no=active_patient.patient_no,
+                    date=timezone.now().date(),
+                    content=f'Patient arrived at the clinic (check-in: {arrive_str}). Visit was ended early.',
+                    author='System',
+                )
+            AuditLog.objects.create(
+                performed_by=_actor(request),
+                action='STATUS_CHANGE',
+                entity_type='ActivePatient',
+                entity_id=str(active_patient.id),
+                description=f'ActivePatient #{active_patient.id} dismissed (status {target_status}) — visit note recorded',
+            )
+            active_patient.delete()
+            return Response({'deleted': True}, status=status.HTTP_200_OK)
 
         active_patient.status = target_status
         active_patient.save()
