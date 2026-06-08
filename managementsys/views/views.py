@@ -68,6 +68,8 @@ from .accounting_page import (
     DailySalesView,
     SupplierListCreateView,
     SupplierDetailView,
+    SupplierTemplateView,
+    SupplierImportView,
     PurchaseInvoiceListCreateView,
     PurchaseInvoiceDetailView,
     PurchaseInvoicePayView,

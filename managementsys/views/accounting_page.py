@@ -1,8 +1,11 @@
+import io
 import json
 from decimal import Decimal, InvalidOperation
 
+import openpyxl
 from django.db import transaction
 from django.db.models import Q, Sum
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
@@ -104,6 +107,83 @@ class SupplierDetailView(APIView):
             description=f'Supplier deleted: {name}',
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SupplierTemplateView(APIView):
+    def get(self, request):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Vendors'
+        ws.append(['name', 'contact_name', 'phone', 'email', 'address'])
+        ws.append(['PT Contoh Supplier', 'Budi Santoso', '0812-3456-7890', 'budi@example.com', 'Jl. Contoh No. 1'])
+        ws.append(['CV Bahan Kecantikan', 'Sari Dewi', '0811-9876-5432', '', 'Jl. Raya Kosmetik 5'])
+        for col, width in zip('ABCDE', [30, 22, 20, 28, 36]):
+            ws.column_dimensions[col].width = width
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+        return HttpResponse(
+            buf.read(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={'Content-Disposition': 'attachment; filename="vendors_template.xlsx"'},
+        )
+
+
+class SupplierImportView(APIView):
+    def post(self, request):
+        f = request.FILES.get('file')
+        if not f:
+            return Response({'error': 'No file provided.'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(f.read()), data_only=True)
+            ws = wb.active
+        except Exception:
+            return Response({'error': 'Could not read Excel file.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return Response({'error': 'File is empty.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        headers = [str(h).strip().lower() if h is not None else '' for h in rows[0]]
+        if 'name' not in headers:
+            return Response({'error': 'Column "name" is required in the first row.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        def col(row, field):
+            try:
+                idx = headers.index(field)
+                val = row[idx] if idx < len(row) else None
+                return str(val).strip() if val is not None else ''
+            except ValueError:
+                return ''
+
+        created = updated = 0
+        errors = []
+        for i, row in enumerate(rows[1:], start=2):
+            name = col(row, 'name')
+            if not name:
+                continue
+            data = {
+                'name': name,
+                'contact_name': col(row, 'contact_name'),
+                'phone': col(row, 'phone'),
+                'email': col(row, 'email'),
+                'address': col(row, 'address'),
+            }
+            existing = Supplier.objects.filter(name__iexact=name).first()
+            if existing:
+                ser = SupplierSerializer(existing, data=data)
+            else:
+                ser = SupplierSerializer(data=data)
+            if ser.is_valid():
+                ser.save()
+                if existing:
+                    updated += 1
+                else:
+                    created += 1
+            else:
+                errors.append({'row': i, 'name': name, 'error': str(ser.errors)})
+
+        return Response({'created': created, 'updated': updated, 'errors': errors})
 
 
 # ── Purchase Invoices ──────────────────────────────────────────────────────────

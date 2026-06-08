@@ -67,7 +67,7 @@ class ActivePatientSerializer(serializers.ModelSerializer):
         result = []
         for session in obj.treatmentsession_set.prefetch_related('treatments').all():
             for t in session.treatments.all():
-                result.append({'id': t.id, 'name': t.name, 'price': str(t.price)})
+                result.append({'id': t.id, 'name': t.name, 'price': str(t.price), 'session_id': session.id})
         return result
 
     def get_soap_treatment(self, obj):

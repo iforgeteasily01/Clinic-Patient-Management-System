@@ -322,6 +322,43 @@ class CompleteTreatmentView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
+class TreatmentRemoveView(APIView):
+    """
+    DELETE /api/treatment-session/<session_id>/treatment/<treatment_id>/
+    Removes one treatment from a session's M2M list.
+    Deletes the session entirely if it becomes empty.
+    """
+    def delete(self, request, session_id, treatment_id):
+        try:
+            session = TreatmentSession.objects.get(id=session_id)
+        except TreatmentSession.DoesNotExist:
+            return Response({'error': 'Session not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            treatment = Treatment.objects.get(id=treatment_id)
+        except Treatment.DoesNotExist:
+            return Response({'error': 'Treatment not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        session.treatments.remove(treatment)
+
+        label = (
+            session.patient_no.name if session.patient_no_id
+            else (session.active_patient.guest_name if session.active_patient_id else str(session_id))
+        )
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='UPDATE',
+            entity_type='TreatmentSession',
+            entity_id=str(session.id),
+            description=f'Removed {treatment.name} from session for {label}',
+        )
+
+        if session.treatments.count() == 0:
+            session.delete()
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
 class PatientCountView(APIView):
     """
     GET /api/patients/count/

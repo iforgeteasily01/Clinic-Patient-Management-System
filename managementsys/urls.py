@@ -58,6 +58,7 @@ urlpatterns = [
     path('api/treatments/', views.TreatmentListView.as_view(), name='treatment-list'),
     path('api/treatment-session/', views.TreatmentSessionCreateView.as_view(), name='treatment-session'),
     path('api/treatment-session/complete/', views.CompleteTreatmentView.as_view(), name='treatment-complete'),
+    path('api/treatment-session/<int:session_id>/treatment/<int:treatment_id>/', views.TreatmentRemoveView.as_view(), name='treatment-session-remove-treatment'),
 
     path('api/billing/', views.BillingQueueView.as_view(), name='billing-queue'),
     path('api/billing/<int:pk>/complete/', views.BillingCompleteView.as_view(), name='billing-complete'),
@@ -152,6 +153,8 @@ urlpatterns = [
     # Accounting
     path('api/accounting/dashboard/',              views.AccountingDashboardView.as_view(),      name='accounting-dashboard'),
     path('api/accounting/suppliers/',              views.SupplierListCreateView.as_view(),       name='accounting-suppliers'),
+    path('api/accounting/suppliers/template/',    views.SupplierTemplateView.as_view(),          name='accounting-supplier-template'),
+    path('api/accounting/suppliers/import/',      views.SupplierImportView.as_view(),            name='accounting-supplier-import'),
     path('api/accounting/suppliers/<int:pk>/',     views.SupplierDetailView.as_view(),           name='accounting-supplier-detail'),
     path('api/accounting/purchases/',                   views.PurchaseInvoiceListCreateView.as_view(), name='accounting-purchases'),
     path('api/accounting/purchases/last-price/',        views.PurchaseLastPriceView.as_view(),          name='accounting-purchase-last-price'),
