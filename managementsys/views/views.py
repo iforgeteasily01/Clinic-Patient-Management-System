@@ -26,7 +26,7 @@ from .admin_views import (
     TreatmentMaterialListCreateView, TreatmentMaterialDetailView,
     TreatmentImportView, TreatmentTemplateView,
     TreatmentPackageListCreateAdminView, TreatmentPackageDetailAdminView, TreatmentPackageSyncView,
-    BeauticianListCreateAdminView, BeauticianDetailAdminView,
+    BeauticianListCreateAdminView, BeauticianDetailAdminView, BeauticianReleaseView,
     AppUserListCreateAdminView, AppUserDetailAdminView,
     TreatmentCategoryListCreateView, TreatmentCategoryDetailView,
     TreatmentCategoryAuditAccountsView, TreatmentCategoryProvisionAccountsView,
@@ -151,13 +151,3 @@ class BeauticianUpdateActPat(generics.UpdateAPIView):
         return super().perform_update(serializer)
     
 
-class PatientSearchView(generics.ListAPIView):
-    queryset = Patient.objects.all()
-    serializer_class = PatientSerializer
-    filter_backends = [filters.SearchFilter]
-    search_fields = ['name', 'patient_no']
-
-    def list(self, request, *args, **kwargs):
-        queryset = self.filter_queryset(self.get_queryset())[:10]
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)

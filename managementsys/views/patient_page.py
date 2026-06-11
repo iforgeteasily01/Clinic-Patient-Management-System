@@ -17,14 +17,34 @@ class PatientSearchView(APIView):
     def get(self, request):
         qs = Patient.objects.all()
 
-        if no := request.GET.get('patient_no', '').strip():
-            qs = qs.filter(patient_no__icontains=no)
-        if name := request.GET.get('name', '').strip():
-            qs = qs.filter(name__icontains=name)
-        if phone := request.GET.get('phone', '').strip():
-            qs = qs.filter(phone_number__icontains=phone)
-        if address := request.GET.get('address', '').strip():
-            qs = qs.filter(address__icontains=address)
+        # Unified ?search=<value>&field=<name|patient_no|phone|address> format
+        search = request.GET.get('search', '').strip()
+        field = request.GET.get('field', '').strip()
+        if search and field:
+            if field == 'name':
+                qs = qs.filter(name__icontains=search)
+            elif field == 'patient_no':
+                qs = qs.filter(patient_no__icontains=search)
+            elif field == 'phone':
+                qs = qs.filter(phone_number__icontains=search)
+            elif field == 'address':
+                qs = qs.filter(address__icontains=search)
+            else:
+                qs = qs.filter(
+                    Q(name__icontains=search) |
+                    Q(patient_no__icontains=search) |
+                    Q(phone_number__icontains=search)
+                )
+        else:
+            # Legacy per-field params
+            if no := request.GET.get('patient_no', '').strip():
+                qs = qs.filter(patient_no__icontains=no)
+            if name := request.GET.get('name', '').strip():
+                qs = qs.filter(name__icontains=name)
+            if phone := request.GET.get('phone', '').strip():
+                qs = qs.filter(phone_number__icontains=phone)
+            if address := request.GET.get('address', '').strip():
+                qs = qs.filter(address__icontains=address)
 
         serializer = PatientSerializer(qs.order_by('name', 'patient_no')[:100], many=True)
         return Response(serializer.data)
@@ -37,33 +57,28 @@ class PatientCreateWithActiveView(APIView):
             return Response(patient_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         patient = patient_serializer.save()
-
         consult_status = bool(request.data.get('consult_status', False))
-        active_patient_data = {
-            'patient_no': patient.patient_no,
-            'status': 1 if consult_status else 3,
-            'consult_status': consult_status,
-        }
-        active_serializer = ActivePatientSerializer(data=active_patient_data)
-        if active_serializer.is_valid():
-            active_serializer.save()
-            AuditLog.objects.create(
-                performed_by=_actor(request),
-                action='CREATE',
-                entity_type='Patient',
-                entity_id=patient.patient_no,
-                description=f'New patient registered: {patient.name} ({patient.patient_no})',
-            )
-            return Response(
-                {
-                    'patient': patient_serializer.data,
-                    'active_patient': active_serializer.data
-                },
-                status=status.HTTP_201_CREATED,
-            )
 
-        patient.delete()
-        return Response(active_serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        active_patient = ActivePatient.objects.create(
+            patient_no=patient,
+            status=1 if consult_status else 3,
+            consult_status=consult_status,
+        )
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='CREATE',
+            entity_type='Patient',
+            entity_id=patient.patient_no,
+            description=f'New patient registered: {patient.name} ({patient.patient_no})',
+        )
+        return Response(
+            {
+                'patient': patient_serializer.data,
+                'active_patient': ActivePatientSerializer(active_patient).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ActivePatientClearView(APIView):

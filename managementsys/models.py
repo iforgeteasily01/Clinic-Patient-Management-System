@@ -22,6 +22,8 @@ class Patient(models.Model):
     def save(self, *args, **kwargs):
         # Only generate if not already set
         if not self.patient_no:
+            if not self.name:
+                raise ValueError("Patient name is required to generate patient_no.")
             prefix = self.name[0].upper()
 
             maxnumber = Patient.objects.filter(

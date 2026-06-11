@@ -14,6 +14,7 @@ _HEADER_FONT = Font(bold=True, color='FFFFFF')
 _HEADER_FILL = PatternFill('solid', fgColor='0284C7')
 from ..api.serializers import (
     AppUserAdminSerializer,
+    BeauticianAdminStatusSerializer,
     BeauticiansSerializer,
     ChartOfAccountsSerializer,
     DoctorsSerializer,
@@ -246,7 +247,12 @@ class TreatmentMaterialDetailView(APIView):
 
 class BeauticianListCreateAdminView(generics.ListCreateAPIView):
     queryset = Beauticians.objects.all().order_by('beautician_name')
-    serializer_class = BeauticiansSerializer
+
+    def get_serializer_class(self):
+        # Use rich status serializer for reads; plain one for writes
+        if self.request.method == 'GET':
+            return BeauticianAdminStatusSerializer
+        return BeauticiansSerializer
 
     def perform_create(self, serializer):
         instance = serializer.save()
@@ -282,6 +288,38 @@ class BeauticianDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
             description=f'Beautician deleted: {instance.beautician_name}',
         )
         instance.delete()
+
+
+class BeauticianReleaseView(APIView):
+    """
+    POST /api/admin/beauticians/<pk>/release/
+    Force-releases a beautician who is stuck (available=False but patient is no longer
+    in active treatment). Sets available=True and logs the action.
+    """
+    def post(self, request, pk):
+        try:
+            beautician = Beauticians.objects.get(id=pk)
+        except Beauticians.DoesNotExist:
+            return Response({'error': 'Beautician not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if beautician.available:
+            return Response(
+                BeauticianAdminStatusSerializer(beautician).data,
+                status=status.HTTP_200_OK,
+            )
+
+        beautician.available = True
+        beautician.save(update_fields=['available'])
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='UPDATE',
+            entity_type='Beautician',
+            entity_id=str(beautician.id),
+            description=f'Beautician {beautician.beautician_name} manually released by admin',
+        )
+
+        return Response(BeauticianAdminStatusSerializer(beautician).data, status=status.HTTP_200_OK)
 
 
 class AppUserListCreateAdminView(generics.ListCreateAPIView):

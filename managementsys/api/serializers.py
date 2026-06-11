@@ -17,6 +17,12 @@ class PatientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Patient
         fields = ["patient_no", "name", "address", "phone_number", "NIK"]
+        read_only_fields = ["patient_no"]
+        extra_kwargs = {
+            # name is nullable in DB but must be provided on input — the model's
+            # save() method needs it to generate patient_no.
+            'name': {'required': True, 'allow_null': False, 'allow_blank': False},
+        }
 
 
 class ActivePatientSerializer(serializers.ModelSerializer):
@@ -86,6 +92,50 @@ class BeauticiansSerializer(serializers.ModelSerializer):
     class Meta:
         model = Beauticians
         fields = ["id", "beautician_name", "bphone_number", "available"]
+
+
+class BeauticianAdminStatusSerializer(serializers.ModelSerializer):
+    """Extended serializer for admin view — includes the current/last session info."""
+    current_session = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Beauticians
+        fields = ["id", "beautician_name", "bphone_number", "available", "current_session"]
+
+    def get_current_session(self, obj):
+        session = (
+            TreatmentSession.objects
+            .filter(beautician=obj)
+            .select_related('active_patient', 'active_patient__patient_no', 'patient_no')
+            .order_by('-session_time')
+            .first()
+        )
+        if not session:
+            return None
+
+        if session.active_patient_id:
+            ap = session.active_patient
+            patient_name = ap.patient_no.name if ap.patient_no_id else (ap.guest_name or '—')
+            ap_status = ap.status
+            ap_id = ap.id
+        elif session.patient_no_id:
+            patient_name = session.patient_no.name
+            ap_status = None
+            ap_id = None
+        else:
+            return None
+
+        # Stuck = beautician marked busy but patient is no longer in status 4
+        is_stuck = (not obj.available) and (ap_status != 4)
+
+        return {
+            'session_id': session.id,
+            'active_patient_id': ap_id,
+            'patient_name': patient_name,
+            'active_patient_status': ap_status,
+            'session_time': session.session_time,
+            'is_stuck': is_stuck,
+        }
 
 
 class MedRecSerializer(serializers.ModelSerializer):

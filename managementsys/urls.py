@@ -26,6 +26,7 @@ urlpatterns = [
     path('api/patients/<str:patient_no>/packages/', views.PatientPackagesView.as_view(), name='patient-packages'),
     path('api/admin/beauticians/', views.BeauticianListCreateAdminView.as_view(), name='admin-beauticians'),
     path('api/admin/beauticians/<int:pk>/', views.BeauticianDetailAdminView.as_view(), name='admin-beautician-detail'),
+    path('api/admin/beauticians/<int:pk>/release/', views.BeauticianReleaseView.as_view(), name='admin-beautician-release'),
     path('api/admin/users/', views.AppUserListCreateAdminView.as_view(), name='admin-users'),
     path('api/admin/users/<int:pk>/', views.AppUserDetailAdminView.as_view(), name='admin-user-detail'),
     path('api/admin/treatment-categories/', views.TreatmentCategoryListCreateView.as_view(), name='admin-treatment-categories'),
