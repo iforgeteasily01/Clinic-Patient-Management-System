@@ -22,7 +22,7 @@ from ..api.serializers import (
 from ..models import (
     AccountTransfer, AppUser, AuditLog, ChartOfAccounts,
     InventoryBatch, InventoryItem, Invoice, LedgerEntry,
-    PurchaseInvoice, PurchaseInvoiceItem, Supplier, Warehouse,
+    PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem, Supplier, Warehouse,
 )
 
 
@@ -237,6 +237,15 @@ class PurchaseInvoiceListCreateView(APIView):
         else:
             items = items_raw
 
+        additional_costs_raw = data.get('additional_costs', [])
+        if isinstance(additional_costs_raw, str):
+            try:
+                additional_costs = json.loads(additional_costs_raw)
+            except (json.JSONDecodeError, ValueError):
+                return Response({'error': 'Invalid additional_costs JSON.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            additional_costs = additional_costs_raw
+
         if not items:
             return Response({'error': 'At least one item is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -246,11 +255,21 @@ class PurchaseInvoiceListCreateView(APIView):
         except (Supplier.DoesNotExist, ChartOfAccounts.DoesNotExist, KeyError):
             return Response({'error': 'Invalid supplier or payment account.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Resolve optional invoice-level warehouse
+        warehouse_id = data.get('warehouse') or None
+        warehouse_obj = None
+        if warehouse_id:
+            try:
+                warehouse_obj = Warehouse.objects.get(pk=warehouse_id)
+            except Warehouse.DoesNotExist:
+                return Response({'error': 'Invalid warehouse.'}, status=status.HTTP_400_BAD_REQUEST)
+
         with transaction.atomic():
             invoice = PurchaseInvoice.objects.create(
                 external_invoice_no=data.get('external_invoice_no', ''),
                 supplier=supplier,
                 payment_account=payment_acct,
+                warehouse=warehouse_obj,
                 purchase_date=data['purchase_date'],
                 due_date=data.get('due_date') or None,
                 notes=data.get('notes', ''),
@@ -263,44 +282,126 @@ class PurchaseInvoiceListCreateView(APIView):
                 invoice.invoice_image = image_file
                 invoice.save(update_fields=['invoice_image'])
 
-            total = Decimal('0')
+            # ── Step 1: parse items and compute per-item adjusted subtotals ──────
+            parsed = []
+            items_subtotal = Decimal('0')
+            total_units = Decimal('0')
+
+            for row in items:
+                qty            = _safe_decimal(row.get('quantity', 0))
+                cost           = _safe_decimal(row.get('unit_cost', 0))
+                total_discount = _safe_decimal(row.get('total_discount', 0))
+                line_type      = row.get('line_type', 'stock')
+                item_id        = row.get('item') or None
+                expense_acct_id = row.get('expense_account') or None
+
+                # Row-level warehouse falls back to invoice-level warehouse
+                row_wh_id = row.get('warehouse') or warehouse_id or None
+
+                gross          = qty * cost
+                # Ensure discount does not exceed gross
+                discount_capped = min(total_discount, gross)
+                adjusted_sub   = gross - discount_capped
+
+                items_subtotal += adjusted_sub
+                if line_type == 'stock' and qty > 0:
+                    total_units += qty
+
+                parsed.append({
+                    'line_type':       line_type,
+                    'item_id':         item_id,
+                    'item_name':       row.get('item_name', ''),
+                    'quantity':        qty,
+                    'unit':            row.get('unit', ''),
+                    'unit_cost':       cost,
+                    'total_discount':  discount_capped,
+                    'adjusted_sub':    adjusted_sub,
+                    'expense_acct_id': expense_acct_id,
+                    'warehouse_id':    row_wh_id,
+                })
+
+            # ── Step 2: compute net adjustment from additional costs ─────────────
+            running_total = items_subtotal
+            net_adjustment = Decimal('0')
+
+            cost_objs = []
+            for i, ac in enumerate(additional_costs):
+                name        = str(ac.get('name', '')).strip()
+                modifier    = ac.get('modifier', 'add')
+                amount_type = ac.get('amount_type', 'cash')
+                amount      = _safe_decimal(ac.get('amount', 0))
+
+                if not name or amount <= 0:
+                    continue
+
+                if amount_type == 'percent':
+                    adj = running_total * amount / Decimal('100')
+                else:
+                    adj = amount
+
+                if modifier == 'subtract':
+                    adj = -adj
+
+                running_total  += adj
+                net_adjustment += adj
+
+                cost_objs.append(PurchaseAdditionalCost(
+                    invoice=invoice,
+                    name=name,
+                    modifier=modifier,
+                    amount_type=amount_type,
+                    amount=amount,
+                    sort_order=i,
+                ))
+
+            if cost_objs:
+                PurchaseAdditionalCost.objects.bulk_create(cost_objs)
+
+            grand_total = items_subtotal + net_adjustment
+
+            # ── Step 3: distribute net_adjustment equally per stock unit ─────────
+            per_unit_adj = Decimal('0')
+            if total_units > 0:
+                per_unit_adj = net_adjustment / total_units
+
+            # ── Step 4: create item records and batches ───────────────────────────
             item_objs = []
             batches_to_create = []
 
-            for row in items:
-                qty       = _safe_decimal(row.get('quantity', 0))
-                cost      = _safe_decimal(row.get('unit_cost', 0))
-                line_type = row.get('line_type', 'stock')
-                total    += qty * cost
-
-                expense_acct_id = row.get('expense_account') or None
-                warehouse_id    = row.get('warehouse') or None
-                item_id         = row.get('item') or None
+            for p in parsed:
+                qty = p['quantity']
+                if qty > 0:
+                    base_unit_cost = p['adjusted_sub'] / qty
+                    actual = base_unit_cost + (per_unit_adj if p['line_type'] == 'stock' else Decimal('0'))
+                else:
+                    base_unit_cost = p['unit_cost']
+                    actual = p['unit_cost']
 
                 item_objs.append(PurchaseInvoiceItem(
                     invoice=invoice,
-                    line_type=line_type,
-                    item_id=item_id,
-                    item_name=row.get('item_name', ''),
+                    line_type=p['line_type'],
+                    item_id=p['item_id'],
+                    item_name=p['item_name'],
                     quantity=qty,
-                    unit=row.get('unit', ''),
-                    unit_cost=cost,
-                    expense_account_id=expense_acct_id,
-                    warehouse_id=warehouse_id,
+                    unit=p['unit'],
+                    unit_cost=p['unit_cost'],
+                    total_discount=p['total_discount'],
+                    actual_unit_cost=actual,
+                    expense_account_id=p['expense_acct_id'],
+                    warehouse_id=p['warehouse_id'],
                 ))
 
-                # Queue InventoryBatch creation for stock lines
-                if line_type == 'stock' and item_id and warehouse_id:
+                if p['line_type'] == 'stock' and p['item_id'] and p['warehouse_id'] and qty > 0:
                     batches_to_create.append({
-                        'item_id': item_id,
-                        'warehouse_id': warehouse_id,
-                        'qty': qty,
-                        'cost': cost,
+                        'item_id':     p['item_id'],
+                        'warehouse_id': p['warehouse_id'],
+                        'qty':         qty,
+                        'cost':        actual,
                     })
 
             PurchaseInvoiceItem.objects.bulk_create(item_objs)
 
-            # Create inventory batches (FIFO stock-in)
+            # Create inventory batches (FIFO stock-in) with actual_unit_cost as batch value
             for b in batches_to_create:
                 InventoryBatch.objects.create(
                     item_id=b['item_id'],
@@ -311,7 +412,7 @@ class PurchaseInvoiceListCreateView(APIView):
                     value=b['cost'],
                 )
 
-            invoice.total_amount = total
+            invoice.total_amount = grand_total
             invoice.save(update_fields=['total_amount'])
 
             AuditLog.objects.create(
@@ -332,8 +433,8 @@ class PurchaseInvoiceDetailView(APIView):
     def _get(self, pk):
         try:
             return PurchaseInvoice.objects.select_related(
-                'supplier', 'payment_account', 'created_by',
-            ).prefetch_related('items__item').get(pk=pk)
+                'supplier', 'payment_account', 'created_by', 'warehouse',
+            ).prefetch_related('items__item', 'additional_costs').get(pk=pk)
         except PurchaseInvoice.DoesNotExist:
             return None
 

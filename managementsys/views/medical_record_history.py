@@ -8,7 +8,10 @@ from ..api.serializers import MedRecHistorySerializer
 
 class MedRecHistoryListView(APIView):
     def get(self, request):
+        include_drafts = request.query_params.get('include_drafts', '').lower() == 'true'
         qs = MedRec.objects.select_related('patient_no', 'doctor_id').all()
+        if not include_drafts:
+            qs = qs.filter(status=MedRec.FINALIZED)
 
         patient_name = request.query_params.get('patient_name', '').strip()
         patient_no = request.query_params.get('patient_no', '').strip()

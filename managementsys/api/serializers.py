@@ -7,9 +7,9 @@ from ..models import (
     ChartOfAccounts, Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
     IssueTicket, IssueTicketImage, LedgerEntry, MedRec, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
-    Promotion, PurchaseInvoice, PurchaseInvoiceItem, SiteConfig, SoapTemplate, StaffSchedule,
-    Supplier, Treatment, TreatmentCategory, TreatmentMaterial, TreatmentPackage,
-    TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift, patientStatus,
+    Promotion, PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem, SiteConfig,
+    SoapTemplate, StaffSchedule, Supplier, Treatment, TreatmentCategory, TreatmentMaterial,
+    TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift, patientStatus,
 )
 
 
@@ -89,9 +89,25 @@ class DoctorsSerializer(serializers.ModelSerializer):
 
 
 class BeauticiansSerializer(serializers.ModelSerializer):
+    current_patient = serializers.SerializerMethodField()
+
+    def get_current_patient(self, obj):
+        session = (
+            TreatmentSession.objects
+            .filter(beautician=obj, active_patient__isnull=False)
+            .select_related('active_patient__patient_no')
+            .order_by('-session_time')
+            .first()
+        )
+        if not session:
+            return None
+        ap = session.active_patient
+        name = ap.patient_no.name if ap.patient_no else ap.guest_name
+        return {'active_patient_id': ap.id, 'patient_name': name}
+
     class Meta:
         model = Beauticians
-        fields = ["id", "beautician_name", "bphone_number", "available"]
+        fields = ["id", "beautician_name", "bphone_number", "available", "current_patient"]
 
 
 class BeauticianAdminStatusSerializer(serializers.ModelSerializer):
@@ -143,12 +159,13 @@ class MedRecSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = MedRec
-        fields = ["medrec_id", "doctor_id", "patient_no", "subjective", "objective",
+        fields = ["medrec_id", "doctor_id", "patient_no", "status", "subjective", "objective",
                   "assessment", "assessment_codes", "plan", "sabun_pagi",
                   "sabun_malam", "toner_pagi", "toner_malam", "obat1_pagi", "obat2_pagi",
                   "obat1_malam", "obat2_malam", "treatment", "visit_date"]
         extra_kwargs = {
             'medrec_id':   {'required': False, 'allow_blank': True},
+            'status':      {'required': False},
             'subjective':  {'allow_blank': True},
             'objective':   {'allow_blank': True},
             'assessment':  {'allow_blank': True},
@@ -399,8 +416,8 @@ class MedRecHistorySerializer(serializers.ModelSerializer):
     class Meta:
         model = MedRec
         fields = [
-            'medrec_id', 'patient_no', 'patient_name', 'doctor_id', 'doctor_name', 'visit_date',
-            'subjective', 'objective', 'assessment', 'plan',
+            'medrec_id', 'status', 'patient_no', 'patient_name', 'doctor_id', 'doctor_name',
+            'visit_date', 'subjective', 'objective', 'assessment', 'assessment_codes', 'plan',
             'sabun_pagi', 'sabun_malam', 'toner_pagi', 'toner_malam',
             'obat1_pagi', 'obat2_pagi', 'obat1_malam', 'obat2_malam', 'treatment',
         ]
@@ -417,6 +434,40 @@ class MedRecHistorySerializer(serializers.ModelSerializer):
             if len(part) == 8 and part.isdigit():
                 return f"{part[:4]}-{part[4:6]}-{part[6:8]}"
         return None
+
+
+class MedRecPendingDraftSerializer(serializers.ModelSerializer):
+    patient_name = serializers.SerializerMethodField()
+    visit_date = serializers.SerializerMethodField()
+    active_patient_id = serializers.SerializerMethodField()
+    active_patient_status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MedRec
+        fields = [
+            'medrec_id', 'status', 'patient_no', 'patient_name',
+            'visit_date', 'active_patient_id', 'active_patient_status',
+            'subjective', 'objective', 'assessment', 'assessment_codes', 'plan',
+            'sabun_pagi', 'sabun_malam', 'toner_pagi', 'toner_malam',
+            'obat1_pagi', 'obat2_pagi', 'obat1_malam', 'obat2_malam', 'treatment',
+        ]
+
+    def get_patient_name(self, obj):
+        return obj.patient_no.name if obj.patient_no_id else '—'
+
+    def get_visit_date(self, obj):
+        for part in obj.medrec_id.split('-'):
+            if len(part) == 8 and part.isdigit():
+                return f"{part[:4]}-{part[4:6]}-{part[6:8]}"
+        return None
+
+    def get_active_patient_id(self, obj):
+        visit = getattr(obj, 'active_visit', None)
+        return visit.id if visit else None
+
+    def get_active_patient_status(self, obj):
+        visit = getattr(obj, 'active_visit', None)
+        return visit.status if visit else None
 
 
 # ── Invoice ────────────────────────────────────────────────────────────────
@@ -950,17 +1001,25 @@ class SupplierSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'contact_name', 'phone', 'email', 'address', 'is_active']
 
 
+class PurchaseAdditionalCostSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PurchaseAdditionalCost
+        fields = ['id', 'name', 'modifier', 'amount_type', 'amount', 'sort_order']
+
+
 class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
     item_code            = serializers.CharField(source='item.code', read_only=True, allow_null=True)
     expense_account_name = serializers.CharField(source='expense_account.name', read_only=True, allow_null=True)
     warehouse_name       = serializers.CharField(source='warehouse.name', read_only=True, allow_null=True)
     subtotal             = serializers.SerializerMethodField()
+    adjusted_subtotal    = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseInvoiceItem
         fields = [
             'id', 'line_type', 'item', 'item_code', 'item_name',
-            'quantity', 'unit', 'unit_cost', 'subtotal',
+            'quantity', 'unit', 'unit_cost', 'total_discount',
+            'actual_unit_cost', 'subtotal', 'adjusted_subtotal',
             'expense_account', 'expense_account_name',
             'warehouse', 'warehouse_name',
         ]
@@ -968,11 +1027,15 @@ class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
     def get_subtotal(self, obj):
         return str(obj.quantity * obj.unit_cost)
 
+    def get_adjusted_subtotal(self, obj):
+        return str(obj.quantity * obj.unit_cost - obj.total_discount)
+
 
 class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
     supplier_name        = serializers.CharField(source='supplier.name', read_only=True)
     payment_account_name = serializers.CharField(source='payment_account.name', read_only=True)
     payment_account_no   = serializers.IntegerField(source='payment_account.account_number', read_only=True)
+    warehouse_name       = serializers.CharField(source='warehouse.name', read_only=True, allow_null=True)
     balance_due          = serializers.SerializerMethodField()
     invoice_image_url    = serializers.SerializerMethodField()
 
@@ -981,6 +1044,7 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'internal_id', 'external_invoice_no', 'supplier', 'supplier_name',
             'payment_account', 'payment_account_name', 'payment_account_no',
+            'warehouse', 'warehouse_name',
             'purchase_date', 'due_date', 'status', 'total_amount', 'amount_paid',
             'balance_due', 'notes', 'invoice_image_url', 'created_at',
         ]
@@ -998,10 +1062,11 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
 
 
 class PurchaseInvoiceDetailSerializer(PurchaseInvoiceListSerializer):
-    items = PurchaseInvoiceItemSerializer(many=True, read_only=True)
+    items            = PurchaseInvoiceItemSerializer(many=True, read_only=True)
+    additional_costs = PurchaseAdditionalCostSerializer(many=True, read_only=True)
 
     class Meta(PurchaseInvoiceListSerializer.Meta):
-        fields = PurchaseInvoiceListSerializer.Meta.fields + ['items']
+        fields = PurchaseInvoiceListSerializer.Meta.fields + ['items', 'additional_costs']
 
 
 class AccountTransferSerializer(serializers.ModelSerializer):

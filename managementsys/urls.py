@@ -78,6 +78,12 @@ urlpatterns = [
     path('api/medical-records/history/', views.MedRecHistoryListView.as_view(), name='medrec-history'),
     path('api/medical-records/history/<str:medrec_id>/', views.MedRecHistoryDetailView.as_view(), name='medrec-history-detail'),
 
+    # Medical Record Drafts
+    path('api/medical-records/draft/', views.MedRecDraftCreateView.as_view(), name='medrec-draft-create'),
+    path('api/medical-records/pending-drafts/', views.MedRecPendingDraftsView.as_view(), name='medrec-pending-drafts'),
+    path('api/medical-records/<str:medrec_id>/', views.MedRecUpdateView.as_view(), name='medrec-update'),
+    path('api/medical-records/<str:medrec_id>/finalize/', views.MedRecFinalizeView.as_view(), name='medrec-finalize'),
+
     # Invoice
     path('api/invoices/', views.InvoiceListView.as_view(), name='invoice-list'),
     path('api/invoices/create/', views.InvoiceCreateView.as_view(), name='invoice-create'),

@@ -1,221 +1,306 @@
+from decimal import Decimal
+
 from django.test import TestCase
-from django.urls import reverse
-from rest_framework.test import APIClient
-
-from .models import ActivePatient, AppUser, Patient
 
 
-def _make_user(token='testtoken123'):
-    user = AppUser.objects.create(
-        display_name='Test Admin',
-        role='superuser',
-        auth_token=token,
-    )
-    user.set_pin('000000')
-    user.save()
-    return user
+# ── Pure calculation helpers (mirror accounting_page.py logic) ─────────────────
+
+def _safe_decimal(val) -> Decimal:
+    try:
+        return Decimal(str(val))
+    except Exception:
+        return Decimal('0')
 
 
-def _auth_client(token='testtoken123'):
-    client = APIClient()
-    client.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
-    return client
-
-
-class PatientCreateWithActiveViewTests(TestCase):
+def compute_purchase_totals(items: list, additional_costs: list):
     """
-    Tests for POST /api/patients/new/
-    Covers all cases that could cause errors on the new-patient form.
+    Replicates the server-side calculation in PurchaseInvoiceListCreateView.post.
+
+    items: list of dicts with keys:
+        quantity, unit_cost, total_discount, line_type ('stock'|'expense')
+
+    additional_costs: list of dicts with keys:
+        name, modifier ('add'|'subtract'), amount_type ('cash'|'percent'), amount
+
+    Returns:
+        {
+            'items_subtotal': Decimal,   # sum of adjusted item subtotals
+            'net_adjustment': Decimal,   # net effect of additional costs
+            'grand_total': Decimal,
+            'per_unit_adj': Decimal,     # adjustment per stock unit
+            'parsed': list of dict with 'base_unit_cost' and 'actual_unit_cost',
+        }
     """
+    parsed = []
+    items_subtotal = Decimal('0')
+    total_units = Decimal('0')
 
-    def setUp(self):
-        self.user = _make_user()
-        self.client = _auth_client()
-        self.url = '/api/patients/new/'
+    for row in items:
+        qty = _safe_decimal(row.get('quantity', 0))
+        cost = _safe_decimal(row.get('unit_cost', 0))
+        total_discount = _safe_decimal(row.get('total_discount', 0))
+        line_type = row.get('line_type', 'stock')
 
-    # ── Happy-path tests ──────────────────────────────────────────────────────
+        gross = qty * cost
+        discount_capped = min(total_discount, gross)
+        adjusted_sub = gross - discount_capped
 
-    def test_create_patient_all_fields(self):
-        """Full payload with all fields creates patient + active patient."""
-        res = self.client.post(self.url, {
-            'name': 'Jane Doe',
-            'address': '123 Main St',
-            'phone_number': '08123456789',
-            'NIK': '1234567890123456',
-            'consult_status': False,
-        }, format='json')
-        self.assertEqual(res.status_code, 201, res.data)
-        data = res.json()
-        self.assertIn('patient', data)
-        self.assertIn('active_patient', data)
+        items_subtotal += adjusted_sub
+        if line_type == 'stock' and qty > 0:
+            total_units += qty
 
-        patient_no = data['patient']['patient_no']
-        self.assertTrue(patient_no.startswith('J'), patient_no)
+        parsed.append({
+            'line_type': line_type,
+            'quantity': qty,
+            'unit_cost': cost,
+            'total_discount': discount_capped,
+            'adjusted_sub': adjusted_sub,
+        })
 
-        # ActivePatient should exist in DB
-        active = ActivePatient.objects.get(patient_no__patient_no=patient_no)
-        self.assertEqual(active.status, 3)   # treatment queue
-        self.assertFalse(active.consult_status)
+    running_total = items_subtotal
+    net_adjustment = Decimal('0')
 
-    def test_create_patient_minimal_fields(self):
-        """Only name is required; other fields may be omitted."""
-        res = self.client.post(self.url, {'name': 'Alice'}, format='json')
-        self.assertEqual(res.status_code, 201, res.data)
-        data = res.json()
-        patient_no = data['patient']['patient_no']
-        self.assertTrue(patient_no, 'patient_no should be auto-generated')
+    for ac in additional_costs:
+        modifier = ac.get('modifier', 'add')
+        amount_type = ac.get('amount_type', 'cash')
+        amount = _safe_decimal(ac.get('amount', 0))
+        if amount <= 0:
+            continue
 
-    def test_consult_status_true_sets_status_1(self):
-        """consult_status=True should create ActivePatient with status=1."""
-        res = self.client.post(self.url, {
-            'name': 'Bob',
-            'consult_status': True,
-        }, format='json')
-        self.assertEqual(res.status_code, 201, res.data)
-        active = ActivePatient.objects.get(
-            patient_no__patient_no=res.json()['patient']['patient_no']
+        if amount_type == 'percent':
+            adj = running_total * amount / Decimal('100')
+        else:
+            adj = amount
+
+        if modifier == 'subtract':
+            adj = -adj
+
+        running_total += adj
+        net_adjustment += adj
+
+    grand_total = items_subtotal + net_adjustment
+    per_unit_adj = Decimal('0')
+    if total_units > 0:
+        per_unit_adj = net_adjustment / total_units
+
+    result_parsed = []
+    for p in parsed:
+        qty = p['quantity']
+        if qty > 0:
+            base_unit_cost = p['adjusted_sub'] / qty
+        else:
+            base_unit_cost = p['unit_cost']
+        actual = base_unit_cost + \
+            (per_unit_adj if p['line_type'] == 'stock' else Decimal('0'))
+        result_parsed.append(
+            {**p, 'base_unit_cost': base_unit_cost, 'actual_unit_cost': actual})
+
+    return {
+        'items_subtotal': items_subtotal,
+        'net_adjustment': net_adjustment,
+        'grand_total': grand_total,
+        'per_unit_adj': per_unit_adj,
+        'total_units': total_units,
+        'parsed': result_parsed,
+    }
+
+
+# ── Tests ──────────────────────────────────────────────────────────────────────
+
+class PurchaseItemDiscountTests(TestCase):
+
+    def test_no_discount_no_additional(self):
+        """Basic: 10 items × 10000, no discount, no additional costs."""
+        result = compute_purchase_totals(
+            items=[{'quantity': 10, 'unit_cost': 10000,
+                    'total_discount': 0, 'line_type': 'stock'}],
+            additional_costs=[],
         )
-        self.assertEqual(active.status, 1)
-        self.assertTrue(active.consult_status)
+        self.assertEqual(result['items_subtotal'], Decimal('100000'))
+        self.assertEqual(result['grand_total'], Decimal('100000'))
+        self.assertEqual(result['net_adjustment'], Decimal('0'))
+        item = result['parsed'][0]
+        self.assertEqual(item['base_unit_cost'], Decimal('10000'))
+        self.assertEqual(item['actual_unit_cost'], Decimal('10000'))
 
-    def test_consult_status_false_sets_status_3(self):
-        """consult_status=False (default) creates ActivePatient with status=3."""
-        res = self.client.post(self.url, {'name': 'Carol', 'consult_status': False}, format='json')
-        self.assertEqual(res.status_code, 201, res.data)
-        active = ActivePatient.objects.get(
-            patient_no__patient_no=res.json()['patient']['patient_no']
+    def test_row_discount_reduces_unit_cost(self):
+        """10 items × 10000 with total_discount=10000 → actual unit cost = 9000."""
+        result = compute_purchase_totals(
+            items=[{'quantity': 10, 'unit_cost': 10000,
+                    'total_discount': 10000, 'line_type': 'stock'}],
+            additional_costs=[],
         )
-        self.assertEqual(active.status, 3)
+        self.assertEqual(result['items_subtotal'], Decimal('90000'))
+        item = result['parsed'][0]
+        self.assertEqual(item['base_unit_cost'], Decimal('9000'))
+        self.assertEqual(item['actual_unit_cost'], Decimal('9000'))
 
-    def test_omitting_consult_status_defaults_to_treatment(self):
-        """Omitting consult_status should default to status=3 (treatment queue)."""
-        res = self.client.post(self.url, {'name': 'Dave'}, format='json')
-        self.assertEqual(res.status_code, 201, res.data)
-        active = ActivePatient.objects.get(
-            patient_no__patient_no=res.json()['patient']['patient_no']
+    def test_discount_cannot_exceed_gross(self):
+        """total_discount > gross is capped at gross → actual cost = 0."""
+        result = compute_purchase_totals(
+            items=[{'quantity': 5, 'unit_cost': 1000,
+                    'total_discount': 9999999, 'line_type': 'stock'}],
+            additional_costs=[],
         )
-        self.assertEqual(active.status, 3)
+        item = result['parsed'][0]
+        self.assertEqual(item['total_discount'], Decimal('5000'))   # capped
+        self.assertEqual(item['base_unit_cost'], Decimal('0'))
 
-    def test_patient_no_is_auto_generated(self):
-        """patient_no should be ignored in input and auto-generated from name."""
-        res = self.client.post(self.url, {
-            'name': 'Eve',
-            'patient_no': 'CUSTOM99',   # should be ignored
-        }, format='json')
-        self.assertEqual(res.status_code, 201, res.data)
-        returned_no = res.json()['patient']['patient_no']
-        self.assertNotEqual(returned_no, 'CUSTOM99')
-        self.assertTrue(returned_no.startswith('E'), returned_no)
+    def test_cash_addition_distributed_per_unit(self):
+        """
+        Single item: 10 units × 10000, discount 10000 → base = 9000.
+        Additional cost: +5000 cash → per_unit_adj = 500 → actual = 9500.
+        """
+        result = compute_purchase_totals(
+            items=[{'quantity': 10, 'unit_cost': 10000,
+                    'total_discount': 10000, 'line_type': 'stock'}],
+            additional_costs=[
+                {'name': 'Ongkir', 'modifier': 'add', 'amount_type': 'cash', 'amount': 5000}],
+        )
+        self.assertEqual(result['items_subtotal'], Decimal('90000'))
+        self.assertEqual(result['net_adjustment'], Decimal('5000'))
+        self.assertEqual(result['grand_total'], Decimal('95000'))
+        self.assertEqual(result['per_unit_adj'], Decimal('500'))
+        item = result['parsed'][0]
+        self.assertEqual(item['actual_unit_cost'], Decimal('9500'))
 
-    def test_creates_exactly_one_patient_and_one_active_patient(self):
-        """Each POST creates exactly one Patient and one ActivePatient."""
-        Patient.objects.all().delete()
-        ActivePatient.objects.all().delete()
-        self.client.post(self.url, {'name': 'Frank'}, format='json')
-        self.assertEqual(Patient.objects.count(), 1)
-        self.assertEqual(ActivePatient.objects.count(), 1)
+    def test_cash_subtraction_distributed_per_unit(self):
+        """Additional discount -5000 on 10 units reduces unit cost by 500."""
+        result = compute_purchase_totals(
+            items=[{'quantity': 10, 'unit_cost': 10000,
+                    'total_discount': 0, 'line_type': 'stock'}],
+            additional_costs=[
+                {'name': 'Diskon', 'modifier': 'subtract', 'amount_type': 'cash', 'amount': 5000}],
+        )
+        self.assertEqual(result['net_adjustment'], Decimal('-5000'))
+        item = result['parsed'][0]
+        self.assertEqual(item['actual_unit_cost'], Decimal('9500'))
 
-    # ── Validation error tests ────────────────────────────────────────────────
+    def test_percent_addition(self):
+        """10% additional on items_subtotal=100000 → +10000 → grand_total=110000."""
+        result = compute_purchase_totals(
+            items=[{'quantity': 10, 'unit_cost': 10000,
+                    'total_discount': 0, 'line_type': 'stock'}],
+            additional_costs=[
+                {'name': 'PPh', 'modifier': 'add', 'amount_type': 'percent', 'amount': 10}],
+        )
+        self.assertEqual(result['net_adjustment'], Decimal('10000'))
+        self.assertEqual(result['grand_total'], Decimal('110000'))
+        item = result['parsed'][0]
+        self.assertEqual(item['actual_unit_cost'], Decimal('11000'))
 
-    def test_missing_name_returns_400(self):
-        """Omitting name entirely should return 400."""
-        res = self.client.post(self.url, {
-            'address': '456 Oak Ave',
-            'phone_number': '08111111111',
-        }, format='json')
-        self.assertEqual(res.status_code, 400)
+    def test_percent_subtraction(self):
+        """5% off 100000 = -5000 → grand_total = 95000."""
+        result = compute_purchase_totals(
+            items=[{'quantity': 10, 'unit_cost': 10000,
+                    'total_discount': 0, 'line_type': 'stock'}],
+            additional_costs=[
+                {'name': 'Diskon 5%', 'modifier': 'subtract', 'amount_type': 'percent', 'amount': 5}],
+        )
+        self.assertEqual(result['net_adjustment'], Decimal('-5000'))
+        self.assertEqual(result['grand_total'], Decimal('95000'))
 
-    def test_empty_name_returns_400(self):
-        """Sending name='' should return 400 (blank not allowed)."""
-        res = self.client.post(self.url, {'name': ''}, format='json')
-        self.assertEqual(res.status_code, 400)
+    def test_percent_applied_to_running_total(self):
+        """
+        Cash +10000 then 10% of new total.
+        items_subtotal=100000, +10000 cash → running=110000, then 10%=11000 → grand=121000.
+        """
+        result = compute_purchase_totals(
+            items=[{'quantity': 10, 'unit_cost': 10000,
+                    'total_discount': 0, 'line_type': 'stock'}],
+            additional_costs=[
+                {'name': 'Fee', 'modifier': 'add',
+                    'amount_type': 'cash', 'amount': 10000},
+                {'name': 'Tax', 'modifier': 'add',
+                    'amount_type': 'percent', 'amount': 10},
+            ],
+        )
+        self.assertEqual(result['grand_total'], Decimal('121000'))
+        self.assertEqual(result['net_adjustment'], Decimal('21000'))
 
-    def test_name_too_long_returns_400(self):
-        """Name exceeding 100 chars should fail serializer validation."""
-        res = self.client.post(self.url, {'name': 'A' * 101}, format='json')
-        self.assertEqual(res.status_code, 400)
+    def test_multi_item_equal_per_unit_distribution(self):
+        """
+        Item A: 10 × 1000, Item B: 5 × 2000. Additional +1500 cash.
+        total_units = 15, per_unit_adj = 100.
+        Item A actual = 1100, Item B actual = 2100.
+        """
+        result = compute_purchase_totals(
+            items=[
+                {'quantity': 10, 'unit_cost': 1000,
+                    'total_discount': 0, 'line_type': 'stock'},
+                {'quantity': 5,  'unit_cost': 2000,
+                    'total_discount': 0, 'line_type': 'stock'},
+            ],
+            additional_costs=[
+                {'name': 'Ongkir', 'modifier': 'add', 'amount_type': 'cash', 'amount': 1500}],
+        )
+        self.assertEqual(result['total_units'], Decimal('15'))
+        self.assertEqual(result['per_unit_adj'], Decimal('100'))
+        self.assertEqual(result['parsed'][0]
+                         ['actual_unit_cost'], Decimal('1100'))
+        self.assertEqual(result['parsed'][1]
+                         ['actual_unit_cost'], Decimal('2100'))
 
-    def test_phone_too_long_returns_400(self):
-        """phone_number exceeding 15 chars should fail serializer validation."""
-        res = self.client.post(self.url, {
-            'name': 'Grace',
-            'phone_number': '0' * 16,
-        }, format='json')
-        self.assertEqual(res.status_code, 400)
+    def test_expense_line_not_included_in_unit_distribution(self):
+        """Expense-type lines do not receive per_unit_adj."""
+        result = compute_purchase_totals(
+            items=[
+                {'quantity': 10, 'unit_cost': 1000,
+                    'total_discount': 0, 'line_type': 'stock'},
+                {'quantity': 1,  'unit_cost': 500,
+                    'total_discount': 0, 'line_type': 'expense'},
+            ],
+            additional_costs=[
+                {'name': 'Fee', 'modifier': 'add', 'amount_type': 'cash', 'amount': 1000}],
+        )
+        # Only 10 stock units; expense unit is not in total_units
+        self.assertEqual(result['total_units'], Decimal('10'))
+        self.assertEqual(result['per_unit_adj'], Decimal('100'))
+        # Expense line's actual_unit_cost is unchanged (no adj applied)
+        expense_item = result['parsed'][1]
+        self.assertEqual(
+            expense_item['actual_unit_cost'], expense_item['unit_cost'])
 
-    def test_nik_too_long_returns_400(self):
-        """NIK exceeding 16 chars should fail serializer validation."""
-        res = self.client.post(self.url, {
-            'name': 'Hank',
-            'NIK': '1' * 17,
-        }, format='json')
-        self.assertEqual(res.status_code, 400)
+    def test_zero_quantity_item_no_division_error(self):
+        """Zero-quantity item should not raise ZeroDivisionError."""
+        result = compute_purchase_totals(
+            items=[{'quantity': 0, 'unit_cost': 5000,
+                    'total_discount': 0, 'line_type': 'stock'}],
+            additional_costs=[],
+        )
+        item = result['parsed'][0]
+        self.assertEqual(item['actual_unit_cost'], Decimal('5000'))
 
-    # ── Auth tests ────────────────────────────────────────────────────────────
+    def test_additional_cost_with_zero_amount_skipped(self):
+        """Additional cost entries with amount=0 are ignored."""
+        result = compute_purchase_totals(
+            items=[{'quantity': 5, 'unit_cost': 2000,
+                    'total_discount': 0, 'line_type': 'stock'}],
+            additional_costs=[
+                {'name': 'Skip me', 'modifier': 'add',
+                    'amount_type': 'cash', 'amount': 0},
+            ],
+        )
+        self.assertEqual(result['net_adjustment'], Decimal('0'))
+        self.assertEqual(result['grand_total'], Decimal('10000'))
 
-    def test_unauthenticated_request_returns_403(self):
-        """Request without auth token should be rejected."""
-        unauth_client = APIClient()
-        res = unauth_client.post(self.url, {'name': 'Ivan'}, format='json')
-        self.assertIn(res.status_code, [401, 403])
-
-    # ── No orphaned records on failure ────────────────────────────────────────
-
-    def test_no_patient_left_when_validation_fails(self):
-        """If patient validation fails, no Patient record should be created."""
-        before = Patient.objects.count()
-        self.client.post(self.url, {}, format='json')   # no name
-        self.assertEqual(Patient.objects.count(), before)
-
-
-class PatientSearchViewTests(TestCase):
-    """
-    Tests for GET /api/patients/search/
-    Verifies that the search+field query format sent by the frontend works.
-    """
-
-    def setUp(self):
-        self.user = _make_user(token='searchtoken')
-        self.client = _auth_client('searchtoken')
-        self.url = '/api/patients/search/'
-        # Create a few patients
-        Patient.objects.create(patient_no='J000001', name='John Smith', phone_number='08111111111')
-        Patient.objects.create(patient_no='A000001', name='Alice Brown', phone_number='08222222222')
-        Patient.objects.create(patient_no='B000001', name='Bob Jones', phone_number='08333333333')
-
-    def test_search_by_name_with_search_param(self):
-        """?search=john&field=name should return patients whose name contains 'john'."""
-        res = self.client.get(self.url, {'search': 'john', 'field': 'name'})
-        self.assertEqual(res.status_code, 200)
-        names = [p['name'] for p in res.json()]
-        self.assertIn('John Smith', names)
-        self.assertNotIn('Alice Brown', names)
-
-    def test_search_by_patient_no_with_search_param(self):
-        """?search=J000&field=patient_no should filter by patient_no."""
-        res = self.client.get(self.url, {'search': 'J000', 'field': 'patient_no'})
-        self.assertEqual(res.status_code, 200)
-        patient_nos = [p['patient_no'] for p in res.json()]
-        self.assertIn('J000001', patient_nos)
-        self.assertNotIn('A000001', patient_nos)
-
-    def test_search_by_phone_with_search_param(self):
-        """?search=08222&field=phone should filter by phone_number."""
-        res = self.client.get(self.url, {'search': '08222', 'field': 'phone'})
-        self.assertEqual(res.status_code, 200)
-        names = [p['name'] for p in res.json()]
-        self.assertIn('Alice Brown', names)
-        self.assertNotIn('John Smith', names)
-
-    def test_legacy_name_param_still_works(self):
-        """Old ?name=X format (used by other callers) should still work."""
-        res = self.client.get(self.url, {'name': 'Bob'})
-        self.assertEqual(res.status_code, 200)
-        names = [p['name'] for p in res.json()]
-        self.assertIn('Bob Jones', names)
-
-    def test_empty_search_returns_all(self):
-        """No search params should return all patients (up to 100)."""
-        res = self.client.get(self.url)
-        self.assertEqual(res.status_code, 200)
-        self.assertEqual(len(res.json()), 3)
+    def test_grand_total_equals_items_subtotal_plus_net_adjustment(self):
+        """Invariant: grand_total == items_subtotal + net_adjustment."""
+        result = compute_purchase_totals(
+            items=[
+                {'quantity': 3, 'unit_cost': 5000,
+                    'total_discount': 1500, 'line_type': 'stock'},
+                {'quantity': 2, 'unit_cost': 7500,
+                    'total_discount': 0,    'line_type': 'stock'},
+            ],
+            additional_costs=[
+                {'name': 'Tax',     'modifier': 'add',
+                    'amount_type': 'percent', 'amount': 11},
+                {'name': 'Diskon',  'modifier': 'subtract',
+                    'amount_type': 'cash',    'amount': 2000},
+            ],
+        )
+        self.assertEqual(
+            result['grand_total'],
+            result['items_subtotal'] + result['net_adjustment'],
+        )

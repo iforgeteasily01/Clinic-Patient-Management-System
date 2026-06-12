@@ -46,7 +46,8 @@ class PatientSearchView(APIView):
             if address := request.GET.get('address', '').strip():
                 qs = qs.filter(address__icontains=address)
 
-        serializer = PatientSerializer(qs.order_by('name', 'patient_no')[:100], many=True)
+        serializer = PatientSerializer(qs.order_by(
+            'name', 'patient_no')[:100], many=True)
         return Response(serializer.data)
 
 
@@ -202,7 +203,8 @@ class ActivePatientUpdateStatusView(APIView):
 
         if target_status in (0, 6):
             if active_patient.patient_no_id:
-                arrive_str = active_patient.visit_time.strftime('%H:%M') if active_patient.visit_time else 'unknown time'
+                arrive_str = active_patient.visit_time.strftime(
+                    '%H:%M') if active_patient.visit_time else 'unknown time'
                 PatientNote.objects.create(
                     patient_no=active_patient.patient_no,
                     date=timezone.now().date(),
@@ -275,7 +277,8 @@ class TreatmentSessionCreateView(APIView):
                 status=status.HTTP_404_NOT_FOUND
             )
 
-        treatment_list = Treatment.objects.filter(id__in=treatment_ids, active=True)
+        treatment_list = Treatment.objects.filter(
+            id__in=treatment_ids, active=True)
 
         patient = active_patient.patient_no  # may be None for general appointments
         session = TreatmentSession.objects.create(
@@ -314,7 +317,8 @@ class CompleteTreatmentView(APIView):
         except ActivePatient.DoesNotExist:
             return Response({"error": f"ActivePatient '{active_patient_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        sessions = TreatmentSession.objects.filter(active_patient=active_patient).select_related('beautician')
+        sessions = TreatmentSession.objects.filter(
+            active_patient=active_patient).select_related('beautician')
         seen = set()
         for session in sessions:
             if session.beautician_id and session.beautician_id not in seen:
@@ -343,6 +347,7 @@ class TreatmentRemoveView(APIView):
     Removes one treatment from a session's M2M list.
     Deletes the session entirely if it becomes empty.
     """
+
     def delete(self, request, session_id, treatment_id):
         try:
             session = TreatmentSession.objects.get(id=session_id)
@@ -379,6 +384,7 @@ class PatientCountView(APIView):
     GET /api/patients/count/
     Returns the total number of patients. Lightweight — no data serialization.
     """
+
     def get(self, request):
         return Response({'total': Patient.objects.count()})
 
@@ -391,13 +397,15 @@ class PatientSyncView(APIView):
     Omit `since` for a full sync (first-time setup).
     Default page_size=200, max=1000.
     """
+
     def get(self, request):
         synced_at = timezone.now()
         since_raw = request.GET.get('since')
 
         try:
             page = max(1, int(request.GET.get('page', 1)))
-            page_size = min(max(1, int(request.GET.get('page_size', 200))), 1000)
+            page_size = min(
+                max(1, int(request.GET.get('page_size', 200))), 1000)
         except (ValueError, TypeError):
             return Response(
                 {'error': 'Invalid `page` or `page_size` value.'},

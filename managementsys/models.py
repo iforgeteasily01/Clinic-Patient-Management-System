@@ -84,11 +84,16 @@ class Beauticians(models.Model):
 
 
 class MedRec(models.Model):
+    DRAFT = 'draft'
+    FINALIZED = 'finalized'
+    STATUS_CHOICES = [(DRAFT, 'Draft'), (FINALIZED, 'Finalized')]
+
     medrec_id = models.CharField(max_length=30, unique=True, blank=True)
     # set null as in, if there is no doctor that takes care of this patient, then doctor_id is Null rather than deleted
     doctor_id = models.ForeignKey(
         Doctors, on_delete=models.SET_NULL, null=True)
     patient_no = models.ForeignKey(Patient, on_delete=models.CASCADE)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=FINALIZED)
     subjective = models.TextField(default="")
     objective = models.TextField(default="")
     assessment = models.TextField(default="")
@@ -1118,6 +1123,7 @@ class PurchaseInvoice(models.Model):
     total_amount   = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     amount_paid    = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     invoice_image  = models.ImageField(upload_to='purchase_invoices/', null=True, blank=True)
+    warehouse      = models.ForeignKey('Warehouse', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_invoices')
     created_at     = models.DateTimeField(auto_now_add=True)
     created_by     = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_invoices')
 
@@ -1155,6 +1161,8 @@ class PurchaseInvoiceItem(models.Model):
     quantity         = models.DecimalField(max_digits=14, decimal_places=3)
     unit             = models.CharField(max_length=50, blank=True)
     unit_cost        = models.DecimalField(max_digits=14, decimal_places=2)
+    total_discount   = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    actual_unit_cost = models.DecimalField(max_digits=14, decimal_places=4, default=0)
     expense_account  = models.ForeignKey(
         'ChartOfAccounts',
         on_delete=models.PROTECT,
@@ -1173,6 +1181,26 @@ class PurchaseInvoiceItem(models.Model):
 
     def __str__(self):
         return f'{self.invoice.internal_id} – {self.item_name}'
+
+
+class PurchaseAdditionalCost(models.Model):
+    MODIFIER_CHOICES    = [('add', 'Tambah'), ('subtract', 'Kurang')]
+    AMOUNT_TYPE_CHOICES = [('cash', 'Nominal'), ('percent', 'Persen')]
+
+    invoice     = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='additional_costs')
+    name        = models.CharField(max_length=255)
+    modifier    = models.CharField(max_length=10, choices=MODIFIER_CHOICES, default='add')
+    amount_type = models.CharField(max_length=10, choices=AMOUNT_TYPE_CHOICES, default='cash')
+    amount      = models.DecimalField(max_digits=14, decimal_places=2)
+    sort_order  = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+
+    def __str__(self):
+        sign = '+' if self.modifier == 'add' else '-'
+        suffix = '%' if self.amount_type == 'percent' else ''
+        return f'{self.invoice.internal_id} {sign}{self.amount}{suffix} ({self.name})'
 
 
 # ── Accounting: Account Transfers & Manual Adjustments ────────────────────────

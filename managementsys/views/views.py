@@ -37,6 +37,7 @@ from .package_page import PatientPackagesView
 from .medical_record_page import MedRecByPatientNoView
 from .photo_page import PatientPhotoUploadView, PatientPhotoListView
 from .medical_record_history import MedRecHistoryListView, MedRecHistoryDetailView
+from .medical_record_draft import MedRecDraftCreateView, MedRecUpdateView, MedRecFinalizeView, MedRecPendingDraftsView
 from .invoice_page import InvoiceCreateView, InvoiceListView, InvoiceDetailView, InvoiceExportView, InvoiceImportView
 from .reports_page import DashboardReportView
 from .patient_notes_page import PatientNoteListCreateView, PatientNoteDetailView
