@@ -122,6 +122,7 @@ urlpatterns = [
 
     # Assessment Codes (ICD-10)
     path('api/assessment-codes/', views.AssessmentCodeListCreateView.as_view(), name='assessment-codes'),
+    path('api/assessment-codes/template/', views.AssessmentCodeTemplateDownloadView.as_view(), name='assessment-codes-template'),
     path('api/assessment-codes/import/preview/', views.AssessmentCodeImportPreviewView.as_view(), name='assessment-codes-import-preview'),
     path('api/assessment-codes/import/confirm/', views.AssessmentCodeImportConfirmView.as_view(), name='assessment-codes-import-confirm'),
     path('api/assessment-codes/<int:pk>/', views.AssessmentCodeDetailView.as_view(), name='assessment-code-detail'),

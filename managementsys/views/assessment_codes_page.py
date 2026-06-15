@@ -2,12 +2,17 @@ import io
 
 import openpyxl
 from django.db.models import Q
+from django.http import HttpResponse
+from openpyxl.styles import Font, PatternFill
 from rest_framework import generics, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..models import AssessmentCode
 from ..api.serializers import AssessmentCodeSerializer
+
+_HEADER_FONT = Font(bold=True, color='FFFFFF')
+_HEADER_FILL = PatternFill('solid', fgColor='4F81BD')
 
 
 class AssessmentCodeListCreateView(generics.ListCreateAPIView):
@@ -24,6 +29,46 @@ class AssessmentCodeListCreateView(generics.ListCreateAPIView):
 class AssessmentCodeDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = AssessmentCode.objects.all()
     serializer_class = AssessmentCodeSerializer
+
+
+class AssessmentCodeTemplateDownloadView(APIView):
+    """GET — download a blank sample .xlsx with ICD-10 import format and example rows."""
+
+    def get(self, request):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'ICD-10 Codes'
+
+        headers = ['Code', 'Description', 'Category', 'Active']
+        ws.append(headers)
+        for cell in ws[1]:
+            cell.font = _HEADER_FONT
+            cell.fill = _HEADER_FILL
+
+        samples = [
+            ('L70.0', 'Acne vulgaris', 'Common', 'TRUE'),
+            ('L81.1', 'Chloasma', 'Common', 'TRUE'),
+            ('L57.0', 'Actinic keratosis', 'Uncommon', 'TRUE'),
+            ('L90.5', 'Scar conditions and fibrosis of skin', 'Uncommon', 'FALSE'),
+        ]
+        for row in samples:
+            ws.append(list(row))
+
+        ws.column_dimensions['A'].width = 14
+        ws.column_dimensions['B'].width = 45
+        ws.column_dimensions['C'].width = 14
+        ws.column_dimensions['D'].width = 10
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        response = HttpResponse(
+            buf.read(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = 'attachment; filename="icd10_import_template.xlsx"'
+        return response
 
 
 class AssessmentCodeImportPreviewView(APIView):
