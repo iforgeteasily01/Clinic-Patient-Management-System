@@ -44,6 +44,7 @@ from .patient_notes_page import PatientNoteListCreateView, PatientNoteDetailView
 from .assessment_codes_page import (
     AssessmentCodeListCreateView,
     AssessmentCodeDetailView,
+    AssessmentCodeTemplateDownloadView,
     AssessmentCodeImportPreviewView,
     AssessmentCodeImportConfirmView,
 )
