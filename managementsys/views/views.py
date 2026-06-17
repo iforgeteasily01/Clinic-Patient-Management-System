@@ -18,6 +18,10 @@ from .inventory_page import (
     InventoryItemImportView,
     InventoryItemTemplateView,
 )
+from .production_page import (
+    RecipeListCreateView, RecipeDetailView, RecipeCostView,
+    ProductionPreviewView, ProductionRunListCreateView, ProductionRunDetailView,
+)
 from .auth_views import UserListView, LoginView, LogoutView, ProfileUpdateView, ThemeUpdateView
 from .admin_views import (
     DoctorListCreateAdminView, DoctorDetailAdminView,

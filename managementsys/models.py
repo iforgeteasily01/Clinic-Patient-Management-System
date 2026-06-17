@@ -1227,6 +1227,76 @@ class AccountTransfer(models.Model):
         return f'{self.transfer_date} | {self.from_account} → {self.to_account}'
 
 
+class ProductionRecipe(models.Model):
+    name = models.CharField(max_length=120)
+    output_item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT,
+                                    related_name='recipes_as_output')
+    output_quantity = models.DecimalField(max_digits=14, decimal_places=4)  # smallest unit
+    notes = models.TextField(blank=True, default='')
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True,
+                                   blank=True, related_name='recipes_created')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return f'{self.name} → {self.output_item.name}'
+
+
+class ProductionRecipeIngredient(models.Model):
+    UNIT_CHOICES = [('small', 'Small'), ('medium', 'Medium'), ('large', 'Large')]
+    recipe = models.ForeignKey(ProductionRecipe, on_delete=models.CASCADE,
+                               related_name='ingredients')
+    item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT,
+                             related_name='recipe_ingredient_lines')
+    quantity = models.DecimalField(max_digits=14, decimal_places=4)
+    unit = models.CharField(max_length=10, choices=UNIT_CHOICES, default='small')
+    ordering = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['ordering', 'id']
+        unique_together = [('recipe', 'item')]
+
+
+class ProductionRun(models.Model):
+    recipe = models.ForeignKey(ProductionRecipe, on_delete=models.SET_NULL, null=True,
+                               blank=True, related_name='runs')
+    output_item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT,
+                                    related_name='production_runs')
+    output_warehouse = models.ForeignKey(Warehouse, on_delete=models.PROTECT,
+                                         related_name='production_runs')
+    output_quantity = models.DecimalField(max_digits=14, decimal_places=4)  # smallest unit
+    total_cost = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    produced_batch = models.ForeignKey(InventoryBatch, on_delete=models.SET_NULL,
+                                        null=True, blank=True,
+                                        related_name='production_runs')
+    notes = models.TextField(blank=True, default='')
+    produced_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True,
+                                    blank=True, related_name='production_runs')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+
+class ProductionRunIngredient(models.Model):
+    run = models.ForeignKey(ProductionRun, on_delete=models.CASCADE,
+                            related_name='ingredients')
+    item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT,
+                             related_name='production_consumed_lines')
+    quantity_small = models.DecimalField(max_digits=14, decimal_places=4)
+    cost = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    source_warehouse = models.ForeignKey(Warehouse, on_delete=models.PROTECT, null=True,
+                                         blank=True,
+                                         related_name='production_consumed_lines')
+
+    class Meta:
+        ordering = ['id']
+
+
 #####
 # END#
 #####

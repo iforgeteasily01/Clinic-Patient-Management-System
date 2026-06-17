@@ -7,6 +7,7 @@ from ..models import (
     ChartOfAccounts, Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
     IssueTicket, IssueTicketImage, LedgerEntry, MedRec, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
+    ProductionRecipe, ProductionRecipeIngredient, ProductionRun, ProductionRunIngredient,
     Promotion, PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem, SiteConfig,
     SoapTemplate, StaffSchedule, Supplier, Treatment, TreatmentCategory, TreatmentMaterial,
     TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift, patientStatus,
@@ -387,6 +388,76 @@ class InventoryBatchSerializer(serializers.ModelSerializer):
 
     def get_created_by_name(self, obj):
         return obj.created_by.display_name if obj.created_by_id else None
+
+
+# ── Item Production ──────────────────────────────────────────────────────────
+
+class ProductionRecipeIngredientSerializer(serializers.ModelSerializer):
+    item_code = serializers.CharField(source='item.code', read_only=True)
+    item_name = serializers.CharField(source='item.name', read_only=True)
+    item_unit_small = serializers.CharField(source='item.unit_small', read_only=True)
+
+    class Meta:
+        model = ProductionRecipeIngredient
+        fields = ['id', 'item', 'item_code', 'item_name', 'item_unit_small',
+                  'quantity', 'unit', 'ordering']
+
+
+class ProductionRecipeSerializer(serializers.ModelSerializer):
+    ingredients = ProductionRecipeIngredientSerializer(many=True)
+    output_item_name = serializers.CharField(source='output_item.name', read_only=True)
+    output_item_code = serializers.CharField(source='output_item.code', read_only=True)
+    output_unit_small = serializers.CharField(source='output_item.unit_small',
+                                              read_only=True)
+
+    class Meta:
+        model = ProductionRecipe
+        fields = ['id', 'name', 'output_item', 'output_item_code', 'output_item_name',
+                  'output_unit_small', 'output_quantity', 'notes', 'is_active',
+                  'ingredients', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        ingredients = validated_data.pop('ingredients', [])
+        recipe = ProductionRecipe.objects.create(**validated_data)
+        for idx, ing in enumerate(ingredients):
+            ing.setdefault('ordering', idx)
+            ProductionRecipeIngredient.objects.create(recipe=recipe, **ing)
+        return recipe
+
+    def update(self, instance, validated_data):
+        ingredients = validated_data.pop('ingredients', None)
+        for k, v in validated_data.items():
+            setattr(instance, k, v)
+        instance.save()
+        if ingredients is not None:
+            instance.ingredients.all().delete()      # replace-all strategy
+            for idx, ing in enumerate(ingredients):
+                ing.setdefault('ordering', idx)
+                ProductionRecipeIngredient.objects.create(recipe=instance, **ing)
+        return instance
+
+
+class ProductionRunIngredientSerializer(serializers.ModelSerializer):
+    item_code = serializers.CharField(source='item.code', read_only=True)
+    item_name = serializers.CharField(source='item.name', read_only=True)
+
+    class Meta:
+        model = ProductionRunIngredient
+        fields = ['id', 'item', 'item_code', 'item_name', 'quantity_small', 'cost',
+                  'source_warehouse']
+
+
+class ProductionRunSerializer(serializers.ModelSerializer):
+    ingredients = ProductionRunIngredientSerializer(many=True, read_only=True)
+    output_item_name = serializers.CharField(source='output_item.name', read_only=True)
+    output_warehouse_name = serializers.CharField(source='output_warehouse.name',
+                                                  read_only=True)
+
+    class Meta:
+        model = ProductionRun
+        fields = ['id', 'recipe', 'output_item', 'output_item_name', 'output_warehouse',
+                  'output_warehouse_name', 'output_quantity', 'total_cost',
+                  'produced_batch', 'notes', 'created_at', 'ingredients']
 
 
 # ── Patient Photos ─────────────────────────────────────────────────────────

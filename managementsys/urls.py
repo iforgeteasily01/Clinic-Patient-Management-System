@@ -105,6 +105,12 @@ urlpatterns = [
     path('api/inventory/stock-out/', views.StockOutView.as_view(), name='inventory-stock-out'),
     path('api/inventory/stock-out/batches/', views.StockOutBatchListView.as_view(), name='inventory-stock-out-batches'),
     path('api/inventory/sync/items/', views.ItemSyncView.as_view(), name='inventory-sync-items'),
+    path('api/inventory/production/recipes/', views.RecipeListCreateView.as_view(), name='production-recipes'),
+    path('api/inventory/production/recipes/<int:pk>/', views.RecipeDetailView.as_view(), name='production-recipe-detail'),
+    path('api/inventory/production/recipes/<int:pk>/cost/', views.RecipeCostView.as_view(), name='production-recipe-cost'),
+    path('api/inventory/production/preview/', views.ProductionPreviewView.as_view(), name='production-preview'),
+    path('api/inventory/production/runs/', views.ProductionRunListCreateView.as_view(), name='production-runs'),
+    path('api/inventory/production/runs/<int:pk>/', views.ProductionRunDetailView.as_view(), name='production-run-detail'),
 
     # Stock Opname
     path('api/stock-opname/', views.StockOpnameSessionListCreateView.as_view(), name='stock-opname-list'),

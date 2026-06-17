@@ -1,6 +1,7 @@
 import io
 
 import openpyxl
+from django.core.paginator import Paginator
 from django.db import transaction
 from django.db.models import Q
 from django.http import HttpResponse
@@ -14,6 +15,7 @@ from ..api.serializers import AssessmentCodeSerializer
 
 _HEADER_FONT = Font(bold=True, color='FFFFFF')
 _HEADER_FILL = PatternFill('solid', fgColor='4F81BD')
+_ALLOWED_PAGE_SIZES = {50, 100, 200}
 
 
 class AssessmentCodeListCreateView(generics.ListCreateAPIView):
@@ -24,7 +26,40 @@ class AssessmentCodeListCreateView(generics.ListCreateAPIView):
         search = self.request.query_params.get('search', '').strip()
         if search:
             qs = qs.filter(Q(code__icontains=search) | Q(description__icontains=search))
+        category = self.request.query_params.get('category', '').strip()
+        if category in ('1', '2'):
+            qs = qs.filter(category=int(category))
+        active = self.request.query_params.get('active', '').strip()
+        if active == 'true':
+            qs = qs.filter(active=True)
+        elif active == 'false':
+            qs = qs.filter(active=False)
         return qs
+
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        try:
+            page_size = int(request.query_params.get('page_size', 50))
+        except (TypeError, ValueError):
+            page_size = 50
+        if page_size not in _ALLOWED_PAGE_SIZES:
+            page_size = 50
+        try:
+            page_num = int(request.query_params.get('page', 1))
+        except (TypeError, ValueError):
+            page_num = 1
+
+        paginator = Paginator(qs, page_size)
+        page_num = max(1, min(page_num, paginator.num_pages))
+        page = paginator.page(page_num)
+        serializer = self.get_serializer(page.object_list, many=True)
+        return Response({
+            'count': paginator.count,
+            'num_pages': paginator.num_pages,
+            'page': page_num,
+            'page_size': page_size,
+            'results': serializer.data,
+        })
 
 
 class AssessmentCodeDetailView(generics.RetrieveUpdateDestroyAPIView):
