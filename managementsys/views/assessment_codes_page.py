@@ -1,6 +1,7 @@
 import io
 
 import openpyxl
+from django.db import transaction
 from django.db.models import Q
 from django.http import HttpResponse
 from openpyxl.styles import Font, PatternFill
@@ -141,22 +142,37 @@ class AssessmentCodeImportConfirmView(APIView):
         if not rows:
             return Response({'error': 'No rows to import.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        created = updated = skipped = 0
+        to_upsert = []
+        skipped = 0
         for row in rows:
             code = str(row.get('code', '')).strip().upper()
             desc = str(row.get('description', '')).strip()
-            category = int(row.get('category', 1))
+            try:
+                category = int(row.get('category', 1))
+            except (TypeError, ValueError):
+                category = 1
             active = bool(row.get('active', True))
             if not code or not desc:
                 skipped += 1
                 continue
-            _, was_created = AssessmentCode.objects.update_or_create(
-                code=code,
-                defaults={'description': desc, 'category': category, 'active': active},
-            )
-            if was_created:
-                created += 1
-            else:
-                updated += 1
+            to_upsert.append(AssessmentCode(code=code, description=desc, category=category, active=active))
 
-        return Response({'created': created, 'updated': updated, 'skipped': skipped})
+        if not to_upsert:
+            return Response({'created': 0, 'updated': 0, 'skipped': skipped})
+
+        existing_codes = set(
+            AssessmentCode.objects.filter(code__in=[obj.code for obj in to_upsert])
+            .values_list('code', flat=True)
+        )
+        new_objs = [obj for obj in to_upsert if obj.code not in existing_codes]
+        update_objs = [obj for obj in to_upsert if obj.code in existing_codes]
+
+        with transaction.atomic():
+            if new_objs:
+                AssessmentCode.objects.bulk_create(new_objs, ignore_conflicts=True)
+            if update_objs:
+                AssessmentCode.objects.bulk_update(
+                    update_objs, ['description', 'category', 'active'], batch_size=500
+                )
+
+        return Response({'created': len(new_objs), 'updated': len(update_objs), 'skipped': skipped})

@@ -198,7 +198,7 @@ class PatStatSerializer(serializers.ModelSerializer):
 class TreatmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Treatment
-        fields = ["id", "code", "name", "category", "price", "active", "catalog_item_id"]
+        fields = ["id", "code", "name", "category", "price", "active", "sort_order", "catalog_item_id"]
         read_only_fields = ["catalog_item_id"]
 
 
@@ -648,7 +648,7 @@ class TreatmentCategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = TreatmentCategory
         fields = [
-            'id', 'name', 'show_to_beautician',
+            'id', 'name', 'show_to_beautician', 'sort_order',
             'revenue_account_id', 'revenue_account_number', 'revenue_account_name',
             'cogs_account_id', 'cogs_account_number', 'cogs_account_name',
             'expense_account_id', 'expense_account_number', 'expense_account_name',

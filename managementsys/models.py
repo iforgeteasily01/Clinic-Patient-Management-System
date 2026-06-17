@@ -161,12 +161,16 @@ class Treatment(models.Model):
     category = models.CharField(max_length=50)
     price = models.DecimalField(max_digits=12, decimal_places=2)
     active = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=0)
     catalog_item = models.OneToOneField(
         'InventoryItem',
         null=True, blank=True,
         on_delete=models.PROTECT,
         related_name='treatment',
     )
+
+    class Meta:
+        ordering = ['sort_order', 'name']
 
     def __str__(self):
         return self.name
@@ -503,6 +507,7 @@ class LedgerEntry(models.Model):
 class TreatmentCategory(models.Model):
     name = models.CharField(max_length=50, unique=True)
     show_to_beautician = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=0)
     revenue_account = models.OneToOneField(
         'ChartOfAccounts',
         null=True, blank=True,
@@ -523,7 +528,7 @@ class TreatmentCategory(models.Model):
     )
 
     class Meta:
-        ordering = ['name']
+        ordering = ['sort_order', 'name']
         verbose_name_plural = 'Treatment Categories'
 
     def __str__(self):
