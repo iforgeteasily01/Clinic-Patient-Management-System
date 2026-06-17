@@ -1,6 +1,8 @@
+import re
+
 from ..models import Patient, ActivePatient, patientStatus, Treatment, Beauticians, TreatmentSession, AppUser, AuditLog, PatientNote
 from django.http import HttpResponse
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
@@ -387,6 +389,28 @@ class PatientCountView(APIView):
 
     def get(self, request):
         return Response({'total': Patient.objects.count()})
+
+
+class PatientNextNoView(APIView):
+    """
+    GET /api/patients/next-no/?initial=J
+    Returns the projected next patient_no for the given name initial.
+    No DB write — preview only.
+    """
+
+    def get(self, request):
+        initial = request.GET.get('initial', '').strip().upper()
+        if not initial or not initial.isalpha() or len(initial) != 1:
+            return Response({'error': 'Provide a single letter as ?initial='}, status=400)
+        candidates = Patient.objects.filter(
+            patient_no__regex=rf'^{initial}\d+$'
+        ).aggregate(last=Max('patient_no'))['last']
+        new_number = 1
+        if candidates:
+            m = re.search(r'\d+$', candidates)
+            if m:
+                new_number = int(m.group()) + 1
+        return Response({'patient_no': f'{initial}{new_number:06d}'})
 
 
 class PatientSyncView(APIView):

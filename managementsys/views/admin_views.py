@@ -9,6 +9,7 @@ from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from ..auth_backend import IsAppAuthenticated
 
 _HEADER_FONT = Font(bold=True, color='FFFFFF')
 _HEADER_FILL = PatternFill('solid', fgColor='0284C7')
@@ -17,6 +18,7 @@ from ..api.serializers import (
     BeauticianAdminStatusSerializer,
     BeauticiansSerializer,
     ChartOfAccountsSerializer,
+    ColorPaletteSerializer,
     DoctorsSerializer,
     LedgerEntrySerializer,
     PatientSerializer,
@@ -27,7 +29,7 @@ from ..api.serializers import (
     TreatmentSerializer,
 )
 from ..models import (
-    AppUser, AuditLog, Beauticians, ChartOfAccounts, Doctors, InventoryItem,
+    AppUser, AuditLog, Beauticians, ChartOfAccounts, ColorPalette, Doctors, InventoryItem,
     LedgerEntry, Patient, SiteConfig, Treatment, TreatmentCategory, TreatmentMaterial, TreatmentPackage,
 )
 
@@ -821,3 +823,51 @@ class SiteConfigView(APIView):
             serializer.save()
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ColorPaletteListCreateView(APIView):
+    permission_classes = [IsAppAuthenticated]
+
+    def get(self, request):
+        palettes = ColorPalette.objects.all()
+        return Response(ColorPaletteSerializer(palettes, many=True).data)
+
+    def post(self, request):
+        if request.user.role not in ('superuser', 'manager'):
+            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        serializer = ColorPaletteSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class ColorPaletteDetailView(APIView):
+    permission_classes = [IsAppAuthenticated]
+
+    def _get(self, pk):
+        try:
+            return ColorPalette.objects.get(pk=pk)
+        except ColorPalette.DoesNotExist:
+            return None
+
+    def patch(self, request, pk):
+        if request.user.role not in ('superuser', 'manager'):
+            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        obj = self._get(pk)
+        if obj is None:
+            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = ColorPaletteSerializer(obj, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, pk):
+        if request.user.role not in ('superuser', 'manager'):
+            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        obj = self._get(pk)
+        if obj is None:
+            return Response({'error': 'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        obj.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)

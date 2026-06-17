@@ -1297,6 +1297,22 @@ class ProductionRunIngredient(models.Model):
         ordering = ['id']
 
 
+class ColorPalette(models.Model):
+    name = models.CharField(max_length=50)
+    primary_color = models.CharField(max_length=7)    # hex e.g. #0284c7
+    secondary_color = models.CharField(max_length=7)
+    background_color = models.CharField(max_length=7)
+    is_dark = models.BooleanField(default=False)
+    sort_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+
+    def __str__(self):
+        return self.name
+
+
 #####
 # END#
 #####

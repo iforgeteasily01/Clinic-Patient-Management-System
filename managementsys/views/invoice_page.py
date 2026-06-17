@@ -440,7 +440,8 @@ class InvoiceListView(APIView):
             from django.db.models import Q
             qs = qs.filter(
                 Q(invoice_number__icontains=q) |
-                Q(patient_no__name__icontains=q)
+                Q(patient_no__name__icontains=q) |
+                Q(patient_no__patient_no__icontains=q)
             )
         if method := request.GET.get('payment_method', '').strip():
             qs = qs.filter(payment_method_id=method)
@@ -646,7 +647,8 @@ class InvoiceExportView(APIView):
             from django.db.models import Q
             qs = qs.filter(
                 Q(invoice_number__icontains=q) |
-                Q(patient_no__name__icontains=q)
+                Q(patient_no__name__icontains=q) |
+                Q(patient_no__patient_no__icontains=q)
             )
         if method := request.GET.get('payment_method', '').strip():
             qs = qs.filter(payment_method_id=method)

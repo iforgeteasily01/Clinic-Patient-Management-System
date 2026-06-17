@@ -2,7 +2,7 @@ import logging
 from datetime import date
 from decimal import Decimal
 
-from django.db.models import Count, Max, Q, Sum
+from django.db.models import Count, F, Max, Q, Sum
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
@@ -13,12 +13,18 @@ from ..models import Invoice, Patient, PatientCRMProfile, PatientTier, Promotion
 logger = logging.getLogger(__name__)
 
 ALLOWED_ORDERINGS = {
-    'total_spend':       'crm_profile__total_spend',
-    '-total_spend':      '-crm_profile__total_spend',
-    'total_visits':      'crm_profile__total_visits',
-    '-total_visits':     '-crm_profile__total_visits',
-    'last_visit_date':   'crm_profile__last_visit_date',
-    '-last_visit_date':  '-crm_profile__last_visit_date',
+    'total_spend':       F('crm_profile__total_spend').asc(nulls_last=True),
+    '-total_spend':      F('crm_profile__total_spend').desc(nulls_last=True),
+    'total_visits':      F('crm_profile__total_visits').asc(nulls_last=True),
+    '-total_visits':     F('crm_profile__total_visits').desc(nulls_last=True),
+    'last_visit_date':   F('crm_profile__last_visit_date').asc(nulls_last=True),
+    '-last_visit_date':  F('crm_profile__last_visit_date').desc(nulls_last=True),
+    'name':              'name',
+    '-name':             '-name',
+    'patient_no':        'patient_no',
+    '-patient_no':       '-patient_no',
+    'tier':              'crm_profile__tier__sort_order',
+    '-tier':             '-crm_profile__tier__sort_order',
 }
 
 

@@ -4,7 +4,7 @@ from rest_framework import serializers
 
 from ..models import (
     AccountTransfer, ActivePatient, AppUser, AssessmentCode, AttendanceRecord, Beauticians,
-    ChartOfAccounts, Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
+    ChartOfAccounts, ColorPalette, Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
     IssueTicket, IssueTicketImage, LedgerEntry, MedRec, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
     ProductionRecipe, ProductionRecipeIngredient, ProductionRun, ProductionRunIngredient,
@@ -1154,3 +1154,9 @@ class AccountTransferSerializer(serializers.ModelSerializer):
             'to_account', 'to_account_name', 'to_account_number',
             'amount', 'description', 'reference', 'created_at', 'created_by_name',
         ]
+
+
+class ColorPaletteSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ColorPalette
+        fields = ['id', 'name', 'primary_color', 'secondary_color', 'background_color', 'is_dark', 'sort_order']

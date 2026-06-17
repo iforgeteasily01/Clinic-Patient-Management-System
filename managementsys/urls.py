@@ -37,6 +37,8 @@ urlpatterns = [
     path('api/admin/accounts/<int:pk>/', views.ChartOfAccountsDetailView.as_view(), name='admin-account-detail'),
     path('api/admin/accounts/<int:pk>/ledger/', views.AccountLedgerView.as_view(), name='admin-account-ledger'),
     path('api/admin/site-config/', views.SiteConfigView.as_view(), name='admin-site-config'),
+    path('api/admin/color-palettes/', views.ColorPaletteListCreateView.as_view(), name='admin-color-palettes'),
+    path('api/admin/color-palettes/<int:pk>/', views.ColorPaletteDetailView.as_view(), name='admin-color-palette-detail'),
 
     path("", views.homepage, name = 'homepage'),
     path("patient/", views.PatientListCreate.as_view(), name = "Patient-view-create"),
@@ -51,6 +53,7 @@ urlpatterns = [
     path("beautician/update/<str:patient_id>/", views.BeauticianUpdateActPat.as_view(), name = "beautician-update-actpat"),
     path('api/patients/search/', views.PatientSearchView.as_view(), name='patient-search'),
     path('api/patients/count/', views.PatientCountView.as_view(), name='patient-count'),
+    path('api/patients/next-no/', views.PatientNextNoView.as_view(), name='patient-next-no'),
     path('api/patients/sync/', views.PatientSyncView.as_view(), name='patient-sync'),
     path('api/activepatients/update-status/', views.ActivePatientUpdateStatusView.as_view(), name='activepatient-update-status'),
     path('api/activepatients/clear/', views.ActivePatientClearView.as_view(), name='activepatient-clear'),
