@@ -435,7 +435,6 @@ class InvoiceListView(APIView):
             .prefetch_related('items__item')
             .order_by('-datetime')
         )
-        # Optional filters
         if q := request.GET.get('q', '').strip():
             from django.db.models import Q
             qs = qs.filter(
@@ -445,7 +444,27 @@ class InvoiceListView(APIView):
             )
         if method := request.GET.get('payment_method', '').strip():
             qs = qs.filter(payment_method_id=method)
-        return Response(InvoiceReadSerializer(qs, many=True).data)
+
+        total = qs.count()
+
+        try:
+            page_size = int(request.GET.get('page_size', 50))
+        except (ValueError, TypeError):
+            page_size = 50
+        page_size = page_size if page_size in (10, 50, 100) else 50
+
+        try:
+            page = max(int(request.GET.get('page', 1)), 1)
+        except (ValueError, TypeError):
+            page = 1
+
+        offset = (page - 1) * page_size
+        qs = qs[offset:offset + page_size]
+
+        return Response({
+            'count': total,
+            'results': InvoiceReadSerializer(qs, many=True).data,
+        })
 
 
 class InvoiceDetailView(APIView):

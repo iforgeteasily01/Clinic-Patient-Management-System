@@ -9,6 +9,7 @@ _SOAP_FIELDS = [
     'subjective', 'objective', 'assessment', 'assessment_codes',
     'plan', 'sabun_pagi', 'sabun_malam', 'toner_pagi', 'toner_malam',
     'obat1_pagi', 'obat2_pagi', 'obat1_malam', 'obat2_malam', 'treatment',
+    'clinician',
 ]
 
 
@@ -46,9 +47,11 @@ class MedRecDraftCreateView(APIView):
             return Response(serializer.data, status=status.HTTP_200_OK)
 
         # Create new draft
+        user = _current_user(request)
         instance = MedRec(
             patient_no=patient,
             status=MedRec.DRAFT,
+            clinician=user.display_name if user else '',
         )
         instance.save(visit_date=visit_date)
 

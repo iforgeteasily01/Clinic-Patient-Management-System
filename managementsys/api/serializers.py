@@ -488,13 +488,15 @@ class MedRecHistorySerializer(serializers.ModelSerializer):
         model = MedRec
         fields = [
             'medrec_id', 'status', 'patient_no', 'patient_name', 'doctor_id', 'doctor_name',
-            'visit_date', 'subjective', 'objective', 'assessment', 'assessment_codes', 'plan',
+            'visit_date', 'clinician', 'subjective', 'objective', 'assessment', 'assessment_codes', 'plan',
             'sabun_pagi', 'sabun_malam', 'toner_pagi', 'toner_malam',
             'obat1_pagi', 'obat2_pagi', 'obat1_malam', 'obat2_malam', 'treatment',
         ]
 
     def get_doctor_name(self, obj):
-        return obj.doctor_id.doctor_name if obj.doctor_id_id else '—'
+        if obj.doctor_id_id:
+            return obj.doctor_id.doctor_name
+        return obj.clinician or '—'
 
     def get_patient_name(self, obj):
         return obj.patient_no.name if obj.patient_no_id else '—'

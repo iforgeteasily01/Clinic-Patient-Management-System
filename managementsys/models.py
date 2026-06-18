@@ -108,6 +108,7 @@ class MedRec(models.Model):
     obat1_malam = models.TextField(default="", null=True)
     obat2_malam = models.TextField(default="", null=True)
     treatment = models.TextField(default="", null=True)
+    clinician = models.CharField(max_length=100, default='', blank=True)
 
     def __str__(self):
         return self.medrec_id
