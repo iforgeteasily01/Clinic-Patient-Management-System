@@ -435,7 +435,9 @@ class InvoiceListView(APIView):
             .prefetch_related('items__item')
             .order_by('-datetime')
         )
-        if q := request.GET.get('q', '').strip():
+        if inv_no := request.GET.get('invoice_number', '').strip():
+            qs = qs.filter(invoice_number=inv_no)
+        elif q := request.GET.get('q', '').strip():
             from django.db.models import Q
             qs = qs.filter(
                 Q(invoice_number__icontains=q) |
@@ -649,6 +651,47 @@ class InvoiceDetailView(APIView):
             .prefetch_related('items__item')
             .get(pk=pk)
         ).data)
+
+    @transaction.atomic
+    def delete(self, request, pk):
+        invoice = self._get(pk)
+        if invoice is None:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        old_item_instances = list(
+            invoice.items
+            .select_related(
+                'item__item_category__revenue_account',
+                'item__item_category__cogs_account',
+            )
+            .all()
+        )
+
+        inv_no = invoice.invoice_number
+        patient = invoice.patient_no
+
+        _reverse_accounting_instances(
+            invoice.payment_method_id,
+            invoice.grand_total,
+            old_item_instances,
+            invoice.warehouse_id,
+        )
+
+        LedgerEntry.objects.filter(invoice=invoice).delete()
+        invoice.delete()
+
+        if patient is not None:
+            refresh_crm_profile(patient)
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='DELETE',
+            entity_type='Invoice',
+            entity_id=str(pk),
+            description=f'Invoice {inv_no} deleted — accounting reversed',
+        )
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class InvoiceExportView(APIView):

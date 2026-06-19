@@ -115,6 +115,10 @@ urlpatterns = [
     path('api/inventory/production/runs/', views.ProductionRunListCreateView.as_view(), name='production-runs'),
     path('api/inventory/production/runs/<int:pk>/', views.ProductionRunDetailView.as_view(), name='production-run-detail'),
 
+    # Pencacahan (unit conversion)
+    path('api/inventory/pencacahan/', views.PencacahanListCreateView.as_view(), name='inventory-pencacahan'),
+    path('api/inventory/pencacahan/<int:pk>/', views.PencacahanDetailView.as_view(), name='inventory-pencacahan-detail'),
+
     # Stock Opname
     path('api/stock-opname/', views.StockOpnameSessionListCreateView.as_view(), name='stock-opname-list'),
     path('api/stock-opname/<int:pk>/', views.StockOpnameSessionDetailView.as_view(), name='stock-opname-detail'),

@@ -1314,6 +1314,62 @@ class ColorPalette(models.Model):
         return self.name
 
 
+# ── Inventory: Pencacahan (Unit Conversion) ───────────────────────────────────
+
+class PencacahanRecord(models.Model):
+    """
+    Converts a quantity of one inventory item into a quantity of another item
+    without changing total inventory value. Used to break bulk forms (bottles,
+    boxes) into production-ready units (ml, g, pcs).
+    """
+    pencacahan_no    = models.CharField(max_length=50, unique=True)  # PCA-YYYYMMDD-N
+    date             = models.DateField()
+    source_item      = models.ForeignKey(
+        InventoryItem, on_delete=models.PROTECT,
+        related_name='pencacahan_source_records',
+    )
+    source_warehouse = models.ForeignKey(
+        Warehouse, on_delete=models.PROTECT,
+        related_name='pencacahan_source_records',
+    )
+    source_quantity  = models.DecimalField(max_digits=14, decimal_places=4)  # in source small unit
+    target_item      = models.ForeignKey(
+        InventoryItem, on_delete=models.PROTECT,
+        related_name='pencacahan_target_records',
+    )
+    target_warehouse = models.ForeignKey(
+        Warehouse, on_delete=models.PROTECT,
+        related_name='pencacahan_target_records',
+    )
+    target_quantity  = models.DecimalField(max_digits=14, decimal_places=4)  # in target small unit
+    value_transferred = models.DecimalField(max_digits=14, decimal_places=2)  # cost moved from source to target
+    notes            = models.TextField(blank=True, default='')
+    created_by       = models.ForeignKey(
+        AppUser, on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='pencacahan_records',
+    )
+    created_at       = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.pencacahan_no}: {self.source_item} → {self.target_item}'
+
+    @classmethod
+    def next_number(cls, date):
+        prefix = f'PCA-{date.strftime("%Y%m%d")}-'
+        last = (
+            cls.objects.filter(pencacahan_no__startswith=prefix)
+            .order_by('pencacahan_no')
+            .values_list('pencacahan_no', flat=True)
+            .last()
+        )
+        n = int(last.split('-')[-1]) + 1 if last else 1
+        return f'{prefix}{n}'
+
+
 #####
 # END#
 #####

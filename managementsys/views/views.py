@@ -17,6 +17,7 @@ from .inventory_page import (
     InventoryItemImportPreviewView,
     InventoryItemImportView,
     InventoryItemTemplateView,
+    PencacahanListCreateView, PencacahanDetailView,
 )
 from .production_page import (
     RecipeListCreateView, RecipeDetailView, RecipeCostView,

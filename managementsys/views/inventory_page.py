@@ -22,7 +22,7 @@ from ..api.serializers import (
     ItemSyncSerializer,
     WarehouseSerializer,
 )
-from ..models import AppUser, AuditLog, InventoryBatch, InventoryItem, StockOutLog, Warehouse
+from ..models import AppUser, AuditLog, InventoryBatch, InventoryItem, PencacahanRecord, StockOutLog, Warehouse
 
 
 def _actor(request):
@@ -938,3 +938,224 @@ class InventoryItemImportView(APIView):
                 errors.append({'row': r['row'], 'message': f'Row {r["row"]}: {exc}'})
 
         return Response({'created': created, 'updated': updated, 'errors': errors}, status=status.HTTP_200_OK)
+
+
+# ── Pencacahan (Unit Conversion) ───────────────────────────────────────────
+
+class PencacahanListCreateView(APIView):
+    """
+    GET  /api/inventory/pencacahan/   — list all pencacahan records, newest first
+    POST /api/inventory/pencacahan/   — execute a unit conversion
+
+    POST body:
+    {
+        "date": "YYYY-MM-DD",
+        "source_item_id": <int>,
+        "source_warehouse_id": <int>,
+        "source_quantity": <number>,      // in source item's unit_small
+        "source_unit": "small"|"medium"|"large",
+        "target_item_id": <int>,
+        "target_warehouse_id": <int>,
+        "target_quantity": <number>,      // in target item's unit_small
+        "target_unit": "small"|"medium"|"large",
+        "notes": ""
+    }
+
+    The value (cost) transferred equals the FIFO cost of the source stock
+    consumed. The same total value is added as a new InventoryBatch for the
+    target item, so inventory value is unchanged.
+    """
+
+    def get(self, request):
+        qs = PencacahanRecord.objects.select_related(
+            'source_item', 'source_warehouse',
+            'target_item', 'target_warehouse',
+            'created_by',
+        )
+        if item_id := request.GET.get('item_id'):
+            qs = qs.filter(
+                models.Q(source_item_id=item_id) | models.Q(target_item_id=item_id)
+            )
+        records = [
+            {
+                'id': r.id,
+                'pencacahan_no': r.pencacahan_no,
+                'date': str(r.date),
+                'source_item_id': r.source_item_id,
+                'source_item_code': r.source_item.code,
+                'source_item_name': r.source_item.name,
+                'source_item_unit': r.source_item.unit_small,
+                'source_warehouse_id': r.source_warehouse_id,
+                'source_warehouse_name': r.source_warehouse.name,
+                'source_quantity': str(r.source_quantity),
+                'target_item_id': r.target_item_id,
+                'target_item_code': r.target_item.code,
+                'target_item_name': r.target_item.name,
+                'target_item_unit': r.target_item.unit_small,
+                'target_warehouse_id': r.target_warehouse_id,
+                'target_warehouse_name': r.target_warehouse.name,
+                'target_quantity': str(r.target_quantity),
+                'value_transferred': str(r.value_transferred),
+                'notes': r.notes,
+                'created_by_name': r.created_by.display_name if r.created_by else None,
+                'created_at': r.created_at.isoformat(),
+            }
+            for r in qs
+        ]
+        return Response(records)
+
+    @transaction.atomic
+    def post(self, request):
+        data = request.data
+        import datetime
+
+        # ── Resolve items and warehouses ──────────────────────────────────
+        try:
+            source_item = InventoryItem.objects.get(pk=data['source_item_id'])
+            source_wh   = Warehouse.objects.get(pk=data['source_warehouse_id'])
+            target_item = InventoryItem.objects.get(pk=data['target_item_id'])
+            target_wh   = Warehouse.objects.get(pk=data['target_warehouse_id'])
+        except (InventoryItem.DoesNotExist, Warehouse.DoesNotExist, KeyError) as exc:
+            return Response({'error': f'Invalid item or warehouse: {exc}'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if source_item.is_service or target_item.is_service:
+            return Response({'error': 'Service items cannot be used in pencacahan.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if source_item.id == target_item.id and source_wh.id == target_wh.id:
+            return Response({'error': 'Source and target must differ (item or warehouse).'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── Parse quantities ──────────────────────────────────────────────
+        try:
+            src_qty_raw  = Decimal(str(data['source_quantity']))
+            src_unit     = data.get('source_unit', 'small')
+            src_qty      = _to_small(source_item, src_qty_raw, src_unit)
+
+            tgt_qty_raw  = Decimal(str(data['target_quantity']))
+            tgt_unit     = data.get('target_unit', 'small')
+            tgt_qty      = _to_small(target_item, tgt_qty_raw, tgt_unit)
+        except (KeyError, ValueError) as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if src_qty <= 0 or tgt_qty <= 0:
+            return Response({'error': 'Quantities must be positive.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── Parse date ────────────────────────────────────────────────────
+        try:
+            conv_date = datetime.date.fromisoformat(data.get('date') or str(datetime.date.today()))
+        except ValueError:
+            return Response({'error': 'Invalid date format. Use YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        notes = data.get('notes', '')
+
+        # ── Check source availability ─────────────────────────────────────
+        available = (
+            InventoryBatch.objects
+            .filter(item=source_item, warehouse=source_wh, quantity_remaining__gt=0)
+            .aggregate(total=Sum('quantity_remaining'))['total'] or Decimal('0')
+        )
+        if available < src_qty:
+            return Response(
+                {
+                    'error': (
+                        f'Insufficient stock for [{source_item.code}]. '
+                        f'Available: {available} {source_item.unit_small}, '
+                        f'requested: {src_qty} {source_item.unit_small}.'
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ── FIFO deduct source ────────────────────────────────────────────
+        shortfall, value_transferred = _fifo_deduct(source_item.id, source_wh.id, src_qty)
+        if shortfall > 0:
+            return Response(
+                {'error': 'Stock deduction failed due to a concurrent modification.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # ── Add target batch with same value ──────────────────────────────
+        target_batch = InventoryBatch.objects.create(
+            item=target_item,
+            warehouse=target_wh,
+            input_date=conv_date,
+            quantity_initial=tgt_qty,
+            quantity_remaining=tgt_qty,
+            value=value_transferred,
+            created_by=_actor(request),
+        )
+
+        # ── Record pencacahan ─────────────────────────────────────────────
+        actor = _actor(request)
+        pencacahan_no = PencacahanRecord.next_number(conv_date)
+        record = PencacahanRecord.objects.create(
+            pencacahan_no=pencacahan_no,
+            date=conv_date,
+            source_item=source_item,
+            source_warehouse=source_wh,
+            source_quantity=src_qty,
+            target_item=target_item,
+            target_warehouse=target_wh,
+            target_quantity=tgt_qty,
+            value_transferred=value_transferred,
+            notes=notes,
+            created_by=actor,
+        )
+
+        AuditLog.objects.create(
+            performed_by=actor,
+            action='CREATE',
+            entity_type='PencacahanRecord',
+            entity_id=str(record.id),
+            description=(
+                f'Pencacahan {pencacahan_no}: '
+                f'{src_qty} {source_item.unit_small} [{source_item.code}] → '
+                f'{tgt_qty} {target_item.unit_small} [{target_item.code}] '
+                f'| nilai Rp {value_transferred:,.2f}'
+            ),
+        )
+
+        return Response(
+            {
+                'pencacahan_no': pencacahan_no,
+                'value_transferred': str(value_transferred),
+                'target_batch_id': target_batch.id,
+                'source_quantity_consumed': str(src_qty),
+                'target_quantity_added': str(tgt_qty),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class PencacahanDetailView(APIView):
+    def get(self, request, pk):
+        try:
+            r = PencacahanRecord.objects.select_related(
+                'source_item', 'source_warehouse',
+                'target_item', 'target_warehouse',
+                'created_by',
+            ).get(pk=pk)
+        except PencacahanRecord.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({
+            'id': r.id,
+            'pencacahan_no': r.pencacahan_no,
+            'date': str(r.date),
+            'source_item_id': r.source_item_id,
+            'source_item_code': r.source_item.code,
+            'source_item_name': r.source_item.name,
+            'source_item_unit': r.source_item.unit_small,
+            'source_warehouse_id': r.source_warehouse_id,
+            'source_warehouse_name': r.source_warehouse.name,
+            'source_quantity': str(r.source_quantity),
+            'target_item_id': r.target_item_id,
+            'target_item_code': r.target_item.code,
+            'target_item_name': r.target_item.name,
+            'target_item_unit': r.target_item.unit_small,
+            'target_warehouse_id': r.target_warehouse_id,
+            'target_warehouse_name': r.target_warehouse.name,
+            'target_quantity': str(r.target_quantity),
+            'value_transferred': str(r.value_transferred),
+            'notes': r.notes,
+            'created_by_name': r.created_by.display_name if r.created_by else None,
+            'created_at': r.created_at.isoformat(),
+        })
