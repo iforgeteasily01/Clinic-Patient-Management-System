@@ -18,11 +18,13 @@ class PatientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Patient
         fields = ["patient_no", "name", "address", "phone_number", "NIK"]
-        read_only_fields = ["patient_no"]
         extra_kwargs = {
             # name is nullable in DB but must be provided on input — the model's
             # save() method needs it to generate patient_no.
             'name': {'required': True, 'allow_null': False, 'allow_blank': False},
+            # patient_no is optional on create: if provided it is used as-is,
+            # otherwise the model's save() auto-generates one from the name initial.
+            'patient_no': {'required': False, 'allow_blank': True},
         }
 
 

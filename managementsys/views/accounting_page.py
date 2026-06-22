@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation
 
 import openpyxl
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import F, Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
@@ -410,6 +410,7 @@ class PurchaseInvoiceListCreateView(APIView):
                     quantity_initial=b['qty'],
                     quantity_remaining=b['qty'],
                     value=b['cost'],
+                    purchase_invoice=invoice,
                 )
 
             invoice.total_amount = grand_total
@@ -434,7 +435,7 @@ class PurchaseInvoiceDetailView(APIView):
         try:
             return PurchaseInvoice.objects.select_related(
                 'supplier', 'payment_account', 'created_by', 'warehouse',
-            ).prefetch_related('items__item', 'additional_costs').get(pk=pk)
+            ).prefetch_related('items__item', 'items__expense_account', 'additional_costs').get(pk=pk)
         except PurchaseInvoice.DoesNotExist:
             return None
 
@@ -445,7 +446,7 @@ class PurchaseInvoiceDetailView(APIView):
         return Response(PurchaseInvoiceDetailSerializer(obj, context={'request': request}).data)
 
     def patch(self, request, pk):
-        """Update notes, due_date, external_invoice_no only. Status is computed from payments."""
+        """Update metadata only (notes, dates, invoice number). Items require PUT."""
         obj = self._get(pk)
         if not obj:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -461,10 +462,237 @@ class PurchaseInvoiceDetailView(APIView):
             action='UPDATE',
             entity_type='PurchaseInvoice',
             entity_id=str(obj.id),
-            description=f'Purchase invoice updated: {obj.internal_id}',
+            description=f'Purchase invoice metadata updated: {obj.internal_id}',
         )
         return Response(PurchaseInvoiceDetailSerializer(obj, context={'request': request}).data)
 
+    @transaction.atomic
+    def put(self, request, pk):
+        """Full replacement of invoice items, costs, and header fields. Only allowed when amount_paid == 0."""
+        obj = self._get(pk)
+        if not obj:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if obj.amount_paid > 0:
+            return Response(
+                {'error': 'Cannot edit an invoice that has payments recorded.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Block edit if any inventory from this invoice has already been partially consumed
+        consumed_batches = obj.inventory_batches.filter(
+            quantity_remaining__lt=F('quantity_initial')
+        )
+        if consumed_batches.exists():
+            return Response(
+                {'error': 'Cannot edit: some inventory from this invoice has already been used.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        data = request.data
+
+        items_raw = data.get('items', [])
+        if isinstance(items_raw, str):
+            try:
+                items = json.loads(items_raw)
+            except (json.JSONDecodeError, ValueError):
+                return Response({'error': 'Invalid items JSON.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            items = items_raw
+
+        additional_costs_raw = data.get('additional_costs', [])
+        if isinstance(additional_costs_raw, str):
+            try:
+                additional_costs = json.loads(additional_costs_raw)
+            except (json.JSONDecodeError, ValueError):
+                return Response({'error': 'Invalid additional_costs JSON.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            additional_costs = additional_costs_raw
+
+        if not items:
+            return Response({'error': 'At least one item is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Resolve supplier and payment account
+        try:
+            supplier = Supplier.objects.get(pk=data['supplier'])
+            payment_acct = ChartOfAccounts.objects.get(pk=data['payment_account'], account_type='asset')
+        except (Supplier.DoesNotExist, ChartOfAccounts.DoesNotExist, KeyError):
+            return Response({'error': 'Invalid supplier or payment account.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        warehouse_id = data.get('warehouse') or None
+        warehouse_obj = None
+        if warehouse_id:
+            try:
+                warehouse_obj = Warehouse.objects.get(pk=warehouse_id)
+            except Warehouse.DoesNotExist:
+                return Response({'error': 'Invalid warehouse.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Remove old inventory batches and line items
+        obj.inventory_batches.all().delete()
+        obj.items.all().delete()
+        obj.additional_costs.all().delete()
+
+        # Update header fields
+        obj.supplier = supplier
+        obj.payment_account = payment_acct
+        obj.warehouse = warehouse_obj
+        obj.purchase_date = data.get('purchase_date', obj.purchase_date)
+        obj.due_date = data.get('due_date') or None
+        obj.external_invoice_no = data.get('external_invoice_no', obj.external_invoice_no)
+        obj.notes = data.get('notes', obj.notes)
+        obj.save(update_fields=[
+            'supplier', 'payment_account', 'warehouse',
+            'purchase_date', 'due_date', 'external_invoice_no', 'notes',
+        ])
+
+        # Update invoice image if provided
+        image_file = request.FILES.get('invoice_image')
+        if image_file:
+            obj.invoice_image = image_file
+            obj.save(update_fields=['invoice_image'])
+
+        # Parse items and compute subtotals (same logic as POST)
+        parsed = []
+        items_subtotal = Decimal('0')
+        total_units = Decimal('0')
+
+        for row in items:
+            qty            = _safe_decimal(row.get('quantity', 0))
+            cost           = _safe_decimal(row.get('unit_cost', 0))
+            total_discount = _safe_decimal(row.get('total_discount', 0))
+            line_type      = row.get('line_type', 'stock')
+            item_id        = row.get('item') or None
+            expense_acct_id = row.get('expense_account') or None
+
+            row_wh_id = row.get('warehouse') or warehouse_id or None
+
+            gross           = qty * cost
+            discount_capped = min(total_discount, gross)
+            adjusted_sub    = gross - discount_capped
+
+            items_subtotal += adjusted_sub
+            if line_type == 'stock' and qty > 0:
+                total_units += qty
+
+            parsed.append({
+                'line_type':       line_type,
+                'item_id':         item_id,
+                'item_name':       row.get('item_name', ''),
+                'quantity':        qty,
+                'unit':            row.get('unit', ''),
+                'unit_cost':       cost,
+                'total_discount':  discount_capped,
+                'adjusted_sub':    adjusted_sub,
+                'expense_acct_id': expense_acct_id,
+                'warehouse_id':    row_wh_id,
+            })
+
+        # Compute net adjustment from additional costs
+        running_total  = items_subtotal
+        net_adjustment = Decimal('0')
+        cost_objs      = []
+
+        for i, ac in enumerate(additional_costs):
+            name        = str(ac.get('name', '')).strip()
+            modifier    = ac.get('modifier', 'add')
+            amount_type = ac.get('amount_type', 'cash')
+            amount      = _safe_decimal(ac.get('amount', 0))
+
+            if not name or amount <= 0:
+                continue
+
+            if amount_type == 'percent':
+                adj = running_total * amount / Decimal('100')
+            else:
+                adj = amount
+
+            if modifier == 'subtract':
+                adj = -adj
+
+            running_total  += adj
+            net_adjustment += adj
+
+            cost_objs.append(PurchaseAdditionalCost(
+                invoice=obj,
+                name=name,
+                modifier=modifier,
+                amount_type=amount_type,
+                amount=amount,
+                sort_order=i,
+            ))
+
+        if cost_objs:
+            PurchaseAdditionalCost.objects.bulk_create(cost_objs)
+
+        grand_total  = items_subtotal + net_adjustment
+        per_unit_adj = Decimal('0')
+        if total_units > 0:
+            per_unit_adj = net_adjustment / total_units
+
+        # Create new item records and batches
+        item_objs         = []
+        batches_to_create = []
+
+        for p in parsed:
+            qty = p['quantity']
+            if qty > 0:
+                base_unit_cost = p['adjusted_sub'] / qty
+                actual = base_unit_cost + (per_unit_adj if p['line_type'] == 'stock' else Decimal('0'))
+            else:
+                base_unit_cost = p['unit_cost']
+                actual = p['unit_cost']
+
+            item_objs.append(PurchaseInvoiceItem(
+                invoice=obj,
+                line_type=p['line_type'],
+                item_id=p['item_id'],
+                item_name=p['item_name'],
+                quantity=qty,
+                unit=p['unit'],
+                unit_cost=p['unit_cost'],
+                total_discount=p['total_discount'],
+                actual_unit_cost=actual,
+                expense_account_id=p['expense_acct_id'],
+                warehouse_id=p['warehouse_id'],
+            ))
+
+            if p['line_type'] == 'stock' and p['item_id'] and p['warehouse_id'] and qty > 0:
+                batches_to_create.append({
+                    'item_id':      p['item_id'],
+                    'warehouse_id': p['warehouse_id'],
+                    'qty':          qty,
+                    'cost':         actual,
+                })
+
+        PurchaseInvoiceItem.objects.bulk_create(item_objs)
+
+        for b in batches_to_create:
+            InventoryBatch.objects.create(
+                item_id=b['item_id'],
+                warehouse_id=b['warehouse_id'],
+                input_date=obj.purchase_date,
+                quantity_initial=b['qty'],
+                quantity_remaining=b['qty'],
+                value=b['cost'],
+                purchase_invoice=obj,
+            )
+
+        obj.total_amount = grand_total
+        obj.save(update_fields=['total_amount'])
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='UPDATE',
+            entity_type='PurchaseInvoice',
+            entity_id=str(obj.id),
+            description=f'Purchase invoice fully updated: {obj.internal_id}',
+        )
+
+        obj.refresh_from_db()
+        return Response(PurchaseInvoiceDetailSerializer(
+            self._get(pk), context={'request': request}
+        ).data)
+
+    @transaction.atomic
     def delete(self, request, pk):
         obj = self._get(pk)
         if not obj:
@@ -474,14 +702,62 @@ class PurchaseInvoiceDetailView(APIView):
                 {'error': 'Cannot delete an invoice that has payments recorded.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # Block deletion if any inventory from this invoice has already been partially consumed
+        consumed_batches = obj.inventory_batches.filter(
+            quantity_remaining__lt=F('quantity_initial')
+        )
+        if consumed_batches.exists():
+            return Response(
+                {'error': 'Cannot delete: some inventory from this invoice has already been used.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        today       = timezone.now().date()
         internal_id = obj.internal_id
+        journal_entries = []
+
+        # Reversal journal entries — one per expense line with an explicit account
+        for line in obj.items.all():
+            if line.line_type == 'expense' and line.expense_account_id:
+                amt = line.quantity * line.actual_unit_cost
+                if amt > 0:
+                    journal_entries.append(LedgerEntry(
+                        account_id=line.expense_account_id,
+                        date=today,
+                        description=f'Reversal beban: {line.item_name} — penghapusan {internal_id}',
+                        entry_type='credit',
+                        amount=amt,
+                        source_type='purchase',
+                        purchase_invoice=obj,
+                    ))
+
+        # One debit entry to the payment account documenting the voided payable
+        if obj.total_amount > 0:
+            journal_entries.append(LedgerEntry(
+                account=obj.payment_account,
+                date=today,
+                description=f'Penghapusan faktur pembelian {internal_id}',
+                entry_type='debit',
+                amount=obj.total_amount,
+                source_type='purchase',
+                purchase_invoice=obj,
+            ))
+
+        if journal_entries:
+            LedgerEntry.objects.bulk_create(journal_entries)
+
+        # Remove inventory batches created from this invoice
+        obj.inventory_batches.all().delete()
+
         obj.delete()
+
         AuditLog.objects.create(
             performed_by=_actor(request),
             action='DELETE',
             entity_type='PurchaseInvoice',
             entity_id=str(pk),
-            description=f'Purchase invoice deleted: {internal_id}',
+            description=f'Purchase invoice deleted: {internal_id} — inventory reversed, journal updated',
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
 

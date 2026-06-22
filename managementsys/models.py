@@ -353,6 +353,12 @@ class InventoryBatch(models.Model):
     quantity_initial = models.DecimalField(max_digits=14, decimal_places=4)    # in smallest unit
     quantity_remaining = models.DecimalField(max_digits=14, decimal_places=4)  # in smallest unit; decremented FIFO
     value = models.DecimalField(max_digits=14, decimal_places=2)  # total batch purchase value
+    purchase_invoice = models.ForeignKey(
+        'PurchaseInvoice',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='inventory_batches',
+    )
     created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='inv_batches_created')
     created_at = models.DateTimeField(auto_now_add=True)
 
