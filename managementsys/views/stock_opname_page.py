@@ -419,6 +419,74 @@ class StockOpnameTemplateView(APIView):
             'warnings': errors,
         }, status=201)
 
+    def patch(self, request):
+        """Reorder an existing template from a drag-and-drop edit.
+
+        Body: { warehouse_id, sections: [{ name, item_ids: [..] }, ..] }
+        The incoming order of sections and of item_ids within each section
+        defines section_order / item_order. Items are rewritten wholesale.
+        """
+        warehouse_id = request.data.get('warehouse_id')
+        sections = request.data.get('sections')
+        if not warehouse_id or sections is None:
+            return Response({'error': 'warehouse_id dan sections wajib diisi.'}, status=400)
+
+        try:
+            template_obj = StockOpnameTemplate.objects.get(warehouse_id=warehouse_id)
+        except StockOpnameTemplate.DoesNotExist:
+            return Response({'error': 'Template tidak ditemukan untuk gudang ini.'}, status=404)
+
+        # Only keep item_ids that still exist, preserving the submitted order.
+        requested_ids = [
+            int(iid)
+            for sec in sections
+            for iid in sec.get('item_ids', [])
+        ]
+        valid_ids = set(
+            InventoryItem.objects.filter(pk__in=requested_ids).values_list('id', flat=True)
+        )
+
+        entries = []
+        seen: set[int] = set()
+        for section_order, sec in enumerate(sections):
+            name = (sec.get('name') or '').strip()
+            item_order = 0
+            for iid in sec.get('item_ids', []):
+                iid = int(iid)
+                if iid in seen or iid not in valid_ids:
+                    continue
+                seen.add(iid)
+                entries.append(
+                    StockOpnameTemplateItem(
+                        template=template_obj,
+                        item_id=iid,
+                        section=name,
+                        section_order=section_order,
+                        item_order=item_order,
+                    )
+                )
+                item_order += 1
+
+        if not entries:
+            return Response({'error': 'Tidak ada barang valid untuk disimpan.'}, status=400)
+
+        with transaction.atomic():
+            StockOpnameTemplateItem.objects.filter(template=template_obj).delete()
+            StockOpnameTemplateItem.objects.bulk_create(entries)
+            template_obj.save(update_fields=['updated_at'])
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='UPDATE',
+            entity_type='StockOpnameTemplate',
+            entity_id=str(template_obj.id),
+            description=(
+                f'Urutan template stok opname gudang #{warehouse_id} '
+                f'diperbarui ({len(entries)} barang).'
+            ),
+        )
+        return Response({'message': f'Urutan template disimpan ({len(entries)} barang).'})
+
 
 class StockOpnameTemplateSampleView(APIView):
     def get(self, request):
