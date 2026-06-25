@@ -26,17 +26,21 @@ class Patient(models.Model):
                 raise ValueError("Patient name is required to generate patient_no.")
             prefix = self.name[0].upper()
 
-            maxnumber = Patient.objects.filter(
+            # Find the highest counter among existing patient_no values for this
+            # prefix. Legacy/imported IDs (e.g. "PN00691") don't follow the
+            # canonical {letter}{digits} format, so skip any whose remainder
+            # after the prefix isn't purely numeric instead of crashing on int().
+            existing_nos = Patient.objects.filter(
                 patient_no__startswith=prefix
-            ).aggregate(
-                lastnumber=models.Max('patient_no')
-            )["lastnumber"]
+            ).values_list('patient_no', flat=True)
 
-            if maxnumber:
-                max_number = int(maxnumber[1:])
-                new_number = max_number + 1
-            else:
-                new_number = 1
+            max_number = 0
+            for pno in existing_nos:
+                digits = pno[len(prefix):]
+                if digits.isdigit():
+                    max_number = max(max_number, int(digits))
+
+            new_number = max_number + 1
 
             self.patient_no = f"{prefix}{new_number:06d}"  # 7 chars total
 
