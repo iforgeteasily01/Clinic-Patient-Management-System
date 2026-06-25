@@ -23,8 +23,12 @@ from __future__ import annotations
 
 import re
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
+
+# iPos stores datetimes as local Jakarta time (GMT+7) without timezone info.
+# Attaching this offset lets Django convert correctly to UTC on save.
+TZ_JAKARTA = timezone(timedelta(hours=7))
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connections, transaction
@@ -391,10 +395,13 @@ class Command(BaseCommand):
             lines = cur2.fetchall()
             cur2.close()
 
+            # Attach Jakarta timezone so Django stores the correct UTC value
+            tanggal_aware = tanggal.replace(tzinfo=TZ_JAKARTA) if tanggal else None
+
             if self.dry:
                 patient_label = patient.name if patient else f'UNKNOWN({kodesupel})'
                 self.stdout.write(
-                    f'    Would CREATE INV {inv_no} | {tanggal} | patient={patient_label} '
+                    f'    Would CREATE INV {inv_no} | {tanggal_aware} | patient={patient_label} '
                     f'| lines={len(lines)} | total={totalakhir}'
                 )
                 inv_created += 1
@@ -407,7 +414,7 @@ class Command(BaseCommand):
                 with transaction.atomic():
                     inv = Invoice(
                         invoice_number=inv_no,
-                        datetime=tanggal,
+                        datetime=tanggal_aware,
                         patient_no=patient,
                         payment_method=None,
                         discount=_dec(potfaktur),
