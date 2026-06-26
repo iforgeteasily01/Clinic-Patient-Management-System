@@ -453,6 +453,9 @@ class Invoice(models.Model):
     promotion          = models.ForeignKey('Promotion', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoices')
     notes              = models.CharField(max_length=500, blank=True, default='')
     promotion_code     = models.CharField(max_length=50, blank=True, default='')
+    is_voided          = models.BooleanField(default=False)
+    voided_at          = models.DateTimeField(null=True, blank=True)
+    voided_by          = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='voided_invoices')
 
     class Meta:
         ordering = ['-datetime']
@@ -1142,6 +1145,9 @@ class PurchaseInvoice(models.Model):
     warehouse      = models.ForeignKey('Warehouse', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_invoices')
     created_at     = models.DateTimeField(auto_now_add=True)
     created_by     = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_invoices')
+    is_voided      = models.BooleanField(default=False)
+    voided_at      = models.DateTimeField(null=True, blank=True)
+    voided_by      = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='voided_purchase_invoices')
 
     class Meta:
         ordering = ['-purchase_date', '-created_at']

@@ -186,5 +186,7 @@ urlpatterns = [
     path('api/accounting/adjustments/',            views.JournalAdjustmentView.as_view(),        name='accounting-adjustments'),
     path('api/accounting/journal/',                views.JournalHistoryView.as_view(),           name='accounting-journal'),
     path('api/accounting/daily-sales/',            views.DailySalesView.as_view(),               name='accounting-daily-sales'),
+    path('api/accounting/payment-plan/preview/',   views.PaymentPlanPreviewView.as_view(),       name='accounting-payment-plan-preview'),
+    path('api/accounting/payment-plan/export/',    views.PaymentPlanExportView.as_view(),        name='accounting-payment-plan-export'),
 ]
 

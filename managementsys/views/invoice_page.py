@@ -447,6 +447,10 @@ class InvoiceListView(APIView):
         if method := request.GET.get('payment_method', '').strip():
             qs = qs.filter(payment_method_id=method)
 
+        # Hide voided invoices unless the caller explicitly asks to include them.
+        if request.GET.get('include_voided', '').strip().lower() not in ('1', 'true', 'yes'):
+            qs = qs.filter(is_voided=False)
+
         total = qs.count()
 
         try:
@@ -498,6 +502,11 @@ class InvoiceDetailView(APIView):
         invoice = self._get(pk)
         if invoice is None:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if invoice.is_voided:
+            return Response(
+                {'error': 'Cannot edit a voided invoice.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         serializer = InvoiceUpdateSerializer(data=request.data)
         if not serializer.is_valid():
@@ -654,9 +663,15 @@ class InvoiceDetailView(APIView):
 
     @transaction.atomic
     def delete(self, request, pk):
+        """Void (soft-delete) an invoice: reverse its accounting but keep the record."""
         invoice = self._get(pk)
         if invoice is None:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if invoice.is_voided:
+            return Response(
+                {'error': 'Invoice is already voided.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         old_item_instances = list(
             invoice.items
@@ -670,28 +685,33 @@ class InvoiceDetailView(APIView):
         inv_no = invoice.invoice_number
         patient = invoice.patient_no
 
+        # Post reversing ledger entries (keeps the original posting + reversal as
+        # a complete audit trail) and roll the affected account balances back.
         _reverse_accounting_instances(
             invoice.payment_method_id,
             invoice.grand_total,
             old_item_instances,
             invoice.warehouse_id,
+            invoice=invoice,
         )
 
-        LedgerEntry.objects.filter(invoice=invoice).delete()
-        invoice.delete()
+        invoice.is_voided = True
+        invoice.voided_at = timezone.now()
+        invoice.voided_by = _actor(request)
+        invoice.save(update_fields=['is_voided', 'voided_at', 'voided_by'])
 
         if patient is not None:
             refresh_crm_profile(patient)
 
         AuditLog.objects.create(
             performed_by=_actor(request),
-            action='DELETE',
+            action='VOID',
             entity_type='Invoice',
             entity_id=str(pk),
-            description=f'Invoice {inv_no} deleted — accounting reversed',
+            description=f'Invoice {inv_no} voided — accounting reversed',
         )
 
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(InvoiceReadSerializer(self._get(pk)).data)
 
 
 class InvoiceExportView(APIView):
@@ -714,6 +734,10 @@ class InvoiceExportView(APIView):
             )
         if method := request.GET.get('payment_method', '').strip():
             qs = qs.filter(payment_method_id=method)
+
+        # Hide voided invoices unless explicitly requested (mirrors the list view).
+        if request.GET.get('include_voided', '').strip().lower() not in ('1', 'true', 'yes'):
+            qs = qs.filter(is_voided=False)
 
         wb = openpyxl.Workbook()
         ws_inv  = wb.active

@@ -74,6 +74,8 @@ from .stock_opname_page import (
 from .accounting_page import (
     AccountingDashboardView,
     DailySalesView,
+    PaymentPlanPreviewView,
+    PaymentPlanExportView,
     SupplierListCreateView,
     SupplierDetailView,
     SupplierTemplateView,

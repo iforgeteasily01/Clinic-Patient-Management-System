@@ -222,6 +222,10 @@ class PurchaseInvoiceListCreateView(APIView):
             today = timezone.now().date()
             qs = qs.filter(due_date__lt=today).exclude(status='paid')
 
+        # Hide voided invoices unless the caller explicitly asks to include them.
+        if request.query_params.get('include_voided', '').strip().lower() not in ('1', 'true', 'yes'):
+            qs = qs.filter(is_voided=False)
+
         return Response(PurchaseInvoiceListSerializer(qs, many=True).data)
 
     def post(self, request):
@@ -450,6 +454,11 @@ class PurchaseInvoiceDetailView(APIView):
         obj = self._get(pk)
         if not obj:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if obj.is_voided:
+            return Response(
+                {'error': 'Cannot edit a voided invoice.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         updatable = ['external_invoice_no', 'notes', 'due_date', 'purchase_date']
         for field in updatable:
@@ -472,6 +481,11 @@ class PurchaseInvoiceDetailView(APIView):
         obj = self._get(pk)
         if not obj:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if obj.is_voided:
+            return Response(
+                {'error': 'Cannot edit a voided invoice.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if obj.amount_paid > 0:
             return Response(
                 {'error': 'Cannot edit an invoice that has payments recorded.'},
@@ -694,22 +708,28 @@ class PurchaseInvoiceDetailView(APIView):
 
     @transaction.atomic
     def delete(self, request, pk):
+        """Void (soft-delete) a purchase invoice: reverse stock and accounting but keep the record."""
         obj = self._get(pk)
         if not obj:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if obj.is_voided:
+            return Response(
+                {'error': 'Invoice is already voided.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if obj.amount_paid > 0:
             return Response(
-                {'error': 'Cannot delete an invoice that has payments recorded.'},
+                {'error': 'Cannot void an invoice that has payments recorded.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Block deletion if any inventory from this invoice has already been partially consumed
+        # Block voiding if any inventory from this invoice has already been partially consumed
         consumed_batches = obj.inventory_batches.filter(
             quantity_remaining__lt=F('quantity_initial')
         )
         if consumed_batches.exists():
             return Response(
-                {'error': 'Cannot delete: some inventory from this invoice has already been used.'},
+                {'error': 'Cannot void: some inventory from this invoice has already been used.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -725,7 +745,7 @@ class PurchaseInvoiceDetailView(APIView):
                     journal_entries.append(LedgerEntry(
                         account_id=line.expense_account_id,
                         date=today,
-                        description=f'Reversal beban: {line.item_name} — penghapusan {internal_id}',
+                        description=f'Reversal beban: {line.item_name} — pembatalan {internal_id}',
                         entry_type='credit',
                         amount=amt,
                         source_type='purchase',
@@ -737,7 +757,7 @@ class PurchaseInvoiceDetailView(APIView):
             journal_entries.append(LedgerEntry(
                 account=obj.payment_account,
                 date=today,
-                description=f'Penghapusan faktur pembelian {internal_id}',
+                description=f'Pembatalan faktur pembelian {internal_id}',
                 entry_type='debit',
                 amount=obj.total_amount,
                 source_type='purchase',
@@ -747,19 +767,22 @@ class PurchaseInvoiceDetailView(APIView):
         if journal_entries:
             LedgerEntry.objects.bulk_create(journal_entries)
 
-        # Remove inventory batches created from this invoice
+        # Remove inventory batches created from this invoice (stock never came in)
         obj.inventory_batches.all().delete()
 
-        obj.delete()
+        obj.is_voided = True
+        obj.voided_at = timezone.now()
+        obj.voided_by = _actor(request)
+        obj.save(update_fields=['is_voided', 'voided_at', 'voided_by'])
 
         AuditLog.objects.create(
             performed_by=_actor(request),
-            action='DELETE',
+            action='VOID',
             entity_type='PurchaseInvoice',
             entity_id=str(pk),
-            description=f'Purchase invoice deleted: {internal_id} — inventory reversed, journal updated',
+            description=f'Purchase invoice voided: {internal_id} — inventory reversed, journal updated',
         )
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(PurchaseInvoiceDetailSerializer(obj, context={'request': request}).data)
 
 
 class PurchaseInvoicePayView(APIView):
@@ -1142,6 +1165,266 @@ class AccountingDashboardView(APIView):
             'overdue_count':   overdue_count,
             'total_unpaid':    str(total_unpaid),
         })
+
+
+# ── Payment Plan (Rencana Pembayaran) ──────────────────────────────────────────
+
+INDO_MONTHS = [
+    'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
+]
+
+
+def _payment_plan_queryset(date_from, date_to):
+    """Outstanding (unpaid/partial) purchase invoices whose purchase_date falls
+    in the inclusive range, ordered by due date (nulls last)."""
+    return (
+        PurchaseInvoice.objects
+        .select_related('supplier')
+        .filter(
+            status__in=['unpaid', 'partial'],
+            purchase_date__gte=date_from,
+            purchase_date__lte=date_to,
+        )
+        .order_by(F('due_date').asc(nulls_last=True), 'purchase_date', 'id')
+    )
+
+
+def _parse_plan_range(request):
+    """Returns (date_from, date_to, error_response)."""
+    import datetime
+    date_from = request.query_params.get('date_from', '').strip()
+    date_to   = request.query_params.get('date_to', '').strip()
+    if not date_from or not date_to:
+        return None, None, Response(
+            {'error': 'date_from dan date_to wajib diisi (YYYY-MM-DD).'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        d_from = datetime.date.fromisoformat(date_from)
+        d_to   = datetime.date.fromisoformat(date_to)
+    except ValueError:
+        return None, None, Response(
+            {'error': 'Format tanggal tidak valid. Gunakan YYYY-MM-DD.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if d_from > d_to:
+        return None, None, Response(
+            {'error': 'date_from tidak boleh setelah date_to.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return d_from, d_to, None
+
+
+def _default_plan_title(d_from, d_to):
+    """e.g. 'Rencana Pembayaran ( 1 - 15 Juni ) 2026'."""
+    if d_from.month == d_to.month and d_from.year == d_to.year:
+        period = f'( {d_from.day} - {d_to.day} {INDO_MONTHS[d_to.month - 1]} ) {d_to.year}'
+    elif d_from.year == d_to.year:
+        period = (f'( {d_from.day} {INDO_MONTHS[d_from.month - 1]} - '
+                  f'{d_to.day} {INDO_MONTHS[d_to.month - 1]} ) {d_to.year}')
+    else:
+        period = (f'( {d_from.day} {INDO_MONTHS[d_from.month - 1]} {d_from.year} - '
+                  f'{d_to.day} {INDO_MONTHS[d_to.month - 1]} {d_to.year} )')
+    return f'Rencana Pembayaran {period}'
+
+
+class PaymentPlanPreviewView(APIView):
+    """
+    GET /api/accounting/payment-plan/preview/?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
+    Lists outstanding purchase invoices (unpaid/partial) in the range for review
+    before generating the Excel file.
+    """
+
+    def get(self, request):
+        d_from, d_to, err = _parse_plan_range(request)
+        if err:
+            return err
+
+        rows = []
+        total = Decimal('0')
+        for inv in _payment_plan_queryset(d_from, d_to):
+            balance = inv.total_amount - inv.amount_paid
+            total += balance
+            rows.append({
+                'id':                 inv.id,
+                'internal_id':        inv.internal_id,
+                'external_invoice_no': inv.external_invoice_no,
+                'supplier_name':      inv.supplier.name,
+                'balance_due':        str(balance),
+                'due_date':           inv.due_date.isoformat() if inv.due_date else None,
+                'purchase_date':      inv.purchase_date.isoformat(),
+                'status':             inv.status,
+            })
+
+        return Response({
+            'date_from':     d_from.isoformat(),
+            'date_to':       d_to.isoformat(),
+            'default_title': _default_plan_title(d_from, d_to),
+            'count':         len(rows),
+            'total':         str(total),
+            'results':       rows,
+        })
+
+
+class PaymentPlanExportView(APIView):
+    """
+    GET /api/accounting/payment-plan/export/?date_from=&date_to=&title=
+    Streams an .xlsx file styled to match the clinic's 'Rencana Pembayaran' template.
+    """
+
+    def get(self, request):
+        from openpyxl.styles import Alignment, Border, Color, Font, PatternFill, Side
+
+        d_from, d_to, err = _parse_plan_range(request)
+        if err:
+            return err
+
+        title = (request.query_params.get('title', '') or '').strip()
+        if not title:
+            title = _default_plan_title(d_from, d_to)
+
+        # Period label reused for the credit-card block title.
+        if title.lower().startswith('rencana pembayaran'):
+            period_label = title[len('rencana pembayaran'):].strip()
+        else:
+            period_label = _default_plan_title(d_from, d_to)[len('Rencana Pembayaran'):].strip()
+
+        # ── Style primitives (mirrors the reference workbook) ──────────────────
+        ACCT_FMT  = '_-* #,##0_-;\\-* #,##0_-;_-* "-"_-;_-@_-'
+        DATE_FMT  = '[$-409]d\\-mmm;@'
+        thin      = Side(style='thin')
+        all_thin  = Border(left=thin, right=thin, top=thin, bottom=thin)
+        header_fill = PatternFill(
+            patternType='solid',
+            fgColor=Color(theme=8, tint=0.7999816888943144),
+        )
+        f_normal = Font(name='Calibri', size=11)
+        f_bold   = Font(name='Calibri', size=11, bold=True)
+        f_title  = Font(name='Calibri', size=14, bold=True)
+        center   = Alignment(horizontal='center', vertical='center')
+        center_v = Alignment(vertical='center')
+        left_v   = Alignment(horizontal='left', vertical='center')
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Rencana Pembayaran'
+
+        # Column widths copied from the reference file
+        widths = {'A': 33.28515625, 'B': 31.42578125, 'C': 13.28515625,
+                  'D': 10.42578125, 'E': 14.5703125, 'F': 18.28515625, 'G': 39.28515625}
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = w
+
+        # ── Title (merged A1:G1) ───────────────────────────────────────────────
+        ws.merge_cells('A1:G1')
+        t = ws['A1']
+        t.value = title
+        t.font = f_title
+        t.alignment = Alignment(horizontal='center')
+        ws.row_dimensions[1].height = 18.75
+
+        # ── Header row (row 3) ─────────────────────────────────────────────────
+        headers = ['No. Invoice', 'Supplier', 'Tagihan', 'DD', 'Tgl Byr', 'No. Rek', 'a/n']
+        for idx, label in enumerate(headers):
+            c = ws.cell(row=3, column=idx + 1, value=label)
+            c.font = f_bold
+            c.alignment = center
+            c.border = all_thin
+            c.fill = header_fill
+
+        # ── Data rows ──────────────────────────────────────────────────────────
+        row = 4
+        first_data_row = row
+        for inv in _payment_plan_queryset(d_from, d_to):
+            balance = inv.total_amount - inv.amount_paid
+
+            a = ws.cell(row=row, column=1, value=inv.external_invoice_no or '')
+            a.font = f_normal; a.alignment = left_v; a.border = all_thin
+
+            b = ws.cell(row=row, column=2, value=inv.supplier.name)
+            b.font = f_normal; b.alignment = center_v; b.border = all_thin
+
+            c = ws.cell(row=row, column=3, value=float(balance))
+            c.font = f_normal; c.alignment = center_v
+            c.number_format = ACCT_FMT; c.border = all_thin
+
+            d = ws.cell(row=row, column=4)
+            if inv.due_date:
+                d.value = inv.due_date
+                d.number_format = DATE_FMT
+            d.font = f_normal; d.alignment = center; d.border = all_thin
+
+            # E (Tgl Byr), F (No. Rek), G (a/n) — left blank for manual entry
+            e = ws.cell(row=row, column=5)
+            e.font = f_normal; e.alignment = center; e.border = all_thin
+            fcell = ws.cell(row=row, column=6)
+            fcell.font = f_normal; fcell.alignment = center; fcell.border = all_thin
+            g = ws.cell(row=row, column=7)
+            g.font = f_normal; g.alignment = left_v; g.border = all_thin
+
+            row += 1
+
+        last_data_row = row - 1
+        if last_data_row < first_data_row:
+            last_data_row = first_data_row  # keep SUM range valid even when empty
+
+        # ── Total row (one blank row below the table) ──────────────────────────
+        total_row = row + 1
+        total_border = Border(top=thin, bottom=Side(style='double'))
+        tb = ws.cell(row=total_row, column=2, value='Total')
+        tb.font = f_bold; tb.border = total_border
+        tc = ws.cell(row=total_row, column=3, value=f'=SUM(C{first_data_row}:C{last_data_row})')
+        tc.font = f_bold; tc.number_format = ACCT_FMT; tc.border = total_border
+
+        # ── Static credit-card block ───────────────────────────────────────────
+        cc_title_row = total_row + 4
+        ws.merge_cells(start_row=cc_title_row, start_column=2, end_row=cc_title_row, end_column=4)
+        cc = ws.cell(row=cc_title_row, column=2, value=f'Pembayaran Kartu kredit {period_label}')
+        cc.font = f_bold; cc.alignment = Alignment(horizontal='center')
+        for col in (2, 3, 4):
+            ws.cell(row=cc_title_row, column=col).border = all_thin
+
+        # Spacer row (bordered, empty)
+        spacer_row = cc_title_row + 1
+        for col in (2, 3, 4):
+            ws.cell(row=spacer_row, column=col).border = all_thin
+
+        # Column headers
+        hdr_row = spacer_row + 1
+        for col, label in ((2, 'BANK'), (3, 'TGL BAYAR'), (4, 'TGL LUNAS')):
+            hc = ws.cell(row=hdr_row, column=col, value=label)
+            hc.font = f_normal; hc.border = all_thin
+
+        # Static bank rows (TGL LUNAS left blank for manual entry)
+        bank_rows = [('CITIBANK', '10-15'), ('MANDIRI', '17-20'),
+                     ('BCA', '15-17'), ('BNI', '7-9')]
+        r = hdr_row + 1
+        for bank, tgl in bank_rows:
+            ws.cell(row=r, column=2, value=bank).font = f_normal
+            ws.cell(row=r, column=3, value=tgl).font = f_normal
+            for col in (2, 3, 4):
+                ws.cell(row=r, column=col).border = all_thin
+            r += 1
+
+        # ── Page setup (landscape A4, matching the reference) ──────────────────
+        ws.page_setup.orientation = 'landscape'
+        ws.page_setup.paperSize = 9
+        ws.page_margins.left = 0.59
+        ws.page_margins.right = 0
+        ws.page_margins.top = 0
+        ws.page_margins.bottom = 0
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        safe_name = title.replace('/', '-').replace('\\', '-')
+        return HttpResponse(
+            buf.read(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={'Content-Disposition': f'attachment; filename="{safe_name}.xlsx"'},
+        )
 
 
 # ── Daily Sales ────────────────────────────────────────────────────────────────

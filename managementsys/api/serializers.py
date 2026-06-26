@@ -619,6 +619,7 @@ class InvoiceReadSerializer(serializers.ModelSerializer):
     cashier_name         = serializers.SerializerMethodField()
     warehouse_name       = serializers.SerializerMethodField()
     payment_method_name  = serializers.SerializerMethodField()
+    voided_by_name       = serializers.CharField(source='voided_by.display_name', read_only=True, allow_null=True)
 
     class Meta:
         model = Invoice
@@ -629,6 +630,7 @@ class InvoiceReadSerializer(serializers.ModelSerializer):
             'discount', 'tax', 'additional_charges', 'grand_total',
             'cashier_id', 'cashier_name',
             'warehouse_id', 'warehouse_name',
+            'is_voided', 'voided_at', 'voided_by_name',
             'items',
         ]
 
@@ -1113,6 +1115,7 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
     warehouse_name       = serializers.CharField(source='warehouse.name', read_only=True, allow_null=True)
     balance_due          = serializers.SerializerMethodField()
     invoice_image_url    = serializers.SerializerMethodField()
+    voided_by_name       = serializers.CharField(source='voided_by.display_name', read_only=True, allow_null=True)
 
     class Meta:
         model = PurchaseInvoice
@@ -1122,6 +1125,7 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
             'warehouse', 'warehouse_name',
             'purchase_date', 'due_date', 'status', 'total_amount', 'amount_paid',
             'balance_due', 'notes', 'invoice_image_url', 'created_at',
+            'is_voided', 'voided_at', 'voided_by_name',
         ]
 
     def get_balance_due(self, obj):
