@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from django.db import transaction
 from django.db.models import Sum
+from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -99,7 +100,8 @@ class RecipeListCreateView(APIView):
 
 class RecipeDetailView(APIView):
     def _get(self, pk):
-        return ProductionRecipe.objects.prefetch_related('ingredients').get(pk=pk)
+        return get_object_or_404(
+            ProductionRecipe.objects.prefetch_related('ingredients'), pk=pk)
 
     def get(self, request, pk):
         return Response(ProductionRecipeSerializer(self._get(pk)).data)
@@ -118,7 +120,8 @@ class RecipeDetailView(APIView):
 class RecipeCostView(APIView):
     """GET live cost breakdown for a saved recipe. ?warehouse_id= optional."""
     def get(self, request, pk):
-        recipe = ProductionRecipe.objects.prefetch_related('ingredients').get(pk=pk)
+        recipe = get_object_or_404(
+            ProductionRecipe.objects.prefetch_related('ingredients'), pk=pk)
         wh = request.GET.get('warehouse_id') or None
         lines = [{'item_id': i.item_id, 'quantity': i.quantity, 'unit': i.unit}
                  for i in recipe.ingredients.all()]

@@ -29,8 +29,12 @@ ALLOWED_ORDERINGS = {
 
 
 def refresh_crm_profile(patient):
-    """Recompute and persist the CRM stats for a single Patient instance."""
-    agg = Invoice.objects.filter(patient_no=patient).aggregate(
+    """Recompute and persist the CRM stats for a single Patient instance.
+
+    Voided invoices are excluded — they represent reversed sales and should not
+    count toward spend, visit count, or last-visit date.
+    """
+    agg = Invoice.objects.filter(patient_no=patient, is_voided=False).aggregate(
         total_spend=Sum('grand_total'),
         total_visits=Count('id'),
         last_visit=Max('datetime'),
