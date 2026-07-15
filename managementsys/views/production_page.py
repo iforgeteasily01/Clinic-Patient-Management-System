@@ -1,8 +1,12 @@
+import io
 from datetime import date
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment
 from django.db import transaction
 from django.db.models import Sum
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.response import Response
@@ -18,6 +22,9 @@ from managementsys.api.serializers import (
 from managementsys.views.inventory_page import (  # reuse, do not copy
     _to_small, _actor, _fifo_deduct, _fifo_deduct_global,
 )
+
+_HEADER_FONT = Font(bold=True, color='FFFFFF')
+_HEADER_FILL = PatternFill('solid', fgColor='0284C7')
 
 
 def unit_cost_small(item_id, warehouse_id=None) -> Decimal:
@@ -137,6 +144,279 @@ class RecipeCostView(APIView):
             'total_cost': str(total),
             'cost_per_output_unit': str(per_unit),
         })
+
+
+# ── Recipe Excel import/export ────────────────────────────────────────────────
+# Flat layout: one row per ingredient. Recipe-level columns (name/output/notes/
+# active) only need to be filled on the first row of each recipe's block —
+# blank cells on later rows inherit the most recent non-blank value.
+
+_RECIPE_HEADERS = [
+    'recipe_name', 'output_item_code', 'output_quantity', 'notes', 'is_active',
+    'ingredient_item_code', 'ingredient_quantity', 'ingredient_unit',
+]
+_RECIPE_COL_WIDTHS = [22, 18, 16, 30, 10, 20, 20, 16]
+
+
+def _style_recipe_header(ws):
+    ws.append(_RECIPE_HEADERS)
+    for cell in ws[1]:
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = Alignment(horizontal='center')
+    for i, width in enumerate(_RECIPE_COL_WIDTHS, start=1):
+        ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+
+
+def _xlsx_response(wb, filename):
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    response = HttpResponse(
+        buf.read(),
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
+
+
+class RecipeExportView(APIView):
+    """GET — download all recipes (with ingredients) as an .xlsx file."""
+
+    def get(self, request):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Recipes'
+        _style_recipe_header(ws)
+
+        recipes = ProductionRecipe.objects.prefetch_related('ingredients__item').all()
+        for recipe in recipes:
+            ingredients = list(recipe.ingredients.all())
+            if not ingredients:
+                ws.append([recipe.name, recipe.output_item.code, str(recipe.output_quantity),
+                          recipe.notes, 'yes' if recipe.is_active else 'no', '', '', ''])
+                continue
+            for idx, ing in enumerate(ingredients):
+                ws.append([
+                    recipe.name if idx == 0 else '',
+                    recipe.output_item.code if idx == 0 else '',
+                    str(recipe.output_quantity) if idx == 0 else '',
+                    recipe.notes if idx == 0 else '',
+                    ('yes' if recipe.is_active else 'no') if idx == 0 else '',
+                    ing.item.code, str(ing.quantity), ing.unit,
+                ])
+
+        return _xlsx_response(wb, 'production_recipes.xlsx')
+
+
+class RecipeTemplateView(APIView):
+    """GET — download a blank sample .xlsx showing the expected import format."""
+
+    def get(self, request):
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = 'Recipes'
+        _style_recipe_header(ws)
+
+        notes = [
+            'Recipe name (required, first row of each block)',
+            'Output item code (required, first row of each block)',
+            'Output quantity in smallest unit (required, first row of each block)',
+            'Notes (optional)',
+            'yes / no (optional, default yes)',
+            'Ingredient item code (required, one per row)',
+            'Ingredient quantity (required)',
+            'small / medium / large (optional, default small)',
+        ]
+        ws.append(notes)
+        note_font = Font(italic=True, color='595959')
+        for cell in ws[2]:
+            cell.font = note_font
+            cell.alignment = Alignment(wrap_text=True)
+        ws.row_dimensions[2].height = 48
+
+        samples = [
+            ('Basic Facial Serum', 'ITEM-001', 100, 'Standard batch', 'yes', 'ITEM-010', 60, 'small'),
+            ('', '', '', '', '', 'ITEM-011', 40, 'small'),
+            ('Whitening Cream 50g', 'ITEM-002', 50, '', 'yes', 'ITEM-012', 1, 'medium'),
+        ]
+        for row in samples:
+            ws.append(list(row))
+
+        return _xlsx_response(wb, 'production_recipes_sample.xlsx')
+
+
+def _parse_bool(value, default=True):
+    if value in (None, ''):
+        return default
+    s = str(value).strip().lower()
+    return s in ('yes', 'true', '1', 'y')
+
+
+class RecipeImportView(APIView):
+    """
+    POST multipart/form-data with file=<xlsx>
+    Columns (row 1 = header, row 2 may be a notes row, skipped as data only if
+    it fails to parse as a valid ingredient line):
+      recipe_name | output_item_code | output_quantity | notes | is_active |
+      ingredient_item_code | ingredient_quantity | ingredient_unit
+    One row per ingredient. Recipe-level columns only need to be present on the
+    first row of each recipe's block. Recipes matched by name are updated
+    (ingredients replaced wholesale); unmatched names create a new recipe.
+    Returns { created, updated, errors: [{row, message}] }
+    """
+
+    def post(self, request):
+        uploaded = request.FILES.get('file')
+        if not uploaded:
+            return Response({'error': 'No file uploaded.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            wb = openpyxl.load_workbook(io.BytesIO(uploaded.read()), read_only=True, data_only=True)
+        except Exception:
+            return Response({'error': 'Could not parse file. Upload a valid .xlsx file.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if not rows:
+            return Response({'error': 'File is empty.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        errors = []
+        groups = {}
+        order = []
+        last_name = None
+
+        for i, row in enumerate(rows[1:], start=2):
+            padded = (list(row) + [None] * 8)[:8]
+            if all(v in (None, '') for v in padded):
+                continue  # fully blank row — skip silently
+
+            name = str(padded[0]).strip() if padded[0] not in (None, '') else ''
+            if not name:
+                name = last_name
+            else:
+                last_name = name
+
+            ing_code = str(padded[5]).strip() if padded[5] not in (None, '') else ''
+            ing_qty_raw = padded[6]
+            ing_unit = str(padded[7]).strip().lower() if padded[7] not in (None, '') else 'small'
+
+            if not name:
+                errors.append({'row': i, 'message': 'recipe_name is required.'})
+                continue
+
+            grp = groups.get(name)
+            if grp is None:
+                grp = {'output_code': None, 'output_qty': None, 'notes': '',
+                      'is_active': True, 'lines': [], 'first_row': i}
+                groups[name] = grp
+                order.append(name)
+
+            out_code = str(padded[1]).strip() if padded[1] not in (None, '') else ''
+            if out_code:
+                grp['output_code'] = out_code
+            if padded[2] not in (None, ''):
+                grp['output_qty'] = padded[2]
+            if padded[3] not in (None, ''):
+                grp['notes'] = str(padded[3]).strip()
+            if padded[4] not in (None, ''):
+                grp['is_active'] = _parse_bool(padded[4])
+
+            if not ing_code:
+                errors.append({'row': i, 'message': 'ingredient_item_code is required.'})
+                continue
+            if ing_unit not in ('small', 'medium', 'large'):
+                errors.append({'row': i, 'message': f'Invalid ingredient_unit "{ing_unit}".'})
+                continue
+            try:
+                qty_dec = Decimal(str(ing_qty_raw))
+                if qty_dec <= 0:
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError, TypeError):
+                errors.append({'row': i, 'message': 'ingredient_quantity must be a positive number.'})
+                continue
+
+            grp['lines'].append({'row': i, 'code': ing_code, 'qty': qty_dec, 'unit': ing_unit})
+
+        created = updated = 0
+
+        for name in order:
+            grp = groups[name]
+            row0 = grp['first_row']
+
+            if not grp['output_code']:
+                errors.append({'row': row0, 'message': f'"{name}": output_item_code is required.'})
+                continue
+            try:
+                output_item = InventoryItem.objects.get(code=grp['output_code'])
+            except InventoryItem.DoesNotExist:
+                errors.append({'row': row0,
+                              'message': f'"{name}": output item code "{grp["output_code"]}" not found.'})
+                continue
+
+            try:
+                out_qty_dec = Decimal(str(grp['output_qty'])) if grp['output_qty'] not in (None, '') else None
+                if not out_qty_dec or out_qty_dec <= 0:
+                    raise InvalidOperation
+            except (InvalidOperation, ValueError, TypeError):
+                errors.append({'row': row0, 'message': f'"{name}": output_quantity must be a positive number.'})
+                continue
+
+            if not grp['lines']:
+                errors.append({'row': row0, 'message': f'"{name}": no valid ingredient rows.'})
+                continue
+
+            resolved_lines = []
+            seen_items = set()
+            group_ok = True
+            for ln in grp['lines']:
+                try:
+                    item = InventoryItem.objects.get(code=ln['code'])
+                except InventoryItem.DoesNotExist:
+                    errors.append({'row': ln['row'], 'message': f'Ingredient item code "{ln["code"]}" not found.'})
+                    group_ok = False
+                    continue
+                if item.id in seen_items:
+                    errors.append({'row': ln['row'],
+                                  'message': f'Duplicate ingredient "{ln["code"]}" in recipe "{name}".'})
+                    group_ok = False
+                    continue
+                seen_items.add(item.id)
+                resolved_lines.append({'item': item, 'quantity': ln['qty'], 'unit': ln['unit']})
+
+            if not group_ok or not resolved_lines:
+                continue
+
+            with transaction.atomic():
+                recipe = ProductionRecipe.objects.filter(name=name).first()
+                was_created = recipe is None
+                if recipe is None:
+                    recipe = ProductionRecipe.objects.create(
+                        name=name, output_item=output_item, output_quantity=out_qty_dec,
+                        notes=grp['notes'], is_active=grp['is_active'], created_by=_actor(request))
+                else:
+                    recipe.output_item = output_item
+                    recipe.output_quantity = out_qty_dec
+                    recipe.notes = grp['notes']
+                    recipe.is_active = grp['is_active']
+                    recipe.save()
+                    recipe.ingredients.all().delete()
+                for idx, ln in enumerate(resolved_lines):
+                    ProductionRecipeIngredient.objects.create(
+                        recipe=recipe, item=ln['item'], quantity=ln['quantity'],
+                        unit=ln['unit'], ordering=idx)
+
+            AuditLog.objects.create(
+                performed_by=_actor(request), action='CREATE' if was_created else 'UPDATE',
+                entity_type='ProductionRecipe', entity_id=str(recipe.id),
+                description=f'Recipe {"imported" if was_created else "updated via import"}: {recipe.name}')
+            if was_created:
+                created += 1
+            else:
+                updated += 1
+
+        return Response({'created': created, 'updated': updated, 'errors': errors})
 
 
 # ── Ad-hoc cost preview ──────────────────────────────────────────────────────

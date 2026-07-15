@@ -1175,19 +1175,28 @@ INDO_MONTHS = [
 ]
 
 
-def _payment_plan_queryset(date_from, date_to):
-    """Outstanding (unpaid/partial) purchase invoices whose purchase_date falls
-    in the inclusive range, ordered by due date (nulls last)."""
+def _payment_plan_queryset(date_from, date_to, include_no_due_date=False):
+    """Outstanding (unpaid/partial) purchase invoices whose due_date (jatuh tempo)
+    falls in the inclusive range, ordered by due date (nulls last).
+
+    When include_no_due_date is True, invoices without a due date are always
+    included regardless of the range so that nothing outstanding is missed.
+    """
+    date_filter = Q(due_date__gte=date_from, due_date__lte=date_to)
+    if include_no_due_date:
+        date_filter |= Q(due_date__isnull=True)
     return (
         PurchaseInvoice.objects
         .select_related('supplier')
-        .filter(
-            status__in=['unpaid', 'partial'],
-            purchase_date__gte=date_from,
-            purchase_date__lte=date_to,
-        )
+        .filter(status__in=['unpaid', 'partial'])
+        .filter(date_filter)
         .order_by(F('due_date').asc(nulls_last=True), 'purchase_date', 'id')
     )
+
+
+def _parse_plan_include_no_due_date(request):
+    """Whether outstanding invoices without a due date should be included."""
+    return request.query_params.get('include_no_due_date', '').strip().lower() in ('1', 'true', 'yes')
 
 
 def _parse_plan_range(request):
@@ -1232,18 +1241,20 @@ def _default_plan_title(d_from, d_to):
 class PaymentPlanPreviewView(APIView):
     """
     GET /api/accounting/payment-plan/preview/?date_from=YYYY-MM-DD&date_to=YYYY-MM-DD
-    Lists outstanding purchase invoices (unpaid/partial) in the range for review
-    before generating the Excel file.
+                                             &include_no_due_date=true
+    Lists outstanding purchase invoices (unpaid/partial) whose due date falls in
+    the range for review before generating the Excel file.
     """
 
     def get(self, request):
         d_from, d_to, err = _parse_plan_range(request)
         if err:
             return err
+        include_no_dd = _parse_plan_include_no_due_date(request)
 
         rows = []
         total = Decimal('0')
-        for inv in _payment_plan_queryset(d_from, d_to):
+        for inv in _payment_plan_queryset(d_from, d_to, include_no_dd):
             balance = inv.total_amount - inv.amount_paid
             total += balance
             rows.append({
@@ -1270,7 +1281,9 @@ class PaymentPlanPreviewView(APIView):
 class PaymentPlanExportView(APIView):
     """
     GET /api/accounting/payment-plan/export/?date_from=&date_to=&title=
+                                            &include_no_due_date=true
     Streams an .xlsx file styled to match the clinic's 'Rencana Pembayaran' template.
+    Filters outstanding invoices by due date (jatuh tempo).
     """
 
     def get(self, request):
@@ -1279,6 +1292,7 @@ class PaymentPlanExportView(APIView):
         d_from, d_to, err = _parse_plan_range(request)
         if err:
             return err
+        include_no_dd = _parse_plan_include_no_due_date(request)
 
         title = (request.query_params.get('title', '') or '').strip()
         if not title:
@@ -1336,7 +1350,7 @@ class PaymentPlanExportView(APIView):
         # ── Data rows ──────────────────────────────────────────────────────────
         row = 4
         first_data_row = row
-        for inv in _payment_plan_queryset(d_from, d_to):
+        for inv in _payment_plan_queryset(d_from, d_to, include_no_dd):
             balance = inv.total_amount - inv.amount_paid
 
             a = ws.cell(row=row, column=1, value=inv.external_invoice_no or '')
