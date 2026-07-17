@@ -368,6 +368,22 @@ When a `Treatment` or `TreatmentPackage` is saved, a mirror `InventoryItem` (is_
 
 ### FIFO Inventory
 `InventoryBatch` tracks stock by batch. Stock-out deducts from oldest batch first (ordered by `input_date`).
+Restock (`_fifo_restock`) refills **newest-first**, so reversing and re-posting the same line can shift COGS
+between batches when an item has batches at differing unit costs. Exact reversal would need per-line batch tracking.
+
+### Invoice Edit = Reverse + Re-post
+`PUT/PATCH /api/invoices/<pk>/` replaces line items wholesale (any `item_id`, quantity, price, discount_pct).
+It reverses everything the original posting did — payment, revenue, FIFO stock, COGS, treatment materials,
+package sales/redemptions — then re-applies it for the new lines. Reversals are written as opposite-side
+`LedgerEntry` rows, so both the original and the correction stay in the journal.
+`DELETE` (void) reverses without re-posting.
+
+Two constraints worth knowing:
+- An edit is **refused** (400) when a treatment package sold by the invoice has been redeemed on a *different*
+  invoice — reversing the sale would cascade-delete that redemption.
+- `_post_accounting` and `_reverse_accounting_instances` must stay mirror images. If you add a side effect to
+  one, add it to the other, or edits and voids will silently corrupt balances.
+  Covered by `tests/test_invoice_edit.py` (create → edit → void must return every balance and batch to baseline).
 
 ### Excel Import Pattern (two-phase)
 1. POST file to `import/preview/` → returns rows for user review

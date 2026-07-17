@@ -1,8 +1,10 @@
+import datetime
 from zoneinfo import ZoneInfo
 
 from django.db.models import Count, DecimalField, F, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
+from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -92,4 +94,69 @@ class DashboardReportView(APIView):
                 'low_stock_items': low_stock_items,
             },
             'recent_invoices': recent_data,
+        })
+
+
+class SalesRangeReportView(APIView):
+    """
+    GET /api/reports/sales/?start=YYYY-MM-DD&end=YYYY-MM-DD
+    Total sales and breakdown per cash (payment) account over an inclusive date
+    range. Defaults to the current month-to-date in Jakarta time.
+    """
+
+    def get(self, request):
+        today = timezone.now().astimezone(_JAKARTA).date()
+
+        def parse(param, default):
+            raw = request.query_params.get(param, '').strip()
+            if not raw:
+                return default, None
+            try:
+                return datetime.date.fromisoformat(raw), None
+            except ValueError:
+                return None, f'Tanggal {param} tidak valid. Gunakan format YYYY-MM-DD.'
+
+        start, err = parse('start', today.replace(day=1))
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+        end, err = parse('end', today)
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+
+        if start > end:
+            return Response(
+                {'error': 'Tanggal mulai tidak boleh setelah tanggal akhir.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # `datetime` is stored in UTC; bound the range by Jakarta-local midnights
+        # so a day belongs to the range the clinic actually worked it.
+        range_start = datetime.datetime(start.year, start.month, start.day, tzinfo=_JAKARTA)
+        range_end = datetime.datetime(end.year, end.month, end.day, tzinfo=_JAKARTA) + datetime.timedelta(days=1)
+
+        invoices = Invoice.objects.filter(datetime__gte=range_start, datetime__lt=range_end)
+        agg = invoices.aggregate(total=Sum('grand_total'), count=Count('id'))
+
+        breakdown = (
+            invoices
+            .values('payment_method_id', 'payment_method__name', 'payment_method__account_number')
+            .annotate(total=Sum('grand_total'), invoice_count=Count('id'))
+            .order_by('-total')
+        )
+
+        return Response({
+            'start': str(start),
+            'end': str(end),
+            'total': str(agg['total'] or 0),
+            'invoice_count': agg['count'] or 0,
+            'by_account': [
+                {
+                    'account_id': r['payment_method_id'],
+                    'account_number': r['payment_method__account_number'],
+                    'account_name': r['payment_method__name'] or 'Tidak Diketahui',
+                    'total': str(r['total'] or 0),
+                    'invoice_count': r['invoice_count'],
+                }
+                for r in breakdown
+            ],
         })

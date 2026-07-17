@@ -40,13 +40,19 @@ from .admin_views import (
     SiteConfigView,
     ColorPaletteListCreateView, ColorPaletteDetailView,
 )
+from .appointments_scheduled import (
+    ScheduledAppointmentListCreateView,
+    ScheduledAppointmentDetailView,
+    AppointmentCheckInView,
+    AppointmentLocationListView,
+)
 from .package_page import PatientPackagesView
 from .medical_record_page import MedRecByPatientNoView
 from .photo_page import PatientPhotoUploadView, PatientPhotoListView
 from .medical_record_history import MedRecHistoryListView, MedRecHistoryDetailView
 from .medical_record_draft import MedRecDraftCreateView, MedRecUpdateView, MedRecFinalizeView, MedRecPendingDraftsView
 from .invoice_page import InvoiceCreateView, InvoiceListView, InvoiceDetailView, InvoiceExportView, InvoiceImportView
-from .reports_page import DashboardReportView
+from .reports_page import DashboardReportView, SalesRangeReportView
 from .patient_notes_page import PatientNoteListCreateView, PatientNoteDetailView
 from .assessment_codes_page import (
     AssessmentCodeListCreateView,

@@ -671,8 +671,37 @@ def _fifo_restock(item_id: int, warehouse_id: int, quantity: Decimal) -> Decimal
         .filter(item_id=item_id, warehouse_id=warehouse_id)
         .order_by('-input_date', '-created_at')
     )
+    return _restock_batches(batches, quantity)
+
+
+@transaction.atomic
+def _fifo_restock_global(item_id: int, quantity: Decimal) -> Decimal:
+    """
+    Return a decimal quantity (in unit_small) to any warehouse, newest-first.
+    Mirror of _fifo_deduct_global. Returns the COGS amount reversed.
+    """
+    batches = (
+        InventoryBatch.objects
+        .select_for_update()
+        .filter(item_id=item_id)
+        .order_by('-input_date', '-created_at')
+    )
+    return _restock_batches(batches, quantity)
+
+
+def _restock_batches(batches, quantity: Decimal) -> Decimal:
+    """
+    Refill batches newest-first, capped at each batch's original quantity.
+
+    Note: deduction is oldest-first while restock is newest-first, so a
+    reverse-then-repost of the same line can shift COGS between batches when
+    an item has batches at differing unit costs. Exact reversal would require
+    recording which batches each line consumed.
+    """
     remaining = Decimal(quantity)
     cogs = Decimal('0')
+    if remaining <= 0:
+        return cogs
     for batch in batches:
         if remaining <= 0:
             break

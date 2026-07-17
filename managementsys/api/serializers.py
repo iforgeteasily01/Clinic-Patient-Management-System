@@ -1,9 +1,12 @@
 from decimal import Decimal
 
+from django.utils import timezone
 from rest_framework import serializers
 
 from ..models import (
-    AccountTransfer, ActivePatient, AppUser, AssessmentCode, AttendanceRecord, Beauticians,
+    JAKARTA_TZ,
+    AccountTransfer, ActivePatient, Appointment, AppointmentLocation, AppUser,
+    AssessmentCode, AttendanceRecord, Beauticians,
     ChartOfAccounts, ColorPalette, Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
     IssueTicket, IssueTicketImage, LedgerEntry, MedRec, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
@@ -34,6 +37,7 @@ class ActivePatientSerializer(serializers.ModelSerializer):
     current_beautician_id = serializers.SerializerMethodField()
     treatment_session_ids = serializers.SerializerMethodField()
     current_treatments = serializers.SerializerMethodField()
+    medrec_code = serializers.SerializerMethodField()
     soap_treatment = serializers.SerializerMethodField()
 
     class Meta:
@@ -43,6 +47,7 @@ class ActivePatientSerializer(serializers.ModelSerializer):
             "status", "consult_status", "visit_time",
             "current_beautician_name", "current_beautician_id",
             "medrec_id",
+            "medrec_code",
             "treatment_session_ids",
             "current_treatments",
             "soap_treatment",
@@ -78,6 +83,13 @@ class ActivePatientSerializer(serializers.ModelSerializer):
             for t in session.treatments.all():
                 result.append({'id': t.id, 'name': t.name, 'price': str(t.price), 'session_id': session.id})
         return result
+
+    def get_medrec_code(self, obj):
+        # medrec_id above is the MedRec table's integer PK; this is the
+        # MR-... code the medical-record endpoints look records up by.
+        if obj.medrec_id:
+            return obj.medrec.medrec_id
+        return None
 
     def get_soap_treatment(self, obj):
         if obj.medrec_id and obj.medrec and obj.medrec.treatment:
@@ -1168,3 +1180,108 @@ class ColorPaletteSerializer(serializers.ModelSerializer):
     class Meta:
         model = ColorPalette
         fields = ['id', 'name', 'primary_color', 'secondary_color', 'background_color', 'is_dark', 'sort_order']
+
+
+class AppointmentLocationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AppointmentLocation
+        fields = ['id', 'name', 'room_code', 'is_active']
+
+
+class AppointmentSerializer(serializers.ModelSerializer):
+    # settings.TIME_ZONE is UTC, so these would render as 'Z' by default.
+    # default_timezone pins both directions to Jakarta: output carries +07:00
+    # (what SatuSehat expects and what the clinic reads), and a naive input is
+    # read as clinic-local rather than UTC. An explicit offset on input is
+    # always honoured as-is.
+    start_at = serializers.DateTimeField(default_timezone=JAKARTA_TZ)
+    end_at = serializers.DateTimeField(
+        default_timezone=JAKARTA_TZ, required=False, allow_null=True)
+    created_at = serializers.DateTimeField(
+        default_timezone=JAKARTA_TZ, read_only=True)
+    updated_at = serializers.DateTimeField(
+        default_timezone=JAKARTA_TZ, read_only=True)
+
+    patient_name = serializers.CharField(
+        source='patient.name', read_only=True, allow_null=True)
+    patient_nik = serializers.CharField(
+        source='patient.NIK', read_only=True, allow_null=True)
+    practitioner_name = serializers.CharField(
+        source='practitioner.doctor_name', read_only=True, allow_null=True)
+    location_name = serializers.CharField(
+        source='location.name', read_only=True, allow_null=True)
+    display_name = serializers.CharField(read_only=True)
+    satusehat_readiness = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Appointment
+        fields = [
+            'id', 'appointment_no',
+            'patient', 'patient_name', 'patient_nik', 'guest_name', 'display_name',
+            'practitioner', 'practitioner_name',
+            'location', 'location_name',
+            'service_category', 'service_type', 'appointment_type', 'reason',
+            'start_at', 'end_at', 'status', 'note',
+            'created_at', 'updated_at',
+            'linked_active_patient',
+            'sync_status', 'synced_at', 'ihs_appointment_id',
+            'satusehat_readiness',
+        ]
+        read_only_fields = [
+            'appointment_no', 'linked_active_patient',
+            'sync_status', 'synced_at', 'ihs_appointment_id',
+        ]
+
+    def get_satusehat_readiness(self, obj):
+        """
+        Which references a future FHIR push would still be missing. Informational
+        only — nothing here blocks a booking, and no SatuSehat call is made.
+        """
+        gaps = []
+        if not obj.patient_id:
+            gaps.append('guest booking — no patient record')
+        elif not (obj.patient.NIK or '').strip():
+            gaps.append('patient has no NIK')
+        if not obj.practitioner_id:
+            gaps.append('no practitioner')
+        elif not (obj.practitioner.nik or '').strip():
+            gaps.append('practitioner has no NIK')
+        if not obj.location_id:
+            gaps.append('no location')
+        return {'ready': not gaps, 'gaps': gaps}
+
+    def validate(self, attrs):
+        def resolved(field):
+            if field in attrs:
+                return attrs[field]
+            return getattr(self.instance, field, None)
+
+        errors = {}
+        is_create = self.instance is None
+
+        patient = resolved('patient')
+        guest_name = (resolved('guest_name') or '').strip()
+        if not patient and not guest_name:
+            # Mirrors GeneralAppointmentCreateView: a booking is either against a
+            # patient record or a named guest.
+            errors['guest_name'] = 'Provide a patient or a guest name.'
+
+        start_at = resolved('start_at')
+        end_at = resolved('end_at')
+        status_value = resolved('status') or 'booked'
+
+        if start_at and end_at and end_at <= start_at:
+            errors['end_at'] = 'End time must be after the start time.'
+
+        if status_value == 'booked' and not end_at:
+            # FHIR invariant app-2/app-3: a booked slot must carry start and end.
+            # Enforced here so the record is pushable the moment sync is switched on.
+            errors['end_at'] = 'A booked appointment requires an end time.'
+
+        # Only on create — edits may legitimately correct a past appointment.
+        if is_create and start_at and start_at <= timezone.now():
+            errors['start_at'] = 'Start time must be in the future.'
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs

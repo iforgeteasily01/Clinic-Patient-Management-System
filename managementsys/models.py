@@ -1,10 +1,15 @@
 import secrets
 from datetime import date
+from zoneinfo import ZoneInfo
 
 from django.contrib.auth.hashers import check_password, make_password
 from django.db import models
 from django.db.models import Max, Min, Avg, Sum, Count
 from django.utils import timezone
+
+# settings.TIME_ZONE is UTC, so anything that must read as clinic-local time
+# converts explicitly. Same convention as views/reports_page.py.
+JAKARTA_TZ = ZoneInfo('Asia/Jakarta')
 
 
 class Patient(models.Model):
@@ -14,6 +19,8 @@ class Patient(models.Model):
     address = models.CharField(max_length=100, null=True, blank=True)
     phone_number = models.CharField(max_length=15, null=True, blank=True)
     NIK = models.CharField(max_length=16, null=True, blank=True)
+    # Resolved from the SatuSehat Master Patient Index (by NIK). Unused until the sync phase.
+    ihs_id = models.CharField(max_length=64, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -69,6 +76,10 @@ class ActivePatient(models.Model):
 
 class Doctors(models.Model):
     doctor_name = models.CharField(max_length=50)
+    # NIK resolves the clinician against the SatuSehat Master Nakes Index, which
+    # returns the ihs_id. Both unused until the sync phase.
+    nik = models.CharField(max_length=16, null=True, blank=True)
+    ihs_id = models.CharField(max_length=64, null=True, blank=True)
 
     def __str__(self):
         return self.doctor_name
@@ -1384,6 +1395,136 @@ class PencacahanRecord(models.Model):
         )
         n = int(last.split('-')[-1]) + 1 if last else 1
         return f'{prefix}{n}'
+
+
+# Scheduled appointments (SatuSehat / FHIR R4 Appointment)
+
+
+class AppointmentLocation(models.Model):
+    """A bookable room. Maps to FHIR Location."""
+    name = models.CharField(max_length=100)
+    room_code = models.CharField(max_length=30, blank=True)
+    is_active = models.BooleanField(default=True)
+    # Assigned when the room is registered as a Location in SatuSehat. Sync phase only.
+    ihs_id = models.CharField(max_length=64, null=True, blank=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
+
+
+class Appointment(models.Model):
+    """
+    A future-dated booking. Distinct from ActivePatient, which is the walk-in
+    queue for today. Checking an Appointment in creates an ActivePatient and
+    links it here, which is the only point the two flows touch.
+
+    Field names and the status enum mirror FHIR R4 Appointment so the sync phase
+    is a mapping walk with no schema change. See
+    docs/satusehat-appointment-page-design.md section 7.
+    """
+
+    # FHIR R4 appointment status value set, verbatim. Only booked/arrived/
+    # fulfilled/cancelled/noshow are reachable from the UI today; the rest are
+    # carried so a future sync never hits an unmappable value.
+    STATUS_CHOICES = [
+        ('proposed', 'Proposed'),
+        ('pending', 'Pending'),
+        ('booked', 'Booked'),
+        ('arrived', 'Arrived'),
+        ('checked-in', 'Checked In'),
+        ('fulfilled', 'Fulfilled'),
+        ('cancelled', 'Cancelled'),
+        ('noshow', 'No Show'),
+        ('waitlist', 'Waitlist'),
+        ('entered-in-error', 'Entered In Error'),
+    ]
+
+    APPOINTMENT_TYPE_CHOICES = [
+        ('routine', 'Routine'),
+        ('follow_up', 'Follow Up'),
+        ('walk_in', 'Walk In'),
+    ]
+
+    SYNC_STATUS_CHOICES = [
+        ('not_synced', 'Not Synced'),
+        ('synced', 'Synced'),
+        ('error', 'Error'),
+    ]
+
+    appointment_no = models.CharField(max_length=20, unique=True, blank=True)
+    patient = models.ForeignKey(
+        Patient, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='appointments',
+    )
+    guest_name = models.CharField(max_length=100, null=True, blank=True)
+    practitioner = models.ForeignKey(
+        Doctors, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='appointments',
+    )
+    location = models.ForeignKey(
+        AppointmentLocation, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='appointments',
+    )
+    service_category = models.CharField(max_length=100, blank=True)
+    service_type = models.CharField(max_length=100, blank=True)
+    appointment_type = models.CharField(
+        max_length=20, choices=APPOINTMENT_TYPE_CHOICES, blank=True)
+    reason = models.TextField(blank=True)
+    start_at = models.DateTimeField()
+    end_at = models.DateTimeField(null=True, blank=True)
+    status = models.CharField(
+        max_length=20, choices=STATUS_CHOICES, default='booked')
+    note = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    linked_active_patient = models.ForeignKey(
+        ActivePatient, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='scheduled_appointments',
+    )
+
+    # Sync-reserved. Written by the Phase E sync service; untouched today.
+    ihs_appointment_id = models.CharField(max_length=64, null=True, blank=True)
+    synced_at = models.DateTimeField(null=True, blank=True)
+    sync_status = models.CharField(
+        max_length=20, choices=SYNC_STATUS_CHOICES, default='not_synced')
+    sync_error = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ['start_at']
+        indexes = [models.Index(fields=['start_at', 'status'])]
+
+    def __str__(self):
+        return f'{self.appointment_no}: {self.display_name}'
+
+    @property
+    def display_name(self):
+        if self.patient_id:
+            return self.patient.name
+        return self.guest_name or 'Guest'
+
+    @classmethod
+    def next_number(cls, year):
+        prefix = f'APT-{year}-'
+        last = (
+            cls.objects.filter(appointment_no__startswith=prefix)
+            .order_by('appointment_no')
+            .values_list('appointment_no', flat=True)
+            .last()
+        )
+        n = int(last.split('-')[-1]) + 1 if last else 1
+        return f'{prefix}{n:06d}'
+
+    def save(self, *args, **kwargs):
+        if not self.appointment_no:
+            # Number by the Jakarta-local year: an appointment booked at 08:00 on
+            # 1 Jan WIB is still 31 Dec in UTC, and should not get last year's prefix.
+            year = timezone.localtime(
+                self.start_at or timezone.now(), JAKARTA_TZ).year
+            self.appointment_no = Appointment.next_number(year)
+        super().save(*args, **kwargs)
 
 
 #####

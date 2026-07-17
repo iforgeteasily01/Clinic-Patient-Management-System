@@ -45,6 +45,12 @@ urlpatterns = [
     path("api/patients/new/", views.PatientCreateWithActiveView.as_view(), name="patient-create-active"),
     path("api/appointments/add/", views.AppointmentAddView.as_view(), name="appointment-add"),
     path("api/appointments/general/", views.GeneralAppointmentCreateView.as_view(), name="appointment-general"),
+
+    # Scheduled appointments (SatuSehat-ready bookings) — separate from the walk-in queue above
+    path("api/scheduled-appointments/", views.ScheduledAppointmentListCreateView.as_view(), name="scheduled-appointments"),
+    path("api/scheduled-appointments/<int:pk>/", views.ScheduledAppointmentDetailView.as_view(), name="scheduled-appointment-detail"),
+    path("api/scheduled-appointments/<int:pk>/check-in/", views.AppointmentCheckInView.as_view(), name="scheduled-appointment-check-in"),
+    path("api/appointment-locations/", views.AppointmentLocationListView.as_view(), name="appointment-locations"),
     path("activepatient/", views.ActPatListCreate.as_view(), name = "ActPat-view-create"),
     path("doctors/", views.DoctorsListCreate.as_view(), name = "doctors-list"),
     path("beauticians/", views.BeauticiansListCreate.as_view(), name = "beauticians-list"),
@@ -131,6 +137,7 @@ urlpatterns = [
 
     # Reports
     path('api/reports/dashboard/', views.DashboardReportView.as_view(), name='reports-dashboard'),
+    path('api/reports/sales/', views.SalesRangeReportView.as_view(), name='reports-sales'),
 
     # Patient Notes
     path('api/patient-notes/', views.PatientNoteListCreateView.as_view(), name='patient-notes'),

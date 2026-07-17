@@ -19,7 +19,7 @@ from ..models import (
     Treatment, TreatmentPackage, Warehouse,
 )
 from .crm_page import refresh_crm_profile
-from .inventory_page import _fifo_deduct, _fifo_deduct_global, _fifo_restock
+from .inventory_page import _fifo_deduct, _fifo_deduct_global, _fifo_restock, _fifo_restock_global
 from .promotion_page import validate_promotion
 
 logger = logging.getLogger(__name__)
@@ -197,6 +197,34 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
                             _le(cogs_acct, 'credit', cogs_amount, invoice,
                                 f'Invoice {inv_no} – COGS correction: {item.name}')
 
+        # Mirror of the material deduction _post_accounting does for services.
+        if item.is_service:
+            treatment = getattr(item, 'treatment', None)
+            if treatment:
+                restock_fn = (
+                    (lambda mid, qty: _fifo_restock(mid, warehouse_id, qty))
+                    if warehouse_id
+                    else (lambda mid, qty: _fifo_restock_global(mid, qty))
+                )
+                for material in treatment.materials.all():
+                    mat_cogs = restock_fn(material.item_id, material.quantity_small)
+                    if mat_cogs <= 0:
+                        continue
+                    if inventory_asset:
+                        ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
+                            balance=F('balance') + mat_cogs
+                        )
+                        if invoice:
+                            _le(inventory_asset, 'debit', mat_cogs, invoice,
+                                f'Invoice {inv_no} – material restock: {material.item.name} for {item.name}')
+                    if cogs_acct:
+                        ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
+                            balance=F('balance') - mat_cogs
+                        )
+                        if invoice:
+                            _le(cogs_acct, 'credit', mat_cogs, invoice,
+                                f'Invoice {inv_no} – material COGS correction: {material.item.name} for {item.name}')
+
 
 def _handle_packages(invoice, patient, line_items, items_by_id):
     """Process package sales and redemptions for a saved invoice.
@@ -261,6 +289,38 @@ def _handle_packages(invoice, patient, line_items, items_by_id):
             PatientPackage.objects.get(pk=pp_id).refresh_status()
         except PatientPackage.DoesNotExist:
             pass
+
+
+def _foreign_redemptions_exist(invoice):
+    """
+    True when a package sold by this invoice has been redeemed on a *different*
+    invoice. Reversing the sale would cascade-delete those redemptions, so the
+    edit is refused instead.
+    """
+    return (
+        PatientPackageRedemption.objects
+        .filter(patient_package__purchased_invoice=invoice)
+        .exclude(invoice=invoice)
+        .exists()
+    )
+
+
+def _reverse_packages(invoice):
+    """
+    Undo the package sales and redemptions _handle_packages made for this
+    invoice, so they can be re-applied against the edited lines.
+    Caller must have checked _foreign_redemptions_exist first.
+    """
+    touched = set(
+        PatientPackageRedemption.objects
+        .filter(invoice=invoice)
+        .values_list('patient_package_id', flat=True)
+    )
+    PatientPackageRedemption.objects.filter(invoice=invoice).delete()
+    PatientPackage.objects.filter(purchased_invoice=invoice).delete()
+
+    for pp in PatientPackage.objects.filter(pk__in=touched):
+        pp.refresh_status()
 
 
 class InvoiceCreateView(APIView):
@@ -515,16 +575,48 @@ class InvoiceDetailView(APIView):
         data = serializer.validated_data
         changes = []
 
+        # ── Resolve and validate the new lines before touching anything ───────
+        # Everything below this point mutates; a 400 returned after a write
+        # would still commit, since only an exception rolls the atomic block back.
+
+        replacing_items = 'items' in data
+        new_items_by_id: dict = {}
+
+        if replacing_items:
+            item_ids = [i['item_id'] for i in data['items'] if i.get('item_id')]
+            new_items_by_id = {
+                obj.id: obj
+                for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
+                    'item_category__revenue_account',
+                    'item_category__cogs_account',
+                ).prefetch_related('treatment__materials__item')
+            }
+            missing = [iid for iid in item_ids if iid not in new_items_by_id]
+            if missing:
+                return Response({'items': f'Item IDs not found: {missing}'}, status=status.HTTP_400_BAD_REQUEST)
+
+            # Replacing the lines reverses this invoice's package sales. If another
+            # invoice already redeemed against one, reversing would destroy it.
+            if _foreign_redemptions_exist(invoice):
+                return Response(
+                    {'items': 'Cannot edit items: a treatment package sold by this '
+                              'invoice has already been redeemed on another invoice. '
+                              'Void the redeeming invoice first.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         # ── Capture old state before any modifications ────────────────────────
         old_grand_total       = invoice.grand_total
         old_payment_method_id = invoice.payment_method_id
         old_warehouse_id      = invoice.warehouse_id
+        old_patient           = invoice.patient_no
         old_item_instances    = list(
             invoice.items
             .select_related(
                 'item__item_category__revenue_account',
                 'item__item_category__cogs_account',
             )
+            .prefetch_related('item__treatment__materials__item')
             .all()
         )
 
@@ -594,21 +686,8 @@ class InvoiceDetailView(APIView):
         # ── Line items (replace-all strategy) ────────────────────────────────
 
         new_line_items_data = None  # None = items unchanged
-        new_items_by_id: dict = {}
 
-        if 'items' in data:
-            item_ids = [i['item_id'] for i in data['items'] if i.get('item_id')]
-            new_items_by_id = {
-                obj.id: obj
-                for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
-                    'item_category__revenue_account',
-                    'item_category__cogs_account',
-                )
-            }
-            missing = [iid for iid in item_ids if iid not in new_items_by_id]
-            if missing:
-                return Response({'items': f'Item IDs not found: {missing}'}, status=status.HTTP_400_BAD_REQUEST)
-
+        if replacing_items:
             invoice.items.all().delete()
             InvoiceItem.objects.bulk_create([
                 InvoiceItem(
@@ -617,6 +696,7 @@ class InvoiceDetailView(APIView):
                     item_name=i.get('item_name', '') if not i.get('item_id') else '',
                     quantity=i['quantity'],
                     price=i['price'],
+                    discount_pct=i.get('discount_pct', 0),
                 )
                 for i in data['items']
             ])
@@ -631,7 +711,9 @@ class InvoiceDetailView(APIView):
         )
 
         if new_line_items_data is not None:
+            _reverse_packages(invoice)
             _post_accounting(invoice, new_line_items_data, new_items_by_id)
+            _handle_packages(invoice, invoice.patient_no, new_line_items_data, new_items_by_id)
         else:
             # Items unchanged — re-apply using old instances converted to dict format
             old_lines_as_dicts = [
@@ -652,6 +734,12 @@ class InvoiceDetailView(APIView):
             entity_id=str(invoice.id),
             description=f'Invoice {invoice.invoice_number} updated — fields changed: {", ".join(changes)}',
         )
+
+        # ── CRM refresh ───────────────────────────────────────────────────────
+        # Both patients when the invoice moved between them.
+        for p in {old_patient, invoice.patient_no}:
+            if p is not None:
+                refresh_crm_profile(p)
 
         invoice.refresh_from_db()
         return Response(InvoiceReadSerializer(
@@ -679,6 +767,7 @@ class InvoiceDetailView(APIView):
                 'item__item_category__revenue_account',
                 'item__item_category__cogs_account',
             )
+            .prefetch_related('item__treatment__materials__item')
             .all()
         )
 
