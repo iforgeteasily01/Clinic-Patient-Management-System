@@ -138,6 +138,7 @@ urlpatterns = [
     # Reports
     path('api/reports/dashboard/', views.DashboardReportView.as_view(), name='reports-dashboard'),
     path('api/reports/sales/', views.SalesRangeReportView.as_view(), name='reports-sales'),
+    path('api/reports/generate/', views.GenerateReportView.as_view(), name='reports-generate'),
 
     # Patient Notes
     path('api/patient-notes/', views.PatientNoteListCreateView.as_view(), name='patient-notes'),

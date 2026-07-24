@@ -1079,7 +1079,7 @@ class SiteConfigSerializer(serializers.ModelSerializer):
     class Meta:
         model = SiteConfig
         fields = ["clinic_name", "address_line1", "address_line2", "phone_fax",
-                  "receipt_header_extra", "receipt_footer"]
+                  "receipt_header_extra", "receipt_footer", "logo"]
 
 
 # ── Accounting serializers ─────────────────────────────────────────────────────

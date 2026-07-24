@@ -1058,6 +1058,7 @@ class SiteConfig(models.Model):
     phone_fax            = models.CharField(max_length=200, default='')
     receipt_header_extra = models.TextField(default='')
     receipt_footer       = models.TextField(default='Terima kasih atas kunjungan Anda')
+    logo                 = models.ImageField(upload_to='site/', null=True, blank=True)
 
     class Meta:
         verbose_name = 'Site Configuration'

@@ -1,14 +1,46 @@
 import datetime
+import io
+import os
 from zoneinfo import ZoneInfo
 
+import openpyxl
+from openpyxl.drawing.image import Image as XLImage
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from django.db.models import Count, DecimalField, F, Sum, Value
 from django.db.models.functions import Coalesce
+from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
+from rest_framework.negotiation import DefaultContentNegotiation
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import InventoryItem, Invoice
+
+class IgnoreFormatQueryNegotiation(DefaultContentNegotiation):
+    """
+    Content negotiation that ignores the reserved ``?format=`` query parameter.
+
+    DRF's default negotiation treats ``?format=xxx`` as a renderer selector and
+    raises 404 when no renderer matches (e.g. ``?format=xlsx``). This view uses
+    ``?output=`` to pick json vs. xlsx itself, so we always return the first
+    (JSON) renderer and let the view decide the real output.
+    """
+
+    def select_renderer(self, request, renderers, format_suffix=None):
+        renderer = renderers[0]
+        return renderer, renderer.media_type
+
+from ..models import (
+    InventoryBatch,
+    InventoryItem,
+    Invoice,
+    InvoiceItem,
+    PurchaseInvoice,
+    SiteConfig,
+    StockOutLog,
+)
 
 _JAKARTA = ZoneInfo('Asia/Jakarta')
 
@@ -160,3 +192,397 @@ class SalesRangeReportView(APIView):
                 for r in breakdown
             ],
         })
+
+
+# ── Generate Report (parametrized, JSON preview + .xlsx download) ─────────────
+
+_REPORT_TITLES = {
+    'stock_in':      'Laporan Daftar Item Masuk',
+    'stock_out':     'Laporan Daftar Item Keluar',
+    'purchases':     'Laporan Pembelian Detail',
+    'sales_by_item': 'Daftar Penjualan Per Item Per Jenis',
+}
+
+_STOCK_COLUMNS = [
+    'No Transaksi', 'Dept.', 'Tanggal', 'Kode Item',
+    'Nama Item', 'Jumlah', 'Satuan', 'Keterangan',
+]
+_PURCHASE_LINE_COLUMNS = [
+    'No.', 'Kd. Item', 'Nama Item', 'Jml', 'Satuan', 'Harga', 'Pot. %', 'Total',
+]
+_SALES_COLUMNS = [
+    'Kode Item', 'Nama Item', 'Jenis', 'Jumlah', 'Satuan', 'Total Harga',
+]
+
+
+def _parse_report_range(request):
+    """Return (start_date, end_date, error_str). Defaults to month-to-date (Jakarta)."""
+    today = timezone.now().astimezone(_JAKARTA).date()
+
+    def parse(param, default):
+        raw = request.query_params.get(param, '').strip()
+        if not raw:
+            return default, None
+        try:
+            return datetime.date.fromisoformat(raw), None
+        except ValueError:
+            return None, f'Tanggal {param} tidak valid. Gunakan format YYYY-MM-DD.'
+
+    start, err = parse('start', today.replace(day=1))
+    if err:
+        return None, None, err
+    end, err = parse('end', today)
+    if err:
+        return None, None, err
+    if start > end:
+        return None, None, 'Tanggal mulai tidak boleh setelah tanggal akhir.'
+    return start, end, None
+
+
+def _build_stock_in(start, end):
+    qs = (
+        InventoryBatch.objects
+        .select_related('item', 'warehouse', 'purchase_invoice')
+        .filter(input_date__gte=start, input_date__lte=end)
+        .order_by('input_date', 'id')
+    )
+    rows = []
+    for b in qs:
+        if b.purchase_invoice_id:
+            no_trx = b.purchase_invoice.internal_id
+            keterangan = b.purchase_invoice.notes or ''
+        else:
+            no_trx = f'IB-{b.id}'
+            keterangan = ''
+        rows.append([
+            no_trx,
+            b.warehouse.code if b.warehouse_id else '',
+            b.input_date.isoformat(),
+            b.item.code if b.item_id else '',
+            b.item.name if b.item_id else '',
+            float(b.quantity_initial),
+            b.item.unit_small if b.item_id else '',
+            keterangan,
+        ])
+    return {'kind': 'flat', 'columns': _STOCK_COLUMNS, 'rows': rows}
+
+
+def _build_stock_out(start, end):
+    qs = (
+        StockOutLog.objects
+        .select_related('item', 'warehouse')
+        .filter(out_date__gte=start, out_date__lte=end)
+        .order_by('out_date', 'id')
+    )
+    rows = []
+    for log in qs:
+        rows.append([
+            f'SO-{log.id}',
+            log.warehouse.code if log.warehouse_id else '',
+            log.out_date.isoformat(),
+            log.item.code if log.item_id else '',
+            log.item.name if log.item_id else '',
+            float(log.quantity),
+            log.item.unit_small if log.item_id else '',
+            log.notes or '',
+        ])
+    return {'kind': 'flat', 'columns': _STOCK_COLUMNS, 'rows': rows}
+
+
+def _build_purchases(start, end):
+    qs = (
+        PurchaseInvoice.objects
+        .select_related('supplier', 'warehouse')
+        .prefetch_related('items__item')
+        .filter(purchase_date__gte=start, purchase_date__lte=end, is_voided=False)
+        .order_by('purchase_date', 'id')
+    )
+    groups = []
+    for inv in qs:
+        lines = []
+        for idx, it in enumerate(inv.items.all(), start=1):
+            qty = float(it.quantity)
+            unit_cost = float(it.unit_cost)
+            discount = float(it.total_discount)
+            gross = qty * unit_cost
+            total = gross - discount
+            pot_pct = (discount / gross * 100) if gross else 0.0
+            lines.append([
+                idx,
+                it.item.code if it.item_id else '',
+                it.item_name,
+                qty,
+                it.unit or '',
+                unit_cost,
+                round(pot_pct, 2),
+                round(total, 2),
+            ])
+        groups.append({
+            'header': {
+                'No Transaksi': inv.internal_id,
+                'Tanggal': inv.purchase_date.isoformat(),
+                'Dept.': inv.warehouse.code if inv.warehouse_id else '',
+                'Kode Supp.': inv.supplier_id,
+                'Nama Supplier': inv.supplier.name if inv.supplier_id else '',
+            },
+            'lines': lines,
+        })
+    return {'kind': 'grouped', 'line_columns': _PURCHASE_LINE_COLUMNS, 'groups': groups}
+
+
+def _build_sales_by_item(start, end):
+    range_start = datetime.datetime(start.year, start.month, start.day, tzinfo=_JAKARTA)
+    range_end = datetime.datetime(end.year, end.month, end.day, tzinfo=_JAKARTA) + datetime.timedelta(days=1)
+
+    items = (
+        InvoiceItem.objects
+        .select_related('item', 'item__item_category', 'invoice')
+        .filter(
+            invoice__datetime__gte=range_start,
+            invoice__datetime__lt=range_end,
+            invoice__is_voided=False,
+        )
+    )
+
+    agg = {}
+    for ii in items:
+        line_total = float(ii.price) * float(ii.quantity) * (1 - float(ii.discount_pct) / 100)
+        if ii.item_id:
+            key = ii.item_id
+            code = ii.item.code
+            name = ii.item.name
+            if ii.item.item_category_id:
+                jenis = ii.item.item_category.name
+            else:
+                jenis = ii.item.category or ''
+            unit = ii.item.unit_small
+        else:
+            key = f'name:{ii.item_name}'
+            code = ''
+            name = ii.item_name
+            jenis = ''
+            unit = ''
+        bucket = agg.get(key)
+        if bucket is None:
+            bucket = {'code': code, 'name': name, 'jenis': jenis, 'unit': unit, 'qty': 0.0, 'total': 0.0}
+            agg[key] = bucket
+        bucket['qty'] += float(ii.quantity)
+        bucket['total'] += line_total
+
+    rows = [
+        [b['code'], b['name'], b['jenis'], b['qty'], b['unit'], round(b['total'], 2)]
+        for b in sorted(agg.values(), key=lambda b: (b['jenis'].lower(), b['name'].lower()))
+    ]
+    return {'kind': 'flat', 'columns': _SALES_COLUMNS, 'rows': rows}
+
+
+_REPORT_BUILDERS = {
+    'stock_in':      _build_stock_in,
+    'stock_out':     _build_stock_out,
+    'purchases':     _build_purchases,
+    'sales_by_item': _build_sales_by_item,
+}
+
+
+_CENTER = Alignment(horizontal='center', vertical='center')
+_RIGHT = Alignment(horizontal='right', vertical='center')
+_LEFT = Alignment(horizontal='left', vertical='center')
+_THIN = Side(style='thin', color='D0D5DD')
+_BORDER = Border(left=_THIN, right=_THIN, top=_THIN, bottom=_THIN)
+_HDR_FILL = PatternFill('solid', fgColor='EEF2F6')
+_HDR_FONT = Font(bold=True, size=10)
+
+
+# Logo is bounded to this box (px) and scaled with its aspect ratio preserved.
+_LOGO_MAX_W = 130
+_LOGO_MAX_H = 78
+# Approx px width of one indent step (Calibri 11 "0"), used to push the header
+# text just past the logo without depending on data-driven column widths.
+_INDENT_PX = 7
+
+
+def _write_banner(ws, title, period_label, ncols):
+    """
+    Write the logo + clinic identity + title + period block, left-aligned.
+
+    The text is one full-width merged cell per line, indented just past the logo,
+    so it sits tight against the logo regardless of how wide the data columns are.
+    Returns (next_free_row, has_logo).
+    """
+    cfg = SiteConfig.get_solo()
+    last_col = get_column_letter(max(ncols, 1))
+
+    # Place + size the logo first so we know how far to indent the text.
+    indent = 0
+    logo_path = getattr(getattr(cfg, 'logo', None), 'path', None)
+    has_logo = bool(logo_path and os.path.exists(logo_path))
+    if has_logo:
+        try:
+            img = XLImage(logo_path)
+            if img.width and img.height:
+                scale = min(_LOGO_MAX_W / img.width, _LOGO_MAX_H / img.height)
+                img.width = int(img.width * scale)
+                img.height = int(img.height * scale)
+            ws.add_image(img, 'A1')
+            indent = round(img.width / _INDENT_PX) + 1  # clear the logo, tight
+        except Exception:
+            has_logo = False  # bad logo: fall back to full-width text
+
+    def line(text, font, row):
+        ws.merge_cells(f'A{row}:{last_col}{row}')
+        cell = ws.cell(row, 1, text)
+        cell.font = font
+        cell.alignment = Alignment(horizontal='left', vertical='center', indent=indent)
+        return row + 1
+
+    r = 1
+    r = line(title, Font(size=14, bold=True), r)
+    if cfg.clinic_name:
+        r = line(cfg.clinic_name.upper(), Font(size=12, bold=True), r)
+    address = ', '.join(p for p in (cfg.address_line1, cfg.address_line2) if p)
+    if address:
+        r = line(address, Font(size=10), r)
+    if cfg.phone_fax:
+        r = line(cfg.phone_fax, Font(size=10), r)
+    r = line(f'PERIODE : {period_label}', Font(size=10, italic=True), r)
+
+    return r + 1, has_logo  # blank spacer row after the banner
+
+
+def _write_table_header(ws, row, columns):
+    for i, label in enumerate(columns, start=1):
+        cell = ws.cell(row, i, label)
+        cell.font = _HDR_FONT
+        cell.fill = _HDR_FILL
+        cell.border = _BORDER
+        cell.alignment = _CENTER
+    return row + 1
+
+
+def _write_data_row(ws, row, values):
+    for i, v in enumerate(values, start=1):
+        cell = ws.cell(row, i, v)
+        cell.border = _BORDER
+        cell.alignment = _RIGHT if isinstance(v, (int, float)) else _LEFT
+    return row + 1
+
+
+def _autosize(ws, columns, rows):
+    """Fit each column to the widest of its header label and data cells."""
+    for i, label in enumerate(columns):
+        letter = get_column_letter(i + 1)
+        longest = len(str(label))
+        for row in rows:
+            if i >= len(row):
+                continue
+            v = row[i]
+            if v is None:
+                continue
+            if isinstance(v, float):
+                text = f'{v:,.2f}'.rstrip('0').rstrip('.') if v % 1 else f'{int(v):,}'
+            elif isinstance(v, int):
+                text = f'{v:,}'
+            else:
+                text = str(v)
+            longest = max(longest, len(text))
+        ws.column_dimensions[letter].width = min(max(longest + 2, 9), 48)
+
+
+def _report_to_xlsx(report, title, period_label, filename):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = 'Laporan'
+    ws.sheet_view.showGridLines = False
+
+    columns = report['columns'] if report['kind'] == 'flat' else report['line_columns']
+    ncols = len(columns)
+    row, has_logo = _write_banner(ws, title, period_label, ncols)
+
+    if report['kind'] == 'flat':
+        row = _write_table_header(ws, row, columns)
+        for data_row in report['rows']:
+            row = _write_data_row(ws, row, data_row)
+        _autosize(ws, columns, report['rows'])
+    else:  # grouped (purchases)
+        all_lines = []
+        for grp in report['groups']:
+            h = grp['header']
+            info = (
+                f"No Transaksi: {h['No Transaksi']}    Tanggal: {h['Tanggal']}    "
+                f"Dept.: {h['Dept.']}    Supplier: {h['Nama Supplier']}"
+            )
+            ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=max(ncols, 1))
+            cell = ws.cell(row, 1, info)
+            cell.font = Font(bold=True, size=10)
+            cell.alignment = _LEFT
+            row += 1
+            row = _write_table_header(ws, row, columns)
+            for line in grp['lines']:
+                row = _write_data_row(ws, row, line)
+                all_lines.append(line)
+            row += 1  # spacer between invoices
+        _autosize(ws, columns, all_lines)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    response = HttpResponse(
+        buf.read(),
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    )
+    response['Content-Disposition'] = f'attachment; filename="{filename}"'
+    return response
+
+
+class GenerateReportView(APIView):
+    """
+    GET /api/reports/generate/?type=<slug>&start=YYYY-MM-DD&end=YYYY-MM-DD&format=json|xlsx
+
+    type ∈ {stock_in, stock_out, purchases, sales_by_item}. Defaults: range =
+    month-to-date (Jakarta), format = json (on-screen preview). format=xlsx
+    returns a downloadable spreadsheet.
+    """
+    permission_classes = [AllowAny]  # reached via anchor download (no auth header), mirrors InvoiceExportView
+    content_negotiation_class = IgnoreFormatQueryNegotiation
+
+    def get(self, request):
+        report_type = request.query_params.get('type', '').strip()
+        if report_type not in _REPORT_BUILDERS:
+            return Response(
+                {'error': 'Jenis laporan tidak dikenal.', 'valid_types': list(_REPORT_BUILDERS)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        start, end, err = _parse_report_range(request)
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+
+        report = _REPORT_BUILDERS[report_type](start, end)
+        title = _REPORT_TITLES[report_type]
+        period_label = f'{start.strftime("%d/%m/%y")} - {end.strftime("%d/%m/%y")}'
+
+        # Accept both ?output= and the legacy ?format=. DRF normally 404s on an
+        # unknown ?format value, but IgnoreFormatQueryNegotiation disables that.
+        fmt = (
+            request.query_params.get('output')
+            or request.query_params.get('format')
+            or 'json'
+        ).strip().lower()
+        if fmt == 'xlsx':
+            filename = f'{report_type}_{start}_{end}.xlsx'
+            return _report_to_xlsx(report, title, period_label, filename)
+
+        meta = {
+            'type': report_type,
+            'title': title,
+            'start': str(start),
+            'end': str(end),
+            'period_label': period_label,
+        }
+        if report['kind'] == 'flat':
+            meta['total_rows'] = len(report['rows'])
+            return Response({'meta': meta, **report})
+        # grouped
+        meta['total_rows'] = sum(len(g['lines']) for g in report['groups'])
+        meta['group_count'] = len(report['groups'])
+        return Response({'meta': meta, **report})
