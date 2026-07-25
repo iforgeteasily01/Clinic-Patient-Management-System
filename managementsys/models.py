@@ -114,14 +114,16 @@ class MedRec(models.Model):
     assessment = models.TextField(default="")
     assessment_codes = models.JSONField(default=list, blank=True)
     plan = models.TextField(default="")
-    sabun_pagi = models.TextField(default="", null=True)
-    sabun_malam = models.TextField(default="", null=True)
-    toner_pagi = models.TextField(default="", null=True)
-    toner_malam = models.TextField(default="", null=True)
+    sabun = models.TextField(default="", null=True)
+    toner = models.TextField(default="", null=True)
     obat1_pagi = models.TextField(default="", null=True)
-    obat2_pagi = models.TextField(default="", null=True)
+    obat1_pagi_detail = models.TextField(default="", null=True)
     obat1_malam = models.TextField(default="", null=True)
+    obat1_malam_detail = models.TextField(default="", null=True)
+    obat2_pagi = models.TextField(default="", null=True)
+    obat2_pagi_detail = models.TextField(default="", null=True)
     obat2_malam = models.TextField(default="", null=True)
+    obat2_malam_detail = models.TextField(default="", null=True)
     treatment = models.TextField(default="", null=True)
     clinician = models.CharField(max_length=100, default='', blank=True)
 
@@ -194,6 +196,9 @@ class Treatment(models.Model):
     def save(self, *args, **kwargs):
         is_new = self.pk is None
         super().save(*args, **kwargs)
+        # Link the mirror catalog item to the matching TreatmentCategory so POS
+        # revenue/COGS route to that category's own GL accounts (else fallbacks).
+        category = TreatmentCategory.resolve_by_name(self.category)
         if is_new or not self.catalog_item_id:
             item = InventoryItem.objects.create(
                 code=self.code,
@@ -203,6 +208,7 @@ class Treatment(models.Model):
                 is_service=True,
                 is_active=self.active,
                 min_stock=0,
+                item_category=category,
             )
             Treatment.objects.filter(pk=self.pk).update(catalog_item=item)
             self.catalog_item_id = item.pk
@@ -212,6 +218,7 @@ class Treatment(models.Model):
                 name=self.name,
                 selling_price=self.price,
                 is_active=self.active,
+                item_category=category,
             )
 
     def delete(self, *args, **kwargs):
@@ -558,6 +565,23 @@ class TreatmentCategory(models.Model):
 
     def __str__(self):
         return self.name
+
+    @classmethod
+    def resolve_by_name(cls, name):
+        """Return the category matching ``name`` (case-insensitive), creating it
+        — and its GL accounts, via ``save()`` — when absent.
+
+        Returns ``None`` for a blank name so the caller falls back to the system
+        revenue/COGS accounts. Used to route a treatment's POS revenue and COGS
+        to the right per-category accounts by matching ``Treatment.category``.
+        """
+        name = (name or '').strip()
+        if not name:
+            return None
+        existing = cls.objects.filter(name__iexact=name).first()
+        if existing:
+            return existing
+        return cls.objects.create(name=name)
 
     @staticmethod
     def _next_account_number(range_min, range_max, step=1000):

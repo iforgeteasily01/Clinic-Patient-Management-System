@@ -57,11 +57,15 @@ def _post_accounting(invoice, line_items, items_by_id):
     """
     Post accounting entries for a completed invoice:
       - Cash/payment account  += grand_total  (DEBIT asset)
-      - Per line: revenue account for the item's category += price * qty  (CREDIT revenue)
+      - Per service line: revenue/COGS for the treatment's category  (CREDIT revenue)
       - Per physical line (is_service=False): FIFO deduct stock, then
         inventory asset -= COGS  (CREDIT asset),  COGS account += COGS  (DEBIT COGS)
-    Falls back to system accounts (4200000, 5100000, 1300000) when an item
-    has no item_category assigned.
+    Routing:
+      - Services (treatments) post to their item_category's revenue/COGS accounts.
+      - Physical inventory items are treated as a single entity — all post to the
+        shared product accounts (4200000 Product Sales Revenue / 5100000 Cost of
+        Products Sold), regardless of item_category.
+    These product accounts also serve as the fallback when a service has no category.
     Each balance change is mirrored as a LedgerEntry row for historical reporting.
     """
     inv_no = invoice.invoice_number
@@ -82,7 +86,8 @@ def _post_accounting(invoice, line_items, items_by_id):
             continue
         item = items_by_id[line['item_id']]
         line_revenue = line['price'] * line['quantity']
-        cat = item.item_category
+        # Only services route by category; physical goods are one shared entity.
+        cat = item.item_category if item.is_service else None
 
         revenue_acct = (cat.revenue_account if cat and cat.revenue_account_id else fallback_revenue)
         cogs_acct = (cat.cogs_account if cat and cat.cogs_account_id else fallback_cogs)
@@ -165,7 +170,8 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
             continue
         item = inst.item
         line_revenue = inst.price * inst.quantity
-        cat = item.item_category
+        # Mirror of _post_accounting: only services route by category.
+        cat = item.item_category if item.is_service else None
 
         revenue_acct = (cat.revenue_account if cat and cat.revenue_account_id else fallback_revenue)
         cogs_acct    = (cat.cogs_account    if cat and cat.cogs_account_id    else fallback_cogs)

@@ -7,8 +7,9 @@ from ..api.serializers import MedRecPendingDraftSerializer, MedRecHistorySeriali
 
 _SOAP_FIELDS = [
     'subjective', 'objective', 'assessment', 'assessment_codes',
-    'plan', 'sabun_pagi', 'sabun_malam', 'toner_pagi', 'toner_malam',
-    'obat1_pagi', 'obat2_pagi', 'obat1_malam', 'obat2_malam', 'treatment',
+    'plan', 'sabun', 'toner',
+    'obat1_pagi', 'obat1_pagi_detail', 'obat1_malam', 'obat1_malam_detail',
+    'obat2_pagi', 'obat2_pagi_detail', 'obat2_malam', 'obat2_malam_detail', 'treatment',
     'clinician',
 ]
 

@@ -96,6 +96,13 @@ from .accounting_page import (
     JournalAdjustmentView,
     JournalHistoryView,
 )
+from .financial_reports_page import (
+    TrialBalanceView,
+    ProfitLossView,
+    BalanceSheetView,
+    GeneralLedgerView,
+    CashFlowView,
+)
 
 # Create your views here.
 def homepage(request):

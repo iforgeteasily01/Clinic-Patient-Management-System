@@ -175,25 +175,27 @@ class MedRecSerializer(serializers.ModelSerializer):
     class Meta:
         model = MedRec
         fields = ["medrec_id", "doctor_id", "patient_no", "status", "subjective", "objective",
-                  "assessment", "assessment_codes", "plan", "sabun_pagi",
-                  "sabun_malam", "toner_pagi", "toner_malam", "obat1_pagi", "obat2_pagi",
-                  "obat1_malam", "obat2_malam", "treatment", "visit_date"]
+                  "assessment", "assessment_codes", "plan", "sabun", "toner",
+                  "obat1_pagi", "obat1_pagi_detail", "obat1_malam", "obat1_malam_detail",
+                  "obat2_pagi", "obat2_pagi_detail", "obat2_malam", "obat2_malam_detail", "treatment", "visit_date"]
         extra_kwargs = {
-            'medrec_id':   {'required': False, 'allow_blank': True},
-            'status':      {'required': False},
-            'subjective':  {'allow_blank': True},
-            'objective':   {'allow_blank': True},
-            'assessment':  {'allow_blank': True},
-            'plan':        {'allow_blank': True},
-            'sabun_pagi':  {'required': False, 'allow_blank': True, 'allow_null': True},
-            'sabun_malam': {'required': False, 'allow_blank': True, 'allow_null': True},
-            'toner_pagi':  {'required': False, 'allow_blank': True, 'allow_null': True},
-            'toner_malam': {'required': False, 'allow_blank': True, 'allow_null': True},
-            'obat1_pagi':  {'required': False, 'allow_blank': True, 'allow_null': True},
-            'obat2_pagi':  {'required': False, 'allow_blank': True, 'allow_null': True},
-            'obat1_malam': {'required': False, 'allow_blank': True, 'allow_null': True},
-            'obat2_malam': {'required': False, 'allow_blank': True, 'allow_null': True},
-            'treatment':   {'required': False, 'allow_blank': True, 'allow_null': True},
+            'medrec_id':    {'required': False, 'allow_blank': True},
+            'status':       {'required': False},
+            'subjective':   {'allow_blank': True},
+            'objective':    {'allow_blank': True},
+            'assessment':   {'allow_blank': True},
+            'plan':         {'allow_blank': True},
+            'sabun':        {'required': False, 'allow_blank': True, 'allow_null': True},
+            'toner':        {'required': False, 'allow_blank': True, 'allow_null': True},
+            'obat1_pagi':         {'required': False, 'allow_blank': True, 'allow_null': True},
+            'obat1_pagi_detail':  {'required': False, 'allow_blank': True, 'allow_null': True},
+            'obat1_malam':        {'required': False, 'allow_blank': True, 'allow_null': True},
+            'obat1_malam_detail': {'required': False, 'allow_blank': True, 'allow_null': True},
+            'obat2_pagi':         {'required': False, 'allow_blank': True, 'allow_null': True},
+            'obat2_pagi_detail':  {'required': False, 'allow_blank': True, 'allow_null': True},
+            'obat2_malam':        {'required': False, 'allow_blank': True, 'allow_null': True},
+            'obat2_malam_detail': {'required': False, 'allow_blank': True, 'allow_null': True},
+            'treatment':    {'required': False, 'allow_blank': True, 'allow_null': True},
         }
 
     def create(self, validated_data):
@@ -285,10 +287,9 @@ class BillingMedRecSerializer(serializers.ModelSerializer):
         model = MedRec
         fields = [
             'treatment',
-            'sabun_pagi', 'sabun_malam',
-            'toner_pagi', 'toner_malam',
-            'obat1_pagi', 'obat2_pagi',
-            'obat1_malam', 'obat2_malam',
+            'sabun', 'toner',
+            'obat1_pagi', 'obat1_pagi_detail', 'obat1_malam', 'obat1_malam_detail',
+            'obat2_pagi', 'obat2_pagi_detail', 'obat2_malam', 'obat2_malam_detail',
         ]
 
 
@@ -454,11 +455,13 @@ class ProductionRecipeSerializer(serializers.ModelSerializer):
 class ProductionRunIngredientSerializer(serializers.ModelSerializer):
     item_code = serializers.CharField(source='item.code', read_only=True)
     item_name = serializers.CharField(source='item.name', read_only=True)
+    source_warehouse_name = serializers.CharField(source='source_warehouse.name',
+                                                  read_only=True)
 
     class Meta:
         model = ProductionRunIngredient
         fields = ['id', 'item', 'item_code', 'item_name', 'quantity_small', 'cost',
-                  'source_warehouse']
+                  'source_warehouse', 'source_warehouse_name']
 
 
 class ProductionRunSerializer(serializers.ModelSerializer):
@@ -503,8 +506,9 @@ class MedRecHistorySerializer(serializers.ModelSerializer):
         fields = [
             'medrec_id', 'status', 'patient_no', 'patient_name', 'doctor_id', 'doctor_name',
             'visit_date', 'clinician', 'subjective', 'objective', 'assessment', 'assessment_codes', 'plan',
-            'sabun_pagi', 'sabun_malam', 'toner_pagi', 'toner_malam',
-            'obat1_pagi', 'obat2_pagi', 'obat1_malam', 'obat2_malam', 'treatment',
+            'sabun', 'toner',
+            'obat1_pagi', 'obat1_pagi_detail', 'obat1_malam', 'obat1_malam_detail',
+            'obat2_pagi', 'obat2_pagi_detail', 'obat2_malam', 'obat2_malam_detail', 'treatment',
         ]
 
     def get_doctor_name(self, obj):
@@ -535,8 +539,9 @@ class MedRecPendingDraftSerializer(serializers.ModelSerializer):
             'medrec_id', 'status', 'patient_no', 'patient_name',
             'visit_date', 'active_patient_id', 'active_patient_status',
             'subjective', 'objective', 'assessment', 'assessment_codes', 'plan',
-            'sabun_pagi', 'sabun_malam', 'toner_pagi', 'toner_malam',
-            'obat1_pagi', 'obat2_pagi', 'obat1_malam', 'obat2_malam', 'treatment',
+            'sabun', 'toner',
+            'obat1_pagi', 'obat1_pagi_detail', 'obat1_malam', 'obat1_malam_detail',
+            'obat2_pagi', 'obat2_pagi_detail', 'obat2_malam', 'obat2_malam_detail', 'treatment',
         ]
 
     def get_patient_name(self, obj):

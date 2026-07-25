@@ -199,5 +199,12 @@ urlpatterns = [
     path('api/accounting/daily-sales/',            views.DailySalesView.as_view(),               name='accounting-daily-sales'),
     path('api/accounting/payment-plan/preview/',   views.PaymentPlanPreviewView.as_view(),       name='accounting-payment-plan-preview'),
     path('api/accounting/payment-plan/export/',    views.PaymentPlanExportView.as_view(),        name='accounting-payment-plan-export'),
+
+    # Financial Reports (Laporan Keuangan)
+    path('api/accounting/reports/trial-balance/',  views.TrialBalanceView.as_view(),   name='reports-trial-balance'),
+    path('api/accounting/reports/profit-loss/',    views.ProfitLossView.as_view(),     name='reports-profit-loss'),
+    path('api/accounting/reports/balance-sheet/',  views.BalanceSheetView.as_view(),   name='reports-balance-sheet'),
+    path('api/accounting/reports/general-ledger/', views.GeneralLedgerView.as_view(),  name='reports-general-ledger'),
+    path('api/accounting/reports/cash-flow/',      views.CashFlowView.as_view(),       name='reports-cash-flow'),
 ]
 
