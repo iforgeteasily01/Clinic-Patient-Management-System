@@ -194,6 +194,179 @@ class SalesRangeReportView(APIView):
         })
 
 
+_ID_MONTHS = [
+    '', 'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
+]
+
+
+def _month_label(year, month):
+    return f'{_ID_MONTHS[month]} {year}'
+
+
+class SalesItemsBreakdownView(APIView):
+    """
+    GET /api/reports/sales-items/?start=YYYY-MM-DD&end=YYYY-MM-DD
+
+    Item-level sales analytics over an inclusive date range, grouped by calendar
+    month (Jakarta time). For each month and for the whole range it reports the
+    revenue/quantity split per category, the top treatment, the top physical
+    item, and the leading category. Defaults to the current month-to-date.
+    """
+
+    def get(self, request):
+        today = timezone.now().astimezone(_JAKARTA).date()
+
+        def parse(param, default):
+            raw = request.query_params.get(param, '').strip()
+            if not raw:
+                return default, None
+            try:
+                return datetime.date.fromisoformat(raw), None
+            except ValueError:
+                return None, f'Tanggal {param} tidak valid. Gunakan format YYYY-MM-DD.'
+
+        start, err = parse('start', today.replace(day=1))
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+        end, err = parse('end', today)
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+        if start > end:
+            return Response(
+                {'error': 'Tanggal mulai tidak boleh setelah tanggal akhir.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        range_start = datetime.datetime(start.year, start.month, start.day, tzinfo=_JAKARTA)
+        range_end = datetime.datetime(end.year, end.month, end.day, tzinfo=_JAKARTA) + datetime.timedelta(days=1)
+
+        lines = (
+            InvoiceItem.objects
+            .select_related('item', 'item__item_category', 'invoice')
+            .filter(
+                invoice__datetime__gte=range_start,
+                invoice__datetime__lt=range_end,
+                invoice__is_voided=False,
+            )
+        )
+
+        # month key -> aggregation buckets
+        months = {}
+
+        def new_month(year, month):
+            return {
+                'month': f'{year:04d}-{month:02d}',
+                'label': _month_label(year, month),
+                'revenue': 0.0,
+                'qty': 0.0,
+                'line_count': 0,
+                'categories': {},    # name -> {revenue, qty, line_count}
+                'treatments': {},    # key  -> {name, revenue, qty}
+                'items': {},         # key  -> {name, revenue, qty}
+            }
+
+        def accumulate(bucket, ii, is_service, cat_name, name, key, revenue, qty):
+            bucket['revenue'] += revenue
+            bucket['qty'] += qty
+            bucket['line_count'] += 1
+
+            cat = bucket['categories'].get(cat_name)
+            if cat is None:
+                cat = {'revenue': 0.0, 'qty': 0.0, 'line_count': 0}
+                bucket['categories'][cat_name] = cat
+            cat['revenue'] += revenue
+            cat['qty'] += qty
+            cat['line_count'] += 1
+
+            target = bucket['treatments'] if is_service else bucket['items']
+            entry = target.get(key)
+            if entry is None:
+                entry = {'name': name, 'category': cat_name, 'revenue': 0.0, 'qty': 0.0}
+                target[key] = entry
+            entry['revenue'] += revenue
+            entry['qty'] += qty
+
+        overall = new_month(0, 0)
+        overall['month'] = None
+        overall['label'] = 'Total'
+
+        for ii in lines:
+            revenue = float(ii.price) * float(ii.quantity) * (1 - float(ii.discount_pct) / 100)
+            qty = float(ii.quantity)
+
+            if ii.item_id:
+                is_service = bool(ii.item.is_service)
+                name = ii.item.name
+                key = ii.item_id
+                if ii.item.item_category_id:
+                    cat_name = ii.item.item_category.name
+                else:
+                    cat_name = ii.item.category or 'Tanpa Kategori'
+            else:
+                is_service = False
+                name = ii.item_name or 'Item Lain'
+                key = f'name:{name}'
+                cat_name = 'Tanpa Kategori'
+
+            local_dt = ii.invoice.datetime.astimezone(_JAKARTA)
+            mkey = (local_dt.year, local_dt.month)
+            bucket = months.get(mkey)
+            if bucket is None:
+                bucket = new_month(local_dt.year, local_dt.month)
+                months[mkey] = bucket
+
+            accumulate(bucket, ii, is_service, cat_name, name, key, revenue, qty)
+            accumulate(overall, ii, is_service, cat_name, name, key, revenue, qty)
+
+        def finalize(bucket):
+            categories = sorted(
+                (
+                    {
+                        'name': cname,
+                        'revenue': round(c['revenue'], 2),
+                        'qty': round(c['qty'], 3),
+                        'line_count': c['line_count'],
+                    }
+                    for cname, c in bucket['categories'].items()
+                ),
+                key=lambda c: c['revenue'],
+                reverse=True,
+            )
+
+            def top(entries, metric):
+                if not entries:
+                    return None
+                best = max(entries.values(), key=lambda e: e[metric])
+                return {
+                    'name': best['name'],
+                    'category': best.get('category', ''),
+                    'qty': round(best['qty'], 3),
+                    'revenue': round(best['revenue'], 2),
+                }
+
+            return {
+                'month': bucket['month'],
+                'label': bucket['label'],
+                'total_revenue': round(bucket['revenue'], 2),
+                'total_qty': round(bucket['qty'], 3),
+                'line_count': bucket['line_count'],
+                'by_category': categories,
+                'top_category': categories[0] if categories else None,
+                'top_treatment': top(bucket['treatments'], 'qty'),
+                'top_item': top(bucket['items'], 'qty'),
+            }
+
+        months_out = [finalize(months[k]) for k in sorted(months.keys())]
+
+        return Response({
+            'start': str(start),
+            'end': str(end),
+            'overall': finalize(overall),
+            'months': months_out,
+        })
+
+
 # ── Generate Report (parametrized, JSON preview + .xlsx download) ─────────────
 
 _REPORT_TITLES = {

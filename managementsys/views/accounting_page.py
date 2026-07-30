@@ -4,7 +4,7 @@ from decimal import Decimal, InvalidOperation
 
 import openpyxl
 from django.db import transaction
-from django.db.models import F, Q, Sum
+from django.db.models import Count, DecimalField, ExpressionWrapper, F, Max, Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework import status
@@ -35,6 +35,108 @@ def _safe_decimal(val) -> Decimal:
         return Decimal(str(val))
     except (InvalidOperation, TypeError):
         return Decimal('0')
+
+
+# ── Double-entry posting helpers ─────────────────────────────────────────────
+# The financial reports recompute every balance from LedgerEntry using natural
+# (normal-balance) sign — asset/cogs/expense are debit-normal, liability/equity/
+# revenue are credit-normal. The cached ChartOfAccounts.balance is kept in the
+# same natural sign, matching invoice_page._post_accounting.
+NORMAL_BALANCE = {
+    'asset':         'debit',
+    'cogs':          'debit',
+    'expense':       'debit',
+    'other_expense': 'debit',
+    'liability':     'credit',
+    'equity':        'credit',
+    'revenue':       'credit',
+    'other_income':  'credit',
+}
+
+INVENTORY_ASSET_NUMBER = 1300000
+CENT = Decimal('0.01')
+
+
+def _apply_balance(account_id, account_type, entry_type, amount):
+    """Nudge the cached account balance in its natural direction."""
+    normal = NORMAL_BALANCE.get(account_type, 'debit')
+    signed = amount if entry_type == normal else -amount
+    ChartOfAccounts.objects.filter(pk=account_id).update(balance=F('balance') + signed)
+
+
+def _post_le(account, entry_type, amount, invoice, description, date):
+    """Post one purchase LedgerEntry row and update the account balance cache."""
+    _apply_balance(account.pk, account.account_type, entry_type, amount)
+    LedgerEntry.objects.create(
+        account=account,
+        date=date,
+        description=description,
+        entry_type=entry_type,
+        amount=amount,
+        source_type='purchase',
+        purchase_invoice=invoice,
+    )
+
+
+def _post_purchase_accrual(invoice, parsed, item_objs, supplier, grand_total):
+    """Accrual double-entry for a purchase invoice:
+        Dr Inventory (stock lines) / Dr expense_account (beban lines)
+        Cr Accounts Payable — <vendor>   for the invoice total.
+    Debits are reconciled so their sum equals the (2-dp) invoice total, which
+    absorbs additional-cost rounding and any adjustment that no stock unit
+    carried (e.g. an all-expense invoice with a shipping surcharge).
+    """
+    target = grand_total.quantize(CENT)
+    ap_account = supplier.ensure_ap_account()
+    inventory_asset = ChartOfAccounts.objects.filter(account_number=INVENTORY_ASSET_NUMBER).first()
+    post_date = invoice.purchase_date
+
+    exp_ids = {p['expense_acct_id'] for p in parsed
+               if p['line_type'] == 'expense' and p['expense_acct_id']}
+    exp_map = {a.id: a for a in ChartOfAccounts.objects.filter(id__in=exp_ids)}
+
+    debit_posts = []   # [account, amount, description]
+    debit_total = Decimal('0')
+    for p, obj in zip(parsed, item_objs):
+        amt = (p['quantity'] * obj.actual_unit_cost).quantize(CENT)
+        if amt <= 0:
+            continue
+        if p['line_type'] == 'stock':
+            if not inventory_asset:
+                continue
+            debit_posts.append([inventory_asset, amt,
+                                f'Persediaan masuk: {p["item_name"]} — {invoice.internal_id}'])
+        else:
+            acct = exp_map.get(p['expense_acct_id'])
+            if not acct:
+                continue
+            debit_posts.append([acct, amt,
+                                f'Beban: {p["item_name"]} — {invoice.internal_id}'])
+        debit_total += amt
+
+    residual = target - debit_total
+    if debit_posts and residual != 0:
+        debit_posts[0][1] += residual
+    elif not debit_posts and target > 0 and inventory_asset:
+        debit_posts.append([inventory_asset, target, f'Pembelian {invoice.internal_id}'])
+
+    for acct, amt, desc in debit_posts:
+        _post_le(acct, 'debit', amt, invoice, desc, post_date)
+
+    if target > 0 and ap_account:
+        _post_le(ap_account, 'credit', target, invoice,
+                 f'Utang pembelian {invoice.internal_id} — {supplier.name}', post_date)
+
+
+def _unpost_purchase(invoice):
+    """Reverse the balance effect of every ledger entry tied to this purchase
+    invoice and delete the rows. Used before re-posting on edit; only safe when
+    the invoice has no payments (guaranteed by the PUT guard)."""
+    entries = LedgerEntry.objects.filter(purchase_invoice=invoice).select_related('account')
+    for e in entries:
+        opp = 'credit' if e.entry_type == 'debit' else 'debit'
+        _apply_balance(e.account_id, e.account.account_type, opp, e.amount)
+    entries.delete()
 
 
 # ── Suppliers ──────────────────────────────────────────────────────────────────
@@ -107,6 +209,58 @@ class SupplierDetailView(APIView):
             description=f'Supplier deleted: {name}',
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class SupplierAccountView(APIView):
+    """GET /api/accounting/suppliers/<pk>/account/
+
+    Everything needed for a vendor detail page in one call:
+      - the supplier (incl. its AP account + cached AP balance)
+      - outstanding payable total and invoice counts
+      - every item ever purchased from this vendor, aggregated
+    Purchase invoices themselves come from /purchases/?supplier=<pk>, and the
+    per-line AP journal from /admin/accounts/<ap_account_id>/ledger/.
+    """
+
+    def get(self, request, pk):
+        try:
+            supplier = Supplier.objects.select_related('ap_account').get(pk=pk)
+        except Supplier.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        live = PurchaseInvoice.objects.filter(supplier_id=pk, is_voided=False)
+        outstanding = live.filter(status__in=['unpaid', 'partial']).aggregate(
+            s=Sum('total_amount') - Sum('amount_paid')
+        )['s'] or Decimal('0')
+
+        items = list(
+            PurchaseInvoiceItem.objects
+            .filter(invoice__supplier_id=pk, invoice__is_voided=False)
+            .values('item_id', 'item__code', 'item_name', 'line_type')
+            .annotate(
+                total_qty=Sum('quantity'),
+                total_spend=Sum(ExpressionWrapper(
+                    F('quantity') * F('actual_unit_cost'),
+                    output_field=DecimalField(max_digits=20, decimal_places=4),
+                )),
+                last_date=Max('invoice__purchase_date'),
+                purchase_count=Count('invoice', distinct=True),
+            )
+            .order_by('-total_spend')
+        )
+        for row in items:
+            row['item_code'] = row.pop('item__code')
+            row['total_qty'] = str(row['total_qty'] or 0)
+            row['total_spend'] = str((row['total_spend'] or Decimal('0')).quantize(Decimal('0.01')))
+            row['last_date'] = row['last_date'].isoformat() if row['last_date'] else None
+
+        return Response({
+            'supplier':          SupplierSerializer(supplier).data,
+            'outstanding':       str(outstanding),
+            'invoice_count':     live.count(),
+            'outstanding_count': live.filter(status__in=['unpaid', 'partial']).count(),
+            'items':             items,
+        })
 
 
 class SupplierTemplateView(APIView):
@@ -268,6 +422,15 @@ class PurchaseInvoiceListCreateView(APIView):
             except Warehouse.DoesNotExist:
                 return Response({'error': 'Invalid warehouse.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        # Every expense line needs a target account so the debit side of the
+        # accrual posting has somewhere to land.
+        for row in items:
+            if row.get('line_type', 'stock') == 'expense' and not (row.get('expense_account')):
+                return Response(
+                    {'error': 'Setiap baris beban harus memiliki akun beban.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         with transaction.atomic():
             invoice = PurchaseInvoice.objects.create(
                 external_invoice_no=data.get('external_invoice_no', ''),
@@ -417,8 +580,12 @@ class PurchaseInvoiceListCreateView(APIView):
                     purchase_invoice=invoice,
                 )
 
+            grand_total = grand_total.quantize(Decimal('0.01'))
             invoice.total_amount = grand_total
             invoice.save(update_fields=['total_amount'])
+
+            # Post the accrual double-entry (Dr Inventory/Expense, Cr AP-vendor)
+            _post_purchase_accrual(invoice, parsed, item_objs, supplier, grand_total)
 
             AuditLog.objects.create(
                 performed_by=_actor(request),
@@ -539,6 +706,17 @@ class PurchaseInvoiceDetailView(APIView):
                 warehouse_obj = Warehouse.objects.get(pk=warehouse_id)
             except Warehouse.DoesNotExist:
                 return Response({'error': 'Invalid warehouse.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        for row in items:
+            if row.get('line_type', 'stock') == 'expense' and not (row.get('expense_account')):
+                return Response(
+                    {'error': 'Setiap baris beban harus memiliki akun beban.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # Reverse and drop the prior accrual postings before re-posting.
+        # Safe: the PUT guard already refused any invoice with payments.
+        _unpost_purchase(obj)
 
         # Remove old inventory batches and line items
         obj.inventory_batches.all().delete()
@@ -690,8 +868,12 @@ class PurchaseInvoiceDetailView(APIView):
                 purchase_invoice=obj,
             )
 
+        grand_total = grand_total.quantize(Decimal('0.01'))
         obj.total_amount = grand_total
         obj.save(update_fields=['total_amount'])
+
+        # Re-post the accrual double-entry for the replaced lines.
+        _post_purchase_accrual(obj, parsed, item_objs, supplier, grand_total)
 
         AuditLog.objects.create(
             performed_by=_actor(request),
@@ -735,37 +917,14 @@ class PurchaseInvoiceDetailView(APIView):
 
         today       = timezone.now().date()
         internal_id = obj.internal_id
-        journal_entries = []
 
-        # Reversal journal entries — one per expense line with an explicit account
-        for line in obj.items.all():
-            if line.line_type == 'expense' and line.expense_account_id:
-                amt = line.quantity * line.actual_unit_cost
-                if amt > 0:
-                    journal_entries.append(LedgerEntry(
-                        account_id=line.expense_account_id,
-                        date=today,
-                        description=f'Reversal beban: {line.item_name} — pembatalan {internal_id}',
-                        entry_type='credit',
-                        amount=amt,
-                        source_type='purchase',
-                        purchase_invoice=obj,
-                    ))
-
-        # One debit entry to the payment account documenting the voided payable
-        if obj.total_amount > 0:
-            journal_entries.append(LedgerEntry(
-                account=obj.payment_account,
-                date=today,
-                description=f'Pembatalan faktur pembelian {internal_id}',
-                entry_type='debit',
-                amount=obj.total_amount,
-                source_type='purchase',
-                purchase_invoice=obj,
-            ))
-
-        if journal_entries:
-            LedgerEntry.objects.bulk_create(journal_entries)
+        # Reverse every creation entry (Dr AP, Cr Inventory/Expense) as an
+        # opposite-side row so both the original posting and its reversal remain
+        # in the journal. Safe: the guard above refused any paid invoice.
+        for e in list(LedgerEntry.objects.filter(purchase_invoice=obj).select_related('account')):
+            opp = 'credit' if e.entry_type == 'debit' else 'debit'
+            _post_le(e.account, opp, e.amount, obj,
+                     f'Pembatalan {internal_id}: {e.description}', today)
 
         # Remove inventory batches created from this invoice (stock never came in)
         obj.inventory_batches.all().delete()
@@ -796,9 +955,14 @@ class PurchaseInvoicePayView(APIView):
 
     def post(self, request, pk):
         try:
-            invoice = PurchaseInvoice.objects.select_related('payment_account').get(pk=pk)
+            invoice = PurchaseInvoice.objects.select_related(
+                'payment_account', 'supplier', 'supplier__ap_account'
+            ).get(pk=pk)
         except PurchaseInvoice.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if invoice.is_voided:
+            return Response({'error': 'Cannot pay a voided invoice.'}, status=status.HTTP_400_BAD_REQUEST)
 
         if invoice.status == 'paid':
             return Response({'error': 'Invoice is already fully paid.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -819,20 +983,15 @@ class PurchaseInvoicePayView(APIView):
             invoice.refresh_status()
             invoice.save(update_fields=['amount_paid', 'status'])
 
-            # Credit the payment_account (cash/bank decreases)
-            ChartOfAccounts.objects.filter(pk=invoice.payment_account_id).update(
-                balance=invoice.payment_account.balance - amount
-            )
+            pay_date = timezone.now().date()
 
-            LedgerEntry.objects.create(
-                account=invoice.payment_account,
-                date=timezone.now().date(),
-                description=f'Pembayaran pembelian {invoice.internal_id}',
-                entry_type='credit',
-                amount=amount,
-                source_type='purchase',
-                purchase_invoice=invoice,
-            )
+            # Double entry: Dr Accounts Payable — vendor (settle the liability),
+            # Cr cash/bank payment account (funds leave).
+            ap_account = invoice.supplier.ensure_ap_account()
+            _post_le(ap_account, 'debit', amount, invoice,
+                     f'Pembayaran utang {invoice.internal_id} — {invoice.supplier.name}', pay_date)
+            _post_le(invoice.payment_account, 'credit', amount, invoice,
+                     f'Pembayaran pembelian {invoice.internal_id}', pay_date)
 
             AuditLog.objects.create(
                 performed_by=_actor(request),

@@ -1090,9 +1090,19 @@ class SiteConfigSerializer(serializers.ModelSerializer):
 # ── Accounting serializers ─────────────────────────────────────────────────────
 
 class SupplierSerializer(serializers.ModelSerializer):
+    ap_account_id     = serializers.IntegerField(source='ap_account.id',             read_only=True, allow_null=True)
+    ap_account_number = serializers.IntegerField(source='ap_account.account_number', read_only=True, allow_null=True)
+    ap_account_name   = serializers.CharField(   source='ap_account.name',           read_only=True, allow_null=True)
+    ap_balance        = serializers.DecimalField(source='ap_account.balance', max_digits=18, decimal_places=2,
+                                                 read_only=True, allow_null=True)
+
     class Meta:
         model = Supplier
-        fields = ['id', 'name', 'contact_name', 'phone', 'email', 'address', 'is_active']
+        fields = [
+            'id', 'name', 'contact_name', 'phone', 'email', 'address', 'is_active',
+            'ap_account_id', 'ap_account_number', 'ap_account_name', 'ap_balance',
+        ]
+        read_only_fields = ['ap_account_id', 'ap_account_number', 'ap_account_name', 'ap_balance']
 
 
 class PurchaseAdditionalCostSerializer(serializers.ModelSerializer):

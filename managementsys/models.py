@@ -1140,6 +1140,17 @@ class IssueTicketImage(models.Model):
 
 # ── Accounting: Suppliers & Purchase Invoices ─────────────────────────────────
 
+# ── Accounts Payable chart-of-accounts layout ────────────────────────────────
+# Each vendor owns a liability sub-account nested under a single AP control
+# account, which itself sits under the Liabilities head. Three levels:
+#   2000000 Liabilities (head)
+#     └ 2100000 Utang Usaha / Accounts Payable (control, is_system)
+#         └ 2100001..2199999 per-vendor payables (is_system, auto-managed)
+LIABILITIES_HEAD_NUMBER = 2000000
+AP_CONTROL_NUMBER       = 2100000
+AP_VENDOR_RANGE         = (2100001, 2199999)
+
+
 class Supplier(models.Model):
     name         = models.CharField(max_length=100)
     contact_name = models.CharField(max_length=100, blank=True)
@@ -1147,12 +1158,95 @@ class Supplier(models.Model):
     email        = models.EmailField(blank=True)
     address      = models.TextField(blank=True)
     is_active    = models.BooleanField(default=True)
+    ap_account   = models.OneToOneField(
+        'ChartOfAccounts',
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name='supplier_ap',
+    )
 
     class Meta:
         ordering = ['name']
 
     def __str__(self):
         return self.name
+
+    # ── Accounts-Payable account provisioning ────────────────────────────────
+
+    @staticmethod
+    def _ensure_ap_control_account():
+        """Return the single AP control account (2100000), creating it — and the
+        Liabilities head it hangs under — if either is missing. Idempotent."""
+        control = ChartOfAccounts.objects.filter(account_number=AP_CONTROL_NUMBER).first()
+        if control:
+            return control
+        head = ChartOfAccounts.objects.filter(account_number=LIABILITIES_HEAD_NUMBER).first()
+        if not head:
+            head = ChartOfAccounts.objects.create(
+                account_number=LIABILITIES_HEAD_NUMBER,
+                name='Liabilities',
+                account_type='liability',
+                is_head=True,
+                is_system=False,
+            )
+        return ChartOfAccounts.objects.create(
+            account_number=AP_CONTROL_NUMBER,
+            name='Utang Usaha (Accounts Payable)',
+            account_type='liability',
+            is_system=True,
+            is_head=False,
+            parent=head,
+        )
+
+    @staticmethod
+    def _next_ap_account_number():
+        lo, hi = AP_VENDOR_RANGE
+        max_num = (
+            ChartOfAccounts.objects
+            .filter(account_number__gte=lo, account_number__lte=hi)
+            .aggregate(m=Max('account_number'))['m']
+        )
+        nxt = (max_num + 1) if max_num is not None else lo
+        if nxt > hi:
+            raise ValueError(f'AP account range {lo}–{hi} is exhausted.')
+        return nxt
+
+    def ensure_ap_account(self):
+        """Create this vendor's AP sub-account if missing. Safe to call on
+        existing suppliers; persists via a direct update so it does not
+        re-enter save(). Returns the account (created or existing)."""
+        if self.ap_account_id:
+            return self.ap_account
+        control = self._ensure_ap_control_account()
+        self.ap_account = ChartOfAccounts.objects.create(
+            account_number=self._next_ap_account_number(),
+            name=f'Utang Usaha – {self.name}',
+            account_type='liability',
+            is_system=True,
+            is_head=False,
+            parent=control,
+        )
+        if self.pk:
+            Supplier.objects.filter(pk=self.pk).update(ap_account_id=self.ap_account_id)
+        return self.ap_account
+
+    def save(self, *args, **kwargs):
+        is_new = self.pk is None
+        if is_new and not self.ap_account_id:
+            control = self._ensure_ap_control_account()
+            self.ap_account = ChartOfAccounts.objects.create(
+                account_number=self._next_ap_account_number(),
+                name=f'Utang Usaha – {self.name}',
+                account_type='liability',
+                is_system=True,
+                is_head=False,
+                parent=control,
+            )
+        elif not is_new and self.ap_account_id:
+            ChartOfAccounts.objects.filter(pk=self.ap_account_id).update(
+                name=f'Utang Usaha – {self.name}',
+            )
+        super().save(*args, **kwargs)
 
 
 class PurchaseInvoice(models.Model):

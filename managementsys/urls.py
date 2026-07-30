@@ -138,6 +138,7 @@ urlpatterns = [
     # Reports
     path('api/reports/dashboard/', views.DashboardReportView.as_view(), name='reports-dashboard'),
     path('api/reports/sales/', views.SalesRangeReportView.as_view(), name='reports-sales'),
+    path('api/reports/sales-items/', views.SalesItemsBreakdownView.as_view(), name='reports-sales-items'),
     path('api/reports/generate/', views.GenerateReportView.as_view(), name='reports-generate'),
 
     # Patient Notes
@@ -188,6 +189,7 @@ urlpatterns = [
     path('api/accounting/suppliers/template/',    views.SupplierTemplateView.as_view(),          name='accounting-supplier-template'),
     path('api/accounting/suppliers/import/',      views.SupplierImportView.as_view(),            name='accounting-supplier-import'),
     path('api/accounting/suppliers/<int:pk>/',     views.SupplierDetailView.as_view(),           name='accounting-supplier-detail'),
+    path('api/accounting/suppliers/<int:pk>/account/', views.SupplierAccountView.as_view(),       name='accounting-supplier-account'),
     path('api/accounting/purchases/',                   views.PurchaseInvoiceListCreateView.as_view(), name='accounting-purchases'),
     path('api/accounting/purchases/last-price/',        views.PurchaseLastPriceView.as_view(),          name='accounting-purchase-last-price'),
     path('api/accounting/purchases/<int:pk>/',          views.PurchaseInvoiceDetailView.as_view(),      name='accounting-purchase-detail'),

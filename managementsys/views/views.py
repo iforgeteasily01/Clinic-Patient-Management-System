@@ -52,7 +52,7 @@ from .photo_page import PatientPhotoUploadView, PatientPhotoListView
 from .medical_record_history import MedRecHistoryListView, MedRecHistoryDetailView
 from .medical_record_draft import MedRecDraftCreateView, MedRecUpdateView, MedRecFinalizeView, MedRecPendingDraftsView
 from .invoice_page import InvoiceCreateView, InvoiceListView, InvoiceDetailView, InvoiceExportView, InvoiceImportView
-from .reports_page import DashboardReportView, GenerateReportView, SalesRangeReportView
+from .reports_page import DashboardReportView, GenerateReportView, SalesRangeReportView, SalesItemsBreakdownView
 from .patient_notes_page import PatientNoteListCreateView, PatientNoteDetailView
 from .assessment_codes_page import (
     AssessmentCodeListCreateView,
@@ -85,6 +85,7 @@ from .accounting_page import (
     PaymentPlanExportView,
     SupplierListCreateView,
     SupplierDetailView,
+    SupplierAccountView,
     SupplierTemplateView,
     SupplierImportView,
     PurchaseInvoiceListCreateView,
