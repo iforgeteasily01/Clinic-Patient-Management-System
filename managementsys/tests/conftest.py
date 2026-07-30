@@ -57,9 +57,12 @@ def auth_api(api, auth_user):
 def gl_accounts(db):
     """Create the GL accounts the invoice posting logic relies on.
 
-    Returns a dict with the cash payment account and the three system fallbacks
+    Returns a dict with the cash payment account and the system fallbacks
     (4200000 revenue, 5100000 COGS, 1300000 inventory asset) referenced by
-    ``_post_accounting`` when an item has no item_category.
+    ``_post_accounting`` when an item has no item_category, plus the accounts the
+    non-line parts of an invoice post to (4100000 discount, 2200000 tax,
+    7100000 additional charges) — without those an invoice carrying a discount,
+    tax or a surcharge cannot balance.
     """
     cash_head = ChartOfAccountsFactory(
         account_number=1100000, name="Cash & Equivalents",
@@ -78,11 +81,23 @@ def gl_accounts(db):
     inventory_asset = ChartOfAccountsFactory(
         account_number=1300000, name="Inventory", account_type="asset",
     )
+    sales_discount = ChartOfAccountsFactory(
+        account_number=4100000, name="Sales Discount", account_type="revenue",
+    )
+    tax_payable = ChartOfAccountsFactory(
+        account_number=2200000, name="Tax Payable", account_type="liability",
+    )
+    additional_charges = ChartOfAccountsFactory(
+        account_number=7100000, name="Additional Charges", account_type="other_income",
+    )
     return {
         "cash": cash,
         "revenue": revenue,
         "cogs": cogs,
         "inventory_asset": inventory_asset,
+        "sales_discount": sales_discount,
+        "tax_payable": tax_payable,
+        "additional_charges": additional_charges,
     }
 
 

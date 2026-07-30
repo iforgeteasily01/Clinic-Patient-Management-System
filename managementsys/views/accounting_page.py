@@ -139,6 +139,81 @@ def _unpost_purchase(invoice):
     entries.delete()
 
 
+PRICE_VARIANCE_NUMBER = 5200000
+COGS_HEAD_NUMBER = 5000000
+
+
+def _ensure_price_variance_account():
+    """The GL account that absorbs the purchase-price difference on units that
+    were already sold when the invoice is edited. Created lazily under the COGS
+    head so it flows into cost of sales, distinct from normal product COGS."""
+    acct = ChartOfAccounts.objects.filter(account_number=PRICE_VARIANCE_NUMBER).first()
+    if acct:
+        return acct
+    head = ChartOfAccounts.objects.filter(account_number=COGS_HEAD_NUMBER, is_head=True).first()
+    return ChartOfAccounts.objects.create(
+        account_number=PRICE_VARIANCE_NUMBER,
+        name='Selisih Harga Pembelian',
+        account_type='cogs',
+        is_system=True,
+        is_head=False,
+        parent=head,
+    )
+
+
+def _post_purchase_price_variance(invoice, sold_by_key, item_objs):
+    """Post the price variance for units sales already consumed.
+
+    For each (item, warehouse) with sold units, the new cost of those units
+    (allocated from the edited lines) is compared with the cost the sale
+    expensed (snapshotted in sold_by_key as the exact _fifo_deduct amount). The
+    difference moves between the Inventory asset and the Purchase Price Variance
+    account, so the sold goods' total recognised cost reflects the corrected
+    price while their original COGS entry on the sale is left untouched. The
+    journal stays balanced; both rows are tied to the invoice so a later edit or
+    void reverses them too."""
+    variance_acct   = _ensure_price_variance_account()
+    inventory_asset = ChartOfAccounts.objects.filter(account_number=INVENTORY_ASSET_NUMBER).first()
+    post_date       = invoice.purchase_date
+
+    # New cost of the sold units, allocated across the edited lines per key.
+    alloc    = {k: v['qty'] for k, v in sold_by_key.items()}
+    new_cost = {k: Decimal('0') for k in sold_by_key}
+    names    = {}
+    for it in item_objs:
+        if it.line_type != 'stock' or not it.item_id or not it.warehouse_id:
+            continue
+        key = (int(it.item_id), int(it.warehouse_id))
+        if key not in alloc:
+            continue
+        names.setdefault(key, it.item_name)
+        take = min(alloc[key], it.quantity)
+        if take <= 0:
+            continue
+        alloc[key] -= take
+        new_cost[key] += take * it.actual_unit_cost
+
+    for key, agg in sold_by_key.items():
+        variance = (new_cost[key] - agg['cost']).quantize(CENT)
+        if variance == 0:
+            continue
+        nm = names.get(key, '')
+        if variance > 0:
+            # Sold goods cost more than first recorded → recognise extra cost.
+            if inventory_asset:
+                _post_le(inventory_asset, 'credit', variance, invoice,
+                         f'Koreksi persediaan unit terjual: {nm} — {invoice.internal_id}', post_date)
+            _post_le(variance_acct, 'debit', variance, invoice,
+                     f'Selisih harga beli unit terjual: {nm} — {invoice.internal_id}', post_date)
+        else:
+            amt = -variance
+            if inventory_asset:
+                _post_le(inventory_asset, 'debit', amt, invoice,
+                         f'Koreksi persediaan unit terjual: {nm} — {invoice.internal_id}', post_date)
+            _post_le(variance_acct, 'credit', amt, invoice,
+                     f'Selisih harga beli unit terjual: {nm} — {invoice.internal_id}', post_date)
+
+
 # ── Suppliers ──────────────────────────────────────────────────────────────────
 
 class SupplierListCreateView(APIView):
@@ -568,7 +643,9 @@ class PurchaseInvoiceListCreateView(APIView):
 
             PurchaseInvoiceItem.objects.bulk_create(item_objs)
 
-            # Create inventory batches (FIFO stock-in) with actual_unit_cost as batch value
+            # Create inventory batches (FIFO stock-in). value is the TOTAL batch
+            # value (actual_unit_cost × qty); every consumer derives the per-unit
+            # cost as value / quantity_initial.
             for b in batches_to_create:
                 InventoryBatch.objects.create(
                     item_id=b['item_id'],
@@ -576,7 +653,7 @@ class PurchaseInvoiceListCreateView(APIView):
                     input_date=invoice.purchase_date,
                     quantity_initial=b['qty'],
                     quantity_remaining=b['qty'],
-                    value=b['cost'],
+                    value=b['cost'] * b['qty'],
                     purchase_invoice=invoice,
                 )
 
@@ -659,15 +736,26 @@ class PurchaseInvoiceDetailView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Block edit if any inventory from this invoice has already been partially consumed
-        consumed_batches = obj.inventory_batches.filter(
-            quantity_remaining__lt=F('quantity_initial')
-        )
-        if consumed_batches.exists():
-            return Response(
-                {'error': 'Cannot edit: some inventory from this invoice has already been used.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # Snapshot the units this invoice's batches have already sold, per (item,
+        # warehouse). A batch's (initial − remaining) is how many of its units
+        # sales consumed, and (value / initial) × sold is the exact cost those
+        # sales posted (mirrors _fifo_deduct). We preserve that portion as a
+        # fully-drawn "frozen" batch and post a price-variance for it rather than
+        # reversing it, so the sale's COGS is never disturbed and the journal
+        # stays balanced. (Replaces the old hard block on consumed inventory.)
+        sold_by_key = {}   # (item_id, warehouse_id) -> {'qty', 'cost', 'date'}
+        for b in obj.inventory_batches.all():
+            sold = b.quantity_initial - b.quantity_remaining
+            if sold <= 0:
+                continue
+            key = (b.item_id, b.warehouse_id)
+            per_unit = (b.value / b.quantity_initial) if b.quantity_initial else Decimal('0')
+            agg = sold_by_key.setdefault(
+                key, {'qty': Decimal('0'), 'cost': Decimal('0'), 'date': b.input_date})
+            agg['qty']  += sold
+            agg['cost'] += per_unit * sold
+            if b.input_date < agg['date']:
+                agg['date'] = b.input_date
 
         data = request.data
 
@@ -714,8 +802,38 @@ class PurchaseInvoiceDetailView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # Reverse and drop the prior accrual postings before re-posting.
-        # Safe: the PUT guard already refused any invoice with payments.
+        # Refuse to shrink a line below what sales have already consumed — those
+        # units cannot be un-sold by editing the purchase. Checked before any
+        # mutation so the 400 leaves the invoice untouched.
+        new_qty_by_key = {}
+        for row in items:
+            if row.get('line_type', 'stock') != 'stock':
+                continue
+            raw_item = row.get('item')
+            if not raw_item:
+                continue
+            try:
+                k_item = int(raw_item)
+                k_wh   = int(row.get('warehouse') or warehouse_id)
+            except (TypeError, ValueError):
+                continue
+            q = _safe_decimal(row.get('quantity', 0))
+            if q > 0:
+                new_qty_by_key[(k_item, k_wh)] = new_qty_by_key.get((k_item, k_wh), Decimal('0')) + q
+
+        for key, agg in sold_by_key.items():
+            if new_qty_by_key.get(key, Decimal('0')) < agg['qty']:
+                itm = InventoryItem.objects.filter(pk=key[0]).first()
+                nm = itm.name if itm else f'#{key[0]}'
+                return Response(
+                    {'error': f'Tidak dapat mengurangi jumlah "{nm}" di bawah {agg["qty"]:g} unit '
+                              f'yang sudah terjual. Batalkan penjualan terkait lebih dulu.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # Reverse and drop the prior accrual postings before re-posting. This also
+        # reverses any prior price-variance rows; they are recomputed from the
+        # frozen batches below, so the result is idempotent across repeated edits.
         _unpost_purchase(obj)
 
         # Remove old inventory batches and line items
@@ -857,14 +975,39 @@ class PurchaseInvoiceDetailView(APIView):
 
         PurchaseInvoiceItem.objects.bulk_create(item_objs)
 
+        # Frozen batches: units already sold, re-created fully-drawn (remaining=0)
+        # at the exact cost the sale expensed. FIFO never touches them; they only
+        # carry the historical cost anchor forward across future edits. value is
+        # the TOTAL, so value / quantity_initial recovers that anchor per unit.
+        for key, agg in sold_by_key.items():
+            InventoryBatch.objects.create(
+                item_id=key[0],
+                warehouse_id=key[1],
+                input_date=agg['date'],
+                quantity_initial=agg['qty'],
+                quantity_remaining=Decimal('0'),
+                value=agg['cost'],
+                purchase_invoice=obj,
+            )
+
+        # On-hand batches for the remaining (unsold) units at the new cost. The
+        # already-sold quantity per key is subtracted so we never re-stock units
+        # that have left. value is the TOTAL batch value (per-unit × on-hand qty).
+        alloc = {k: v['qty'] for k, v in sold_by_key.items()}
         for b in batches_to_create:
+            key = (int(b['item_id']), int(b['warehouse_id']))
+            take = min(alloc.get(key, Decimal('0')), b['qty'])
+            alloc[key] = alloc.get(key, Decimal('0')) - take
+            onhand = b['qty'] - take
+            if onhand <= 0:
+                continue
             InventoryBatch.objects.create(
                 item_id=b['item_id'],
                 warehouse_id=b['warehouse_id'],
                 input_date=obj.purchase_date,
-                quantity_initial=b['qty'],
-                quantity_remaining=b['qty'],
-                value=b['cost'],
+                quantity_initial=onhand,
+                quantity_remaining=onhand,
+                value=b['cost'] * onhand,
                 purchase_invoice=obj,
             )
 
@@ -872,8 +1015,11 @@ class PurchaseInvoiceDetailView(APIView):
         obj.total_amount = grand_total
         obj.save(update_fields=['total_amount'])
 
-        # Re-post the accrual double-entry for the replaced lines.
+        # Re-post the accrual double-entry for the replaced lines, then correct
+        # the sold-unit price difference into the variance account.
         _post_purchase_accrual(obj, parsed, item_objs, supplier, grand_total)
+        if sold_by_key:
+            _post_purchase_price_variance(obj, sold_by_key, item_objs)
 
         AuditLog.objects.create(
             performed_by=_actor(request),

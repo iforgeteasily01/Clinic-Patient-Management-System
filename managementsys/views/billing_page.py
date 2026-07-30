@@ -10,6 +10,7 @@ from rest_framework.views import APIView
 from ..api.serializers import BillingPatientSerializer
 from ..models import ActivePatient, AppUser, AuditLog, ChartOfAccounts, Invoice, InvoiceItem, TreatmentMaterial
 from .inventory_page import _fifo_deduct_global
+from .invoice_page import ACC_CASH, _post_legs, _revenue_legs
 
 
 def _actor(request):
@@ -103,9 +104,22 @@ class BillingCompleteView(APIView):
         promotion_code = (request.data.get('promotion_code') or '').strip()
 
         # ── Create Invoice ────────────────────────────────────────────────────
+        # The cash side has to land somewhere or the entry cannot balance, so an
+        # unspecified payment method falls back to Cash.
+        payment_account = None
+        if request.data.get('payment_method_id'):
+            payment_account = ChartOfAccounts.objects.filter(
+                pk=request.data['payment_method_id'],
+                parent__account_number=1100000,
+                is_head=False,
+            ).first()
+        if payment_account is None:
+            payment_account = ChartOfAccounts.objects.filter(account_number=ACC_CASH).first()
+
         invoice = Invoice.objects.create(
             datetime=timezone.now(),
             patient_no=active_patient.patient_no,
+            payment_method=payment_account,
             discount=discount,
             tax=Decimal('0'),
             additional_charges=Decimal('0'),
@@ -127,20 +141,16 @@ class BillingCompleteView(APIView):
         ])
 
         # ── Post revenue to GL ────────────────────────────────────────────────
-        fallback_revenue = ChartOfAccounts.objects.filter(account_number=4200000).first()
-        for catalog_item, _name, price, _treatment in lines:
-            if catalog_item is None:
-                continue
-            cat = getattr(catalog_item, 'item_category', None)
-            revenue_acct = (
-                cat.revenue_account
-                if cat and getattr(cat, 'revenue_account_id', None)
-                else fallback_revenue
-            )
-            if revenue_acct:
-                ChartOfAccounts.objects.filter(pk=revenue_acct.pk).update(
-                    balance=F('balance') + price
-                )
+        # Delegated so the billing queue writes the same self-balancing block as
+        # the POS path — cash debit, per-line revenue (including lines with no
+        # catalog item), and the discount plug — as real LedgerEntry rows.
+        # Updating ChartOfAccounts.balance alone, as this used to, left the
+        # stored balances drifting away from the journal.
+        _post_legs(invoice, _revenue_legs(
+            invoice,
+            [(catalog_item, name, Decimal('1'), price)
+             for catalog_item, name, price, _treatment in lines],
+        ))
 
         # ── Post treatment material COGS to GL ───────────────────────────────
         fallback_cogs = ChartOfAccounts.objects.filter(account_number=5100000).first()
@@ -156,14 +166,19 @@ class BillingCompleteView(APIView):
                     if cat and getattr(cat, 'cogs_account_id', None)
                     else fallback_cogs
                 )
+                label = catalog_item.name if catalog_item else treatment.name
                 if inventory_asset:
-                    ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
-                        balance=F('balance') - cogs_amount
-                    )
+                    _post_legs(invoice, [(
+                        inventory_asset, 'credit', cogs_amount,
+                        f'Invoice {invoice.invoice_number} – material: '
+                        f'{material.item.name} for {label}',
+                    )])
                 if cogs_acct:
-                    ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
-                        balance=F('balance') + cogs_amount
-                    )
+                    _post_legs(invoice, [(
+                        cogs_acct, 'debit', cogs_amount,
+                        f'Invoice {invoice.invoice_number} – material COGS: '
+                        f'{material.item.name} for {label}',
+                    )])
 
         # ── CRM refresh ───────────────────────────────────────────────────────
         if active_patient.patient_no_id:

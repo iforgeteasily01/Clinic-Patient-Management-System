@@ -16,7 +16,7 @@ from ..api.serializers import InvoiceCreateSerializer, InvoiceReadSerializer, In
 from ..models import (
     AppUser, AuditLog, ChartOfAccounts, InventoryItem, Invoice, InvoiceItem,
     LedgerEntry, Patient, PatientPackage, PatientPackageRedemption, PromotionUsage,
-    Treatment, TreatmentPackage, Warehouse,
+    Treatment, TreatmentCategory, TreatmentPackage, Warehouse,
 )
 from .crm_page import refresh_crm_profile
 from .inventory_page import _fifo_deduct, _fifo_deduct_global, _fifo_restock, _fifo_restock_global
@@ -50,7 +50,166 @@ def _le(account, entry_type, amount, invoice, description):
         entry_type=entry_type,
         amount=amount,
         invoice=invoice,
+        source_type='invoice',
     )
+
+
+# Account types whose natural (positive) balance sits on the debit side.
+DEBIT_NORMAL_TYPES = {'asset', 'cogs', 'expense', 'other_expense'}
+
+# System accounts the invoice posting routes to. Numbers are fixed by
+# migration 0075; see _revenue_legs for how each is used.
+ACC_SALES_DISCOUNT     = 4100000   # contra-revenue (debit-normal within revenue)
+ACC_PRODUCT_REVENUE    = 4200000
+ACC_TAX_PAYABLE        = 2200000
+ACC_ADDITIONAL_CHARGES = 7100000
+ACC_INVENTORY          = 1300000
+ACC_PRODUCT_COGS       = 5100000
+ACC_CASH               = 1100001
+
+
+def _apply_balance(account, entry_type, amount):
+    """Move ``account.balance`` by ``amount`` in the direction ``entry_type`` implies.
+
+    A debit raises a debit-normal account and lowers a credit-normal one, so the
+    stored balance always matches what the ledger rows derive to.
+    """
+    is_debit = (entry_type == 'debit')
+    natural = account.account_type in DEBIT_NORMAL_TYPES
+    delta = amount if is_debit == natural else -amount
+    ChartOfAccounts.objects.filter(pk=account.pk).update(balance=F('balance') + delta)
+
+
+def _sysacct(number):
+    return ChartOfAccounts.objects.filter(account_number=number).first()
+
+
+def _line_revenue_account(item, item_name, treatments_by_name, fallback_revenue):
+    """Resolve the revenue account for one invoice line.
+
+    Lines carrying an ``InventoryItem`` route by that item's category when it is a
+    service; physical goods are one shared entity and always use the product
+    account. Lines with no item FK (treatments billed by name only) are matched
+    back to a ``Treatment`` by name so they reach the same per-category account
+    the linked path would have used — without this they earn no revenue leg at all.
+    """
+    if item is not None:
+        cat = item.item_category if item.is_service else None
+        return (cat.revenue_account if cat and cat.revenue_account_id else fallback_revenue)
+
+    treatment = treatments_by_name.get((item_name or '').strip().lower())
+    if treatment is not None:
+        cat = TreatmentCategory.objects.filter(
+            name__iexact=(treatment.category or '').strip()
+        ).first() if treatment.category else None
+        if cat and cat.revenue_account_id:
+            return cat.revenue_account
+    return fallback_revenue
+
+
+def _revenue_legs(invoice, lines):
+    """Build the complete, self-balancing cash/revenue block for an invoice.
+
+    ``lines`` is a list of ``(item_or_None, item_name, quantity, price)``.
+
+    Returns ``[(account, entry_type, amount, description), ...]`` where total
+    debits equal total credits by construction:
+
+        Dr  payment account        grand_total
+        Dr  Sales Discount         (balancing plug, when positive)
+            Cr  revenue per line   gross price x quantity
+            Cr  Tax Payable        invoice.tax
+            Cr  Additional Charges invoice.additional_charges
+
+    Revenue is credited gross and every reduction — line ``discount_pct``,
+    ``invoice.discount``, and promotion or package redemptions that were never
+    written back to ``invoice.discount`` — lands in the single Sales Discount
+    contra account. That keeps gross revenue reportable and makes the entry
+    balance regardless of where the reduction came from.
+    """
+    inv_no = invoice.invoice_number
+    fallback_revenue = _sysacct(ACC_PRODUCT_REVENUE)
+
+    unlinked = [(n or '').strip().lower() for it, n, _q, _p in lines if it is None]
+    treatments_by_name = {}
+    if unlinked:
+        treatments_by_name = {
+            t.name.strip().lower(): t
+            for t in Treatment.objects.filter(name__in=[n for n in unlinked if n])
+        }
+        if len(treatments_by_name) < len(set(filter(None, unlinked))):
+            # Fall back to a full scan so case/spacing variants still match.
+            treatments_by_name = {t.name.strip().lower(): t for t in Treatment.objects.all()}
+
+    legs = []
+    gross = Decimal('0')
+
+    for item, item_name, quantity, price in lines:
+        amount = price * quantity
+        if amount == 0:
+            continue
+        gross += amount
+        acct = _line_revenue_account(item, item_name, treatments_by_name, fallback_revenue)
+        if acct:
+            label = item.name if item is not None else (item_name or 'Item')
+            legs.append((acct, 'credit', amount, f'Invoice {inv_no} – {label}'))
+
+    if invoice.tax:
+        acct = _sysacct(ACC_TAX_PAYABLE)
+        if acct:
+            legs.append((acct, 'credit', invoice.tax, f'Invoice {inv_no} – Pajak'))
+
+    if invoice.additional_charges:
+        acct = _sysacct(ACC_ADDITIONAL_CHARGES)
+        if acct:
+            legs.append((acct, 'credit', invoice.additional_charges,
+                         f'Invoice {inv_no} – Biaya tambahan'))
+
+    payment_acct = invoice.payment_method or _sysacct(ACC_CASH)
+    if payment_acct and invoice.grand_total:
+        legs.append((payment_acct, 'debit', invoice.grand_total,
+                     f'Invoice {inv_no} – Payment received'))
+
+    # Whatever is left over is the total discount granted on this invoice.
+    credited = sum(a for _ac, side, a, _d in legs if side == 'credit')
+    debited = sum(a for _ac, side, a, _d in legs if side == 'debit')
+    plug = credited - debited
+    if plug:
+        acct = _sysacct(ACC_SALES_DISCOUNT)
+        if acct:
+            side = 'debit' if plug > 0 else 'credit'
+            legs.append((acct, side, abs(plug), f'Invoice {inv_no} – Diskon penjualan'))
+
+    return legs
+
+
+def _post_legs(invoice, legs, reverse=False):
+    """Write ``legs`` to the ledger and roll account balances, optionally flipped.
+
+    ``reverse=True`` posts the exact opposite of every leg, which is what makes
+    an edit or a void undo a posting completely.
+    """
+    flip = {'debit': 'credit', 'credit': 'debit'}
+    for account, entry_type, amount, description in legs:
+        side = flip[entry_type] if reverse else entry_type
+        _apply_balance(account, side, amount)
+        _le(account, side, amount, invoice,
+            f'{description} (koreksi)' if reverse else description)
+
+
+def _lines_from_dicts(line_items, items_by_id):
+    return [
+        (items_by_id.get(l['item_id']) if l.get('item_id') else None,
+         l.get('item_name', ''), l['quantity'], l['price'])
+        for l in line_items
+    ]
+
+
+def _lines_from_instances(item_instances):
+    return [
+        (inst.item if inst.item_id else None, inst.item_name, inst.quantity, inst.price)
+        for inst in item_instances
+    ]
 
 
 def _post_accounting(invoice, line_items, items_by_id):
@@ -70,14 +229,10 @@ def _post_accounting(invoice, line_items, items_by_id):
     """
     inv_no = invoice.invoice_number
 
-    if invoice.payment_method_id:
-        ChartOfAccounts.objects.filter(pk=invoice.payment_method_id).update(
-            balance=F('balance') + invoice.grand_total
-        )
-        _le(invoice.payment_method, 'debit', invoice.grand_total, invoice,
-            f'Invoice {inv_no} – Payment received')
+    # Cash, revenue, tax, additional charges and the discount plug, as one
+    # self-balancing block covering every line — including lines with no item FK.
+    _post_legs(invoice, _revenue_legs(invoice, _lines_from_dicts(line_items, items_by_id)))
 
-    fallback_revenue = ChartOfAccounts.objects.filter(account_number=4200000).first()
     fallback_cogs = ChartOfAccounts.objects.filter(account_number=5100000).first()
     inventory_asset = ChartOfAccounts.objects.filter(account_number=1300000).first()
 
@@ -85,19 +240,9 @@ def _post_accounting(invoice, line_items, items_by_id):
         if not line.get('item_id'):
             continue
         item = items_by_id[line['item_id']]
-        line_revenue = line['price'] * line['quantity']
         # Only services route by category; physical goods are one shared entity.
         cat = item.item_category if item.is_service else None
-
-        revenue_acct = (cat.revenue_account if cat and cat.revenue_account_id else fallback_revenue)
         cogs_acct = (cat.cogs_account if cat and cat.cogs_account_id else fallback_cogs)
-
-        if revenue_acct:
-            ChartOfAccounts.objects.filter(pk=revenue_acct.pk).update(
-                balance=F('balance') + line_revenue
-            )
-            _le(revenue_acct, 'credit', line_revenue, invoice,
-                f'Invoice {inv_no} – {item.name}')
 
         if not item.is_service and invoice.warehouse_id:
             if line['quantity'] > 0:
@@ -142,7 +287,25 @@ def _post_accounting(invoice, line_items, items_by_id):
                             f'Invoice {inv_no} – material COGS: {material.item.name} for {item.name}')
 
 
-def _reverse_accounting_instances(payment_method_id, grand_total, item_instances, warehouse_id, invoice=None):
+def _snapshot_scalars(invoice):
+    """Capture the invoice fields the GL block is derived from.
+
+    A PUT writes the new scalars onto the instance before the reversal runs, so
+    the reversal must be handed the pre-edit values or it will unwind amounts
+    that were never posted.
+    """
+    return {
+        'grand_total': invoice.grand_total,
+        'tax': invoice.tax,
+        'additional_charges': invoice.additional_charges,
+        'discount': invoice.discount,
+        'datetime': invoice.datetime,
+        'payment_method_id': invoice.payment_method_id,
+    }
+
+
+def _reverse_accounting_instances(payment_method_id, grand_total, item_instances, warehouse_id,
+                                  invoice=None, old_scalars=None):
     """
     Reverse every accounting entry that _post_accounting originally made,
     using InvoiceItem model instances (with item relations already prefetched).
@@ -151,17 +314,39 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
     """
     inv_no = invoice.invoice_number if invoice else '?'
 
-    if payment_method_id:
-        ChartOfAccounts.objects.filter(pk=payment_method_id).update(
-            balance=F('balance') - grand_total
-        )
-        if invoice:
-            payment_acct = ChartOfAccounts.objects.filter(pk=payment_method_id).first()
-            if payment_acct:
-                _le(payment_acct, 'credit', grand_total, invoice,
-                    f'Invoice {inv_no} – Payment correction')
+    if invoice is not None:
+        # Undo the exact block _post_accounting wrote. Rebuilding it from the
+        # same inputs and flipping every side keeps the two functions mirror
+        # images by construction rather than by manual upkeep.
+        old = dict(old_scalars or {})
+        old.setdefault('grand_total', grand_total)
+        old.setdefault('payment_method_id', payment_method_id)
+        saved = _snapshot_scalars(invoice)
+        try:
+            invoice.grand_total        = old['grand_total']
+            invoice.tax                = old.get('tax', invoice.tax)
+            invoice.additional_charges = old.get('additional_charges', invoice.additional_charges)
+            invoice.discount           = old.get('discount', invoice.discount)
+            invoice.datetime           = old.get('datetime', invoice.datetime)
+            if old['payment_method_id'] != invoice.payment_method_id:
+                invoice.payment_method = ChartOfAccounts.objects.filter(
+                    pk=old['payment_method_id']).first()
+            legs = _revenue_legs(invoice, _lines_from_instances(item_instances))
+            _post_legs(invoice, legs, reverse=True)
+        finally:
+            invoice.grand_total        = saved['grand_total']
+            invoice.tax                = saved['tax']
+            invoice.additional_charges = saved['additional_charges']
+            invoice.discount           = saved['discount']
+            invoice.datetime           = saved['datetime']
+            if invoice.payment_method_id != saved['payment_method_id']:
+                invoice.payment_method = ChartOfAccounts.objects.filter(
+                    pk=saved['payment_method_id']).first()
+    elif payment_method_id:
+        acct = ChartOfAccounts.objects.filter(pk=payment_method_id).first()
+        if acct:
+            _apply_balance(acct, 'credit', grand_total)
 
-    fallback_revenue = ChartOfAccounts.objects.filter(account_number=4200000).first()
     fallback_cogs    = ChartOfAccounts.objects.filter(account_number=5100000).first()
     inventory_asset  = ChartOfAccounts.objects.filter(account_number=1300000).first()
 
@@ -169,20 +354,9 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
         if not inst.item_id:
             continue
         item = inst.item
-        line_revenue = inst.price * inst.quantity
         # Mirror of _post_accounting: only services route by category.
         cat = item.item_category if item.is_service else None
-
-        revenue_acct = (cat.revenue_account if cat and cat.revenue_account_id else fallback_revenue)
         cogs_acct    = (cat.cogs_account    if cat and cat.cogs_account_id    else fallback_cogs)
-
-        if revenue_acct:
-            ChartOfAccounts.objects.filter(pk=revenue_acct.pk).update(
-                balance=F('balance') - line_revenue
-            )
-            if invoice:
-                _le(revenue_acct, 'debit', line_revenue, invoice,
-                    f'Invoice {inv_no} – Correction: {item.name}')
 
         if not item.is_service and warehouse_id:
             if inst.quantity > 0:
@@ -612,6 +786,7 @@ class InvoiceDetailView(APIView):
                 )
 
         # ── Capture old state before any modifications ────────────────────────
+        old_scalars           = _snapshot_scalars(invoice)
         old_grand_total       = invoice.grand_total
         old_payment_method_id = invoice.payment_method_id
         old_warehouse_id      = invoice.warehouse_id
@@ -713,7 +888,7 @@ class InvoiceDetailView(APIView):
 
         _reverse_accounting_instances(
             old_payment_method_id, old_grand_total, old_item_instances, old_warehouse_id,
-            invoice=invoice,
+            invoice=invoice, old_scalars=old_scalars,
         )
 
         if new_line_items_data is not None:
@@ -723,7 +898,8 @@ class InvoiceDetailView(APIView):
         else:
             # Items unchanged — re-apply using old instances converted to dict format
             old_lines_as_dicts = [
-                {'item_id': inst.item_id, 'quantity': inst.quantity, 'price': inst.price}
+                {'item_id': inst.item_id, 'item_name': inst.item_name,
+                 'quantity': inst.quantity, 'price': inst.price}
                 for inst in old_item_instances
             ]
             old_items_by_id = {
