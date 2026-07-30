@@ -90,6 +90,13 @@ def gl_accounts(db):
     additional_charges = ChartOfAccountsFactory(
         account_number=7100000, name="Additional Charges", account_type="other_income",
     )
+    undeposited = ChartOfAccountsFactory(
+        account_number=1100011, name="Undeposited Funds",
+        account_type="asset", is_head=False, parent=cash_head,
+    )
+    opening_equity = ChartOfAccountsFactory(
+        account_number=3900000, name="Opening Balance Equity", account_type="equity",
+    )
     return {
         "cash": cash,
         "revenue": revenue,
@@ -98,6 +105,8 @@ def gl_accounts(db):
         "sales_discount": sales_discount,
         "tax_payable": tax_payable,
         "additional_charges": additional_charges,
+        "undeposited": undeposited,
+        "opening_equity": opening_equity,
     }
 
 

@@ -116,6 +116,52 @@ class TestInvoicePostingBalances:
             entry_type="debit", amount=Decimal("2500"),
         ).exists()
 
+    def test_line_discount_pct_is_recorded_as_a_discount(self, auth_api, stock, gl_accounts):
+        """What the fixed cashier app now sends: gross price plus discount_pct.
+
+        The WinUI POS used to send the gross price with a grand_total already net
+        of the line discount, leaving the difference as an unexplained residual.
+        With discount_pct present the same money is still a discount, but the
+        invoice record now says so.
+        """
+        invoice = _post(
+            auth_api, stock, gl_accounts,
+            [{"item_id": stock["item"].id, "price": 10000, "quantity": 1,
+              "discount_pct": 20}],
+            grand_total=8000,
+        )
+        debit, credit = _sides(invoice)
+        assert debit == credit
+        # Revenue stays gross; the 20% lands in contra-revenue.
+        assert LedgerEntry.objects.filter(
+            invoice=invoice, account=gl_accounts["revenue"],
+            entry_type="credit", amount=Decimal("10000"),
+        ).exists()
+        assert LedgerEntry.objects.filter(
+            invoice=invoice, account=gl_accounts["sales_discount"],
+            entry_type="debit", amount=Decimal("2000"),
+        ).exists()
+
+    def test_missing_payment_method_goes_to_the_clearing_account(
+            self, auth_api, stock, gl_accounts):
+        """Unidentified receipts must not silently inflate Cash."""
+        res = auth_api.post(reverse("invoice-create"), {
+            "warehouse_id": stock["warehouse"].id,
+            "discount": 0, "tax": 0, "additional_charges": 0,
+            "grand_total": 10000,
+            "items": [{"item_id": stock["item"].id, "price": 10000, "quantity": 1}],
+        }, format="json")
+        assert res.status_code in (200, 201), res.content
+        invoice = Invoice.objects.latest("id")
+        debit, credit = _sides(invoice)
+        assert debit == credit
+        assert LedgerEntry.objects.filter(
+            invoice=invoice, account=gl_accounts["undeposited"], entry_type="debit",
+        ).exists()
+        assert not LedgerEntry.objects.filter(
+            invoice=invoice, account=gl_accounts["cash"],
+        ).exists()
+
     def test_edit_then_void_leaves_no_net_effect(self, auth_api, stock, gl_accounts):
         invoice = _post(
             auth_api, stock, gl_accounts,

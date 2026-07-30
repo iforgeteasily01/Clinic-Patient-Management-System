@@ -58,6 +58,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'managementsys.discord_alerts.DiscordErrorAlertMiddleware',
 ]
 
 CORS_ALLOW_ALL_ORIGINS = True
@@ -148,6 +149,23 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Discord error alerts
+# Leave DISCORD_WEBHOOK_URL empty to disable the feature entirely.
+DISCORD_WEBHOOK_URL       = env.str('DISCORD_WEBHOOK_URL', '')
+# Which response codes to report: comma-separated codes and/or ranges.
+# '404,500-599' = 404s + all server errors. '400-599' = every client & server error.
+DISCORD_ALERT_STATUSES    = env.str('DISCORD_ALERT_STATUSES', '404,500-599')
+# Seconds to suppress repeats of the same status+method+path (0 = no throttling).
+DISCORD_ALERT_COOLDOWN    = env.int('DISCORD_ALERT_COOLDOWN', 60)
+# Shown in the embed footer — useful to tell dev from production.
+DISCORD_ALERT_ENV_NAME    = env.str('DISCORD_ALERT_ENV_NAME', 'CPMS dev')
+# Optional ping, e.g. '<@123456789>' or '@here'. Empty = silent embed.
+DISCORD_ALERT_MENTION     = env.str('DISCORD_ALERT_MENTION', '')
+# Include the JSON response body in the alert (off if bodies may hold patient data).
+DISCORD_ALERT_INCLUDE_BODY = env.bool('DISCORD_ALERT_INCLUDE_BODY', True)
+# Paths never reported (prefix match).
+DISCORD_ALERT_IGNORE_PATHS = env.list('DISCORD_ALERT_IGNORE_PATHS', ['/favicon.ico', '/static/'])
 
 # Vercel dashboard integration
 CPMS_VERCEL_URL    = env.str('CPMS_VERCEL_URL', 'https://cpms-dashboard-api.vercel.app')

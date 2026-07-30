@@ -10,7 +10,7 @@ from rest_framework.views import APIView
 from ..api.serializers import BillingPatientSerializer
 from ..models import ActivePatient, AppUser, AuditLog, ChartOfAccounts, Invoice, InvoiceItem, TreatmentMaterial
 from .inventory_page import _fifo_deduct_global
-from .invoice_page import ACC_CASH, _post_legs, _revenue_legs
+from .invoice_page import ACC_UNDEPOSITED, _post_legs, _revenue_legs
 
 
 def _actor(request):
@@ -104,8 +104,10 @@ class BillingCompleteView(APIView):
         promotion_code = (request.data.get('promotion_code') or '').strip()
 
         # ── Create Invoice ────────────────────────────────────────────────────
-        # The cash side has to land somewhere or the entry cannot balance, so an
-        # unspecified payment method falls back to Cash.
+        # The cash side has to land somewhere or the entry cannot balance. The
+        # billing queue does not capture how the patient paid, so an unspecified
+        # method goes to the clearing account — Cash would assert a payment method
+        # nobody recorded.
         payment_account = None
         if request.data.get('payment_method_id'):
             payment_account = ChartOfAccounts.objects.filter(
@@ -114,7 +116,8 @@ class BillingCompleteView(APIView):
                 is_head=False,
             ).first()
         if payment_account is None:
-            payment_account = ChartOfAccounts.objects.filter(account_number=ACC_CASH).first()
+            payment_account = ChartOfAccounts.objects.filter(
+                account_number=ACC_UNDEPOSITED).first()
 
         invoice = Invoice.objects.create(
             datetime=timezone.now(),

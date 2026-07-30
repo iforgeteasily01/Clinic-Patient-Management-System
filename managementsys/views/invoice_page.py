@@ -66,6 +66,9 @@ ACC_ADDITIONAL_CHARGES = 7100000
 ACC_INVENTORY          = 1300000
 ACC_PRODUCT_COGS       = 5100000
 ACC_CASH               = 1100001
+# Receipts whose payment method was never captured (migration 0076).
+ACC_UNDEPOSITED        = 1100011
+ACC_OPENING_EQUITY     = 3900000
 
 
 def _apply_balance(account, entry_type, amount):
@@ -165,7 +168,11 @@ def _revenue_legs(invoice, lines):
             legs.append((acct, 'credit', invoice.additional_charges,
                          f'Invoice {inv_no} – Biaya tambahan'))
 
-    payment_acct = invoice.payment_method or _sysacct(ACC_CASH)
+    # An unknown payment method goes to the clearing account rather than Cash, so
+    # unidentified receipts stay visible instead of inflating the cash balance.
+    payment_acct = (invoice.payment_method
+                    or _sysacct(ACC_UNDEPOSITED)
+                    or _sysacct(ACC_CASH))
     if payment_acct and invoice.grand_total:
         legs.append((payment_acct, 'debit', invoice.grand_total,
                      f'Invoice {inv_no} – Payment received'))
