@@ -1,8 +1,10 @@
 """
 ensure_category_accounts
 ========================
-Backfills missing revenue, COGS, and expense GL accounts for every
-TreatmentCategory (which is also the item_category used by InventoryItem).
+Backfills the missing revenue GL account for every TreatmentCategory (which
+is also the item_category used by InventoryItem). As of Phase 3, COGS/expense
+are no longer per-category accounts — those postings now come from the
+Expense model instead.
 
 Usage:
     python manage.py ensure_category_accounts
@@ -49,7 +51,7 @@ def _ensure_account(category, field_name, range_min, range_max, account_type, la
 
 
 class Command(BaseCommand):
-    help = 'Ensure every TreatmentCategory has revenue, COGS, and expense GL accounts.'
+    help = 'Ensure every TreatmentCategory has a revenue GL account.'
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -63,9 +65,7 @@ class Command(BaseCommand):
         if dry_run:
             self.stdout.write(self.style.WARNING('DRY RUN — no changes will be saved.\n'))
 
-        categories = TreatmentCategory.objects.select_related(
-            'revenue_account', 'cogs_account', 'expense_account',
-        ).order_by('name')
+        categories = TreatmentCategory.objects.select_related('revenue_account').order_by('name')
 
         if not categories.exists():
             self.stdout.write('No treatment categories found.')
@@ -77,10 +77,6 @@ class Command(BaseCommand):
         for cat in categories:
             _ensure_account(cat, 'revenue_account', 4400000, 4999999,
                             'revenue', 'Treatment Revenue', dry_run, created, already_exist)
-            _ensure_account(cat, 'cogs_account', 5400000, 5999999,
-                            'cogs', 'COGS', dry_run, created, already_exist)
-            _ensure_account(cat, 'expense_account', 6900000, 6999999,
-                            'expense', 'Expense', dry_run, created, already_exist)
 
         if already_exist:
             self.stdout.write(self.style.SUCCESS(f'Already linked ({len(already_exist)}):'))

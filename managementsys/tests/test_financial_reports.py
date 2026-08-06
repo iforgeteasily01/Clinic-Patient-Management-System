@@ -10,7 +10,7 @@ from decimal import Decimal
 import pytest
 from rest_framework.test import APIRequestFactory, force_authenticate
 
-from managementsys.models import LedgerEntry
+from managementsys.models import JournalDayLog, LedgerEntry
 from managementsys.views.financial_reports_page import (
     BalanceSheetView,
     CashFlowView,
@@ -24,6 +24,16 @@ D1 = datetime.date(2026, 1, 10)   # capital injection
 D2 = datetime.date(2026, 1, 20)   # sale + expense
 FROM = '2026-01-01'
 TO = '2026-01-31'
+
+
+def _mark_range_posted(date_from, date_to):
+    """Simulate a journal run's JournalDayLog side effect: every calendar day
+    in the range is marked posted, not just the days with transactions — a
+    real run does the same (it sweeps the whole span, not just active days)."""
+    cur = date_from
+    while cur <= date_to:
+        JournalDayLog.objects.get_or_create(date=cur, defaults={'is_posted': True})
+        cur += datetime.timedelta(days=1)
 
 
 def _le(account, entry_type, amount, when, source='manual'):
@@ -46,6 +56,13 @@ def books(db):
     _le(revenue, 'credit', 500_000, D2, 'invoice')
     _le(expense, 'debit', 200_000, D2, 'adjustment')    # expense paid cash
     _le(cash, 'credit', 200_000, D2, 'adjustment')
+
+    # Phase 2: every report now refuses to compute over a range with any
+    # unposted calendar day. These LedgerEntry rows are written directly
+    # (bypassing the journal run, same as a manual JournalAdjustmentView
+    # entry), so the whole reporting window is marked posted here — mirroring
+    # what a journal run covering FROM..TO would have done.
+    _mark_range_posted(datetime.date.fromisoformat(FROM), datetime.date.fromisoformat(TO))
     return {'cash': cash, 'revenue': revenue, 'expense': expense, 'equity': equity}
 
 
@@ -107,3 +124,46 @@ def test_xlsx_export(books):
 def test_invalid_date_returns_400(books):
     resp = _call(ProfitLossView, date_from='not-a-date', date_to=TO)
     assert resp.status_code == 400
+
+
+def test_report_rejects_range_with_unposted_day(books):
+    """A day inside the requested range with no JournalDayLog row (or
+    is_posted=False) must 400 with the list of offending dates, instead of
+    silently reporting a partially-posted period as complete."""
+    D3 = datetime.date(2026, 1, 25)
+    _le(books['cash'], 'debit', 50_000, D3, 'invoice')
+    # The `books` fixture already swept the whole FROM..TO range, including
+    # D3 — flip it back to "never swept" to simulate a day that was missed.
+    JournalDayLog.objects.filter(date=D3).delete()
+
+    resp = _call(ProfitLossView, date_from=FROM, date_to=TO)
+    assert resp.status_code == 400
+    assert D3.isoformat() in resp.data['unposted_dates']
+
+    resp = _call(GeneralLedgerView, account='all', date_from=FROM, date_to=TO)
+    assert resp.status_code == 400
+    assert D3.isoformat() in resp.data['unposted_dates']
+
+    resp = _call(CashFlowView, date_from=FROM, date_to=TO)
+    assert resp.status_code == 400
+
+    # as_of-style reports (Trial Balance / Balance Sheet) are cumulative from
+    # the earliest ledger date, so an unposted day anywhere before as_of also
+    # blocks them.
+    resp = _call(TrialBalanceView, as_of=TO)
+    assert resp.status_code == 400
+    assert D3.isoformat() in resp.data['unposted_dates']
+
+    resp = _call(BalanceSheetView, as_of=TO)
+    assert resp.status_code == 400
+
+
+def test_report_succeeds_once_the_extra_day_is_posted(books):
+    # `books` already sweeps the whole FROM..TO range, so a transaction
+    # landing on any day in it (D3 included) is fine out of the box — this
+    # pins that a posted day with activity does NOT block the report.
+    D3 = datetime.date(2026, 1, 25)
+    _le(books['cash'], 'debit', 50_000, D3, 'invoice')
+
+    resp = _call(ProfitLossView, date_from=FROM, date_to=TO)
+    assert resp.status_code == 200

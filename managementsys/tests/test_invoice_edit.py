@@ -5,6 +5,7 @@ new lines. The invariant these tests defend is that reverse-then-repost is
 value-neutral: create -> edit -> void must leave every account balance and every
 batch exactly where it started.
 """
+import datetime
 from decimal import Decimal
 
 import pytest
@@ -20,10 +21,23 @@ from managementsys.models import (
 from .factories import InventoryBatchFactory, InventoryItemFactory
 
 
+def _run_journal(auth_api, through=None):
+    """Phase 2: creation is deferred (posting_status='unposted', zero
+    LedgerEntry rows, stock untouched) until this runs. A subsequent void/edit
+    of a *posted* invoice then takes the same-day memo path, which does
+    perform the real FIFO restock/deduct immediately (only the ledger rows are
+    memo-dated) — these edit/void tests need that, so they sweep first,
+    mirroring how the app is actually used."""
+    date_to = (through or datetime.date.today()).isoformat()
+    res = auth_api.post(reverse("accounting-journal-run"), {"date_to": date_to}, format="json")
+    assert res.status_code == 200, res.content
+    return res.json()
+
+
 def _create_payload(stock, gl_accounts, *, item_id=None, quantity, price, grand_total):
     return {
         "warehouse_id": stock["warehouse"].id,
-        "payment_method_id": gl_accounts["cash"].id,
+        "payment_method_id": gl_accounts["cash_method"].id,
         "discount": 0,
         "tax": 0,
         "additional_charges": 0,
@@ -51,6 +65,7 @@ def sold_invoice(auth_api, stock, gl_accounts):
         format="json",
     )
     assert res.status_code in (200, 201), res.content
+    _run_journal(auth_api)
     return Invoice.objects.latest("id")
 
 
@@ -152,6 +167,7 @@ class TestReversalIsValueNeutral:
         )
         assert res.status_code in (200, 201), res.content
         invoice = Invoice.objects.latest("id")
+        _run_journal(auth_api)
 
         res = auth_api.put(
             reverse("invoice-detail", args=[invoice.pk]),
@@ -295,6 +311,7 @@ class TestServiceMaterialReversal:
         )
         assert res.status_code in (200, 201), res.content
         invoice = Invoice.objects.latest("id")
+        _run_journal(auth_api)
 
         # 5 units of material consumed by the service.
         assert InventoryBatch.objects.get(pk=facial["batch"].pk).quantity_remaining == Decimal("95.0000")
@@ -315,6 +332,7 @@ class TestServiceMaterialReversal:
         )
         assert res.status_code in (200, 201), res.content
         invoice = Invoice.objects.latest("id")
+        _run_journal(auth_api)
         assert InventoryBatch.objects.get(pk=facial["batch"].pk).quantity_remaining == Decimal("95.0000")
 
         # Swap the service for a plain product: the material must come back.

@@ -7,7 +7,8 @@ database. Idempotent — safe to re-run.
 It does three things:
   1. Generates a ``TreatmentCategory`` for every distinct ``Treatment.category``
      string currently in use (so each in-use category becomes a real record).
-  2. Ensures every category has its revenue / COGS / expense GL accounts.
+  2. Ensures every category has its revenue GL account. (COGS/expense are no
+     longer per-category as of Phase 3 — they now come from the Expense model.)
   3. Links each treatment's mirror catalog item to its category so future POS
      sales route to that category's accounts. (Physical inventory items are a
      single entity and keep posting to the shared product accounts
@@ -23,7 +24,7 @@ from django.core.management.base import BaseCommand
 
 from managementsys.models import InventoryItem, Treatment, TreatmentCategory
 
-ACCOUNT_FIELDS = ('revenue_account', 'cogs_account', 'expense_account')
+ACCOUNT_FIELDS = ('revenue_account',)
 
 
 class Command(BaseCommand):
@@ -117,6 +118,4 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS('\nAvailable treatment categories:'))
         for cat in TreatmentCategory.objects.select_related(*ACCOUNT_FIELDS).order_by('name'):
             rev = cat.revenue_account.account_number if cat.revenue_account_id else '—'
-            cogs = cat.cogs_account.account_number if cat.cogs_account_id else '—'
-            exp = cat.expense_account.account_number if cat.expense_account_id else '—'
-            self.stdout.write(f'  {cat.name}: revenue {rev} | COGS {cogs} | expense {exp}')
+            self.stdout.write(f'  {cat.name}: revenue {rev}')

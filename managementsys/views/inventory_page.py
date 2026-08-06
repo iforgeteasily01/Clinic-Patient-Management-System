@@ -611,55 +611,109 @@ def _to_small(item: InventoryItem, qty: Decimal, unit: str) -> Decimal:
     return qty
 
 
-@transaction.atomic
-def _fifo_deduct(item_id: int, warehouse_id: int, quantity: Decimal) -> tuple:
-    """Deduct stock FIFO. Returns (shortfall, cogs_amount). shortfall=0 means fully deducted."""
-    batches = (
-        InventoryBatch.objects
-        .select_for_update()
-        .filter(item_id=item_id, warehouse_id=warehouse_id, quantity_remaining__gt=0)
-        .order_by('input_date', 'created_at')
-    )
+class FifoSimulation:
+    """Virtual consumption ledger for dry-run FIFO.
+
+    A journal *preview* has to know what COGS an invoice would produce without
+    consuming any stock. Reading the live batch rows once per line is not enough:
+    a preview covers many invoices, and two of them may draw on the same batch.
+    Without a memory of what earlier previewed lines "used", the second invoice
+    would see stock the first one already claimed and both would report a full
+    COGS figure.
+
+    So dry runs share one of these for the whole preview. It records how much of
+    each batch has been virtually consumed and subtracts that from the batch's
+    real ``quantity_remaining``. Nothing here is written to the database.
+    """
+
+    __slots__ = ('_consumed',)
+
+    def __init__(self):
+        self._consumed = {}
+
+    def available(self, batch) -> Decimal:
+        used = self._consumed.get(batch.pk, Decimal('0'))
+        left = Decimal(batch.quantity_remaining) - used
+        return left if left > 0 else Decimal('0')
+
+    def consume(self, batch, quantity: Decimal) -> None:
+        self._consumed[batch.pk] = self._consumed.get(batch.pk, Decimal('0')) + quantity
+
+
+def _fifo_batches(item_id: int, warehouse_id=None, *, lock: bool):
+    """The FIFO queue for an item, oldest batch first.
+
+    ``lock`` is False only for dry runs. The real deduction locks the rows for
+    the life of the enclosing transaction, which is correct there; a preview
+    that took the same locks would hold them across hundreds of documents and
+    stall the POS. A dry run therefore reads unlocked and accepts that its
+    answer is a snapshot — which is why previewed COGS is recomputed at commit.
+    """
+    criteria = {'item_id': item_id, 'quantity_remaining__gt': 0}
+    if warehouse_id is not None:
+        criteria['warehouse_id'] = warehouse_id
+    # Kept as a single .filter() on the manager so the chain is byte-for-byte
+    # what it was before the dry-run split — test_fifo.py mocks this exact call
+    # sequence, and a queryset that behaves the same but is *built* differently
+    # would break it for no reason.
+    manager = InventoryBatch.objects.select_for_update() if lock else InventoryBatch.objects
+    return manager.filter(**criteria).order_by('input_date', 'created_at')
+
+
+def _fifo_walk(batches, quantity: Decimal, *, commit: bool, sim: 'FifoSimulation | None' = None) -> tuple:
+    """Walk the FIFO queue consuming ``quantity``. Returns (shortfall, cogs).
+
+    The single implementation behind both the real deduction and its dry run —
+    if these two ever diverged, the preview would confidently show a COGS figure
+    the commit would never post.
+    """
     remaining = Decimal(quantity)
     cogs = Decimal('0')
     for batch in batches:
         if remaining <= 0:
             break
-        deduct = min(batch.quantity_remaining, remaining)
+        on_hand = sim.available(batch) if sim is not None else Decimal(batch.quantity_remaining)
+        if on_hand <= 0:
+            continue
+        deduct = min(on_hand, remaining)
         if batch.quantity_initial:
             cogs += (batch.value / batch.quantity_initial) * deduct
-        batch.quantity_remaining -= deduct
-        batch.save(update_fields=['quantity_remaining'])
+        if commit:
+            batch.quantity_remaining -= deduct
+            batch.save(update_fields=['quantity_remaining'])
+        elif sim is not None:
+            sim.consume(batch, deduct)
         remaining -= deduct
     return remaining, cogs
 
 
-def _fifo_deduct_global(item_id: int, quantity_small: Decimal) -> tuple:
+def _fifo_deduct(item_id: int, warehouse_id: int, quantity: Decimal,
+                 *, commit: bool = True, sim: 'FifoSimulation | None' = None) -> tuple:
+    """Deduct stock FIFO. Returns (shortfall, cogs_amount). shortfall=0 means fully deducted.
+
+    ``commit=False`` computes the same answer without touching a single row —
+    used by the journal preview. Pass the same ``sim`` for every dry-run call in
+    one preview so repeated draws on a batch stay honest.
+    """
+    if not commit:
+        return _fifo_walk(_fifo_batches(item_id, warehouse_id, lock=False),
+                          quantity, commit=False, sim=sim)
+    with transaction.atomic():
+        return _fifo_walk(_fifo_batches(item_id, warehouse_id, lock=True),
+                          quantity, commit=True)
+
+
+def _fifo_deduct_global(item_id: int, quantity_small: Decimal,
+                        *, commit: bool = True, sim: 'FifoSimulation | None' = None) -> tuple:
     """
     Deduct a decimal quantity (in unit_small) from any warehouse, FIFO by date.
-    Returns (shortfall, cogs_amount).
+    Returns (shortfall, cogs_amount). See ``_fifo_deduct`` for ``commit``/``sim``.
     """
     qty = Decimal(quantity_small)
     if qty <= 0:
         return Decimal('0'), Decimal('0')
-    batches = (
-        InventoryBatch.objects
-        .select_for_update()
-        .filter(item_id=item_id, quantity_remaining__gt=0)
-        .order_by('input_date', 'created_at')
-    )
-    remaining = qty
-    cogs = Decimal('0')
-    for batch in batches:
-        if remaining <= 0:
-            break
-        deduct = min(batch.quantity_remaining, remaining)
-        if batch.quantity_initial:
-            cogs += (batch.value / batch.quantity_initial) * deduct
-        batch.quantity_remaining -= deduct
-        batch.save(update_fields=['quantity_remaining'])
-        remaining -= deduct
-    return remaining, cogs
+    return _fifo_walk(_fifo_batches(item_id, None, lock=commit),
+                      qty, commit=commit, sim=None if commit else sim)
 
 
 @transaction.atomic

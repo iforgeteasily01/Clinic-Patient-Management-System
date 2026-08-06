@@ -171,7 +171,7 @@ class SalesRangeReportView(APIView):
 
         breakdown = (
             invoices
-            .values('payment_method_id', 'payment_method__name', 'payment_method__account_number')
+            .values('payment_method_id', 'payment_method__name', 'payment_method__linked_account__account_number')
             .annotate(total=Sum('grand_total'), invoice_count=Count('id'))
             .order_by('-total')
         )
@@ -184,7 +184,7 @@ class SalesRangeReportView(APIView):
             'by_account': [
                 {
                     'account_id': r['payment_method_id'],
-                    'account_number': r['payment_method__account_number'],
+                    'account_number': r['payment_method__linked_account__account_number'],
                     'account_name': r['payment_method__name'] or 'Tidak Diketahui',
                     'total': str(r['total'] or 0),
                     'invoice_count': r['invoice_count'],

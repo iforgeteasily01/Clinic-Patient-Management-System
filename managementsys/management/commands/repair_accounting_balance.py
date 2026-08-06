@@ -37,12 +37,12 @@ from managementsys.accounting_checks import (
     invoices_missing_from_ledger, trial_balance, unbalanced_documents,
 )
 from managementsys.models import (
-    ChartOfAccounts, Invoice, LedgerEntry, PurchaseInvoice,
+    ChartOfAccounts, Invoice, LedgerEntry, PaymentMethod, PurchaseInvoice,
 )
-from managementsys.views.invoice_page import (
-    ACC_INVENTORY, ACC_OPENING_EQUITY, ACC_UNDEPOSITED,
-    _lines_from_instances, _post_legs, _revenue_legs,
+from managementsys.services.journal_engine import (
+    ACC_INVENTORY, ACC_OPENING_EQUITY, ACC_UNDEPOSITED, _post_legs, _revenue_legs,
 )
+from managementsys.views.invoice_page import _lines_from_instances
 
 D = Decimal
 
@@ -117,7 +117,7 @@ class Command(BaseCommand):
         )
         invoices = (
             Invoice.objects.filter(id__in=invoice_ids)
-            .select_related('payment_method')
+            .select_related('payment_method', 'payment_method__linked_account')
             .prefetch_related(
                 'items__item__item_category__revenue_account',
                 'ledger_entries__account',
@@ -163,15 +163,21 @@ class Command(BaseCommand):
         stats = defaultdict(int)
         stats['amount'] = D('0')
 
-        clearing = ChartOfAccounts.objects.filter(account_number=ACC_UNDEPOSITED).first()
+        clearing_account = ChartOfAccounts.objects.filter(account_number=ACC_UNDEPOSITED).first()
+        clearing_method = None
+        if clearing_account is not None:
+            clearing_method, _ = PaymentMethod.objects.get_or_create(
+                linked_account=clearing_account,
+                defaults={'name': clearing_account.name, 'is_system': True},
+            )
         missing = (invoices_missing_from_ledger(cutoff, include_imported)
-                   .select_related('payment_method')
+                   .select_related('payment_method', 'payment_method__linked_account')
                    .prefetch_related('items__item__item_category__revenue_account'))
 
         for invoice in missing:
             if invoice.payment_method_id is None:
                 # Record where the money was parked so the invoice explains itself.
-                invoice.payment_method = clearing
+                invoice.payment_method = clearing_method
                 invoice.save(update_fields=['payment_method'])
                 stats['assigned_clearing'] += 1
             legs = _revenue_legs(invoice, _lines_from_instances(list(invoice.items.all())))

@@ -36,7 +36,15 @@ def _next_account_number(COA, range_min, range_max, step=1000):
 
 
 def _ensure_accounts(cat, COA):
-    """Create any missing GL accounts for a category (historical models)."""
+    """Create any missing GL accounts for a category (historical models).
+
+    ``hasattr`` guards around cogs_account/expense_account keep this function
+    working two ways: replayed at its real position in migration history (the
+    fields exist — they were not dropped until migration 0086) and invoked
+    directly against the *current* model in tests that exercise this backfill
+    logic in isolation (Phase 3 dropped both fields, so only revenue_account
+    is provisioned then).
+    """
     changed = False
     if cat.revenue_account_id is None:
         cat.revenue_account = COA.objects.create(
@@ -44,13 +52,13 @@ def _ensure_accounts(cat, COA):
             name=f'Treatment Revenue – {cat.name}', account_type='revenue',
         )
         changed = True
-    if cat.cogs_account_id is None:
+    if hasattr(cat, 'cogs_account_id') and cat.cogs_account_id is None:
         cat.cogs_account = COA.objects.create(
             account_number=_next_account_number(COA, *COGS_RANGE),
             name=f'COGS – {cat.name}', account_type='cogs',
         )
         changed = True
-    if cat.expense_account_id is None:
+    if hasattr(cat, 'expense_account_id') and cat.expense_account_id is None:
         cat.expense_account = COA.objects.create(
             account_number=_next_account_number(COA, *EXPENSE_RANGE),
             name=f'Expense – {cat.name}', account_type='expense',

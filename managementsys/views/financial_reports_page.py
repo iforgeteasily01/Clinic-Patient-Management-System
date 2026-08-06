@@ -31,9 +31,11 @@ from .financial_reports_utils import (
     ZERO,
     account_movements,
     accounts_by_id,
+    earliest_ledger_date,
     earnings_through,
     opening_balances,
     signed_balance,
+    unposted_dates_in_range,
 )
 
 WIB = ZoneInfo('Asia/Jakarta')
@@ -100,6 +102,32 @@ def _parse_range(request):
             status=status.HTTP_400_BAD_REQUEST,
         )
     return d_from, d_to, None
+
+
+def _unposted_gate(date_from, date_to):
+    """Return a 400 Response listing unposted_dates when any day in
+    [date_from, date_to] hasn't been posted by a journal run yet, else None.
+    Every report view calls this before computing so a partially-posted
+    period never gets silently reported as complete."""
+    unposted = unposted_dates_in_range(date_from, date_to)
+    if not unposted:
+        return None
+    return Response(
+        {'unposted_dates': [d.isoformat() for d in unposted]},
+        status=status.HTTP_400_BAD_REQUEST,
+    )
+
+
+def _unposted_gate_as_of(as_of):
+    """Same as _unposted_gate but for as_of-style reports (Trial Balance,
+    Balance Sheet), which have no explicit date_from — the range checked runs
+    from the oldest LedgerEntry date through as_of, since those reports are
+    cumulative from the start of the journal. An empty journal has nothing to
+    gate."""
+    start = earliest_ledger_date()
+    if start is None:
+        return None
+    return _unposted_gate(start, as_of)
 
 
 _CENTS = Decimal('0.01')
@@ -171,6 +199,10 @@ class TrialBalanceView(APIView):
             return err
         if not as_of:
             as_of = _today_wib()
+
+        gate = _unposted_gate_as_of(as_of)
+        if gate:
+            return gate
 
         mv = account_movements(date_to=as_of)
         accts = accounts_by_id()
@@ -248,6 +280,10 @@ class ProfitLossView(APIView):
         d_from, d_to, err = _parse_range(request)
         if err:
             return err
+
+        gate = _unposted_gate(d_from, d_to)
+        if gate:
+            return gate
 
         current = self._compute(d_from, d_to)
         payload = {
@@ -370,6 +406,10 @@ class BalanceSheetView(APIView):
         if not as_of:
             as_of = _today_wib()
 
+        gate = _unposted_gate_as_of(as_of)
+        if gate:
+            return gate
+
         mv = account_movements(date_to=as_of)
         accts = accounts_by_id()
 
@@ -467,6 +507,10 @@ class GeneralLedgerView(APIView):
         d_from, d_to, err = _parse_range(request)
         if err:
             return err
+
+        gate = _unposted_gate(d_from, d_to)
+        if gate:
+            return gate
 
         account_param = request.query_params.get('account', 'all').strip()
         accts = accounts_by_id()
@@ -594,6 +638,10 @@ class CashFlowView(APIView):
         d_from, d_to, err = _parse_range(request)
         if err:
             return err
+
+        gate = _unposted_gate(d_from, d_to)
+        if gate:
+            return gate
 
         cash_accounts = list(
             ChartOfAccounts.objects.filter(account_number__in=CASH_ACCOUNT_NUMBERS)

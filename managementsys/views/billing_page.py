@@ -1,16 +1,52 @@
 from decimal import Decimal, InvalidOperation
 
-from django.db.models import F
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..api.serializers import BillingPatientSerializer
-from ..models import ActivePatient, AppUser, AuditLog, ChartOfAccounts, Invoice, InvoiceItem, TreatmentMaterial
-from .inventory_page import _fifo_deduct_global
-from .invoice_page import ACC_UNDEPOSITED, _post_legs, _revenue_legs
+from ..api.serializers import BillingPatientSerializer, todays_notes_by_visit
+from ..models import ActivePatient, AppUser, AuditLog, Invoice, InvoiceItem, PaymentMethod
+
+
+def _already_invoiced(active_patient, lines):
+    """Return an existing invoice that already bills every line in ``lines``.
+
+    The POS creates the invoice itself and is meant to pass ``?skip_invoice=1``
+    when clearing the queue. When a caller forgets, this endpoint used to bill the
+    same visit a second time, producing an invoice with no payment method that
+    double-counted the revenue. A query parameter is too easy to omit to be the
+    only defence, so the visit's own data is checked as well.
+
+    Matching is by (name, price) against non-voided invoices for the same patient
+    on the same day. Guests have no patient record to match on, so they are not
+    guarded here — an unmatched guest falls through and is billed normally.
+    """
+    if not active_patient.patient_no_id or not lines:
+        return None
+
+    wanted = {
+        ((catalog_item.name if catalog_item else name).strip().lower(), price)
+        for catalog_item, name, price, _treatment in lines
+    }
+
+    same_day = (
+        Invoice.objects
+        .filter(patient_no_id=active_patient.patient_no_id,
+                datetime__date=timezone.now().date(),
+                is_voided=False)
+        .prefetch_related('items__item')
+    )
+    for invoice in same_day:
+        billed = {
+            (((item.item.name if item.item_id else item.item_name) or '').strip().lower(),
+             item.price)
+            for item in invoice.items.all()
+        }
+        if wanted <= billed:
+            return invoice
+    return None
 
 
 def _actor(request):
@@ -29,7 +65,7 @@ class BillingQueueView(APIView):
     permission_classes = [AllowAny]
 
     def get(self, request):
-        patients = (
+        patients = list(
             ActivePatient.objects
             .filter(status=5)
             .select_related('patient_no', 'medrec')
@@ -39,7 +75,13 @@ class BillingQueueView(APIView):
             )
             .order_by('visit_time')
         )
-        serializer = BillingPatientSerializer(patients, many=True)
+        # Today's notes for the whole queue in a single query. Letting the
+        # serializer resolve them per patient would be an N+1 on an endpoint the
+        # POS polls; see todays_notes_by_visit().
+        serializer = BillingPatientSerializer(
+            patients, many=True,
+            context={'notes_by_visit': todays_notes_by_visit(patients)},
+        )
         return Response(serializer.data)
 
 
@@ -85,7 +127,6 @@ class BillingCompleteView(APIView):
             active_patient.treatmentsession_set
             .prefetch_related(
                 'treatments__catalog_item__item_category__revenue_account',
-                'treatments__catalog_item__item_category__cogs_account',
                 'treatments__materials__item',
             )
             .all()
@@ -97,6 +138,30 @@ class BillingCompleteView(APIView):
                 catalog_item = getattr(treatment, 'catalog_item', None)
                 lines.append((catalog_item, treatment.name, treatment.price, treatment))
 
+        # ── Refuse to bill a visit that was already invoiced ──────────────────
+        existing = _already_invoiced(active_patient, lines)
+        if existing is not None:
+            label = (
+                active_patient.patient_no.name
+                if active_patient.patient_no_id
+                else active_patient.guest_name
+            )
+            AuditLog.objects.create(
+                performed_by=_actor(request),
+                action='DELETE',
+                entity_type='ActivePatient',
+                entity_id=str(active_patient.id),
+                description=(
+                    f'Billing queue entry cleared for {label} — treatments already '
+                    f'billed on {existing.invoice_number}; duplicate invoice not created'
+                ),
+            )
+            active_patient.delete()
+            return Response(
+                {'invoice_number': existing.invoice_number, 'already_invoiced': True},
+                status=status.HTTP_200_OK,
+            )
+
         # ── Totals ────────────────────────────────────────────────────────────
         subtotal = sum(price for _, _, price, _ in lines)
         discount = _safe_decimal(request.data.get('discount', 0))
@@ -106,23 +171,19 @@ class BillingCompleteView(APIView):
         # ── Create Invoice ────────────────────────────────────────────────────
         # The cash side has to land somewhere or the entry cannot balance. The
         # billing queue does not capture how the patient paid, so an unspecified
-        # method goes to the clearing account — Cash would assert a payment method
-        # nobody recorded.
-        payment_account = None
+        # method is left blank — _revenue_legs falls back to the clearing account
+        # (Cash would assert a payment method nobody recorded).
+        payment_method_obj = None
         if request.data.get('payment_method_id'):
-            payment_account = ChartOfAccounts.objects.filter(
+            payment_method_obj = PaymentMethod.objects.filter(
                 pk=request.data['payment_method_id'],
-                parent__account_number=1100000,
-                is_head=False,
+                is_active=True,
             ).first()
-        if payment_account is None:
-            payment_account = ChartOfAccounts.objects.filter(
-                account_number=ACC_UNDEPOSITED).first()
 
         invoice = Invoice.objects.create(
             datetime=timezone.now(),
             patient_no=active_patient.patient_no,
-            payment_method=payment_account,
+            payment_method=payment_method_obj,
             discount=discount,
             tax=Decimal('0'),
             additional_charges=Decimal('0'),
@@ -143,45 +204,14 @@ class BillingCompleteView(APIView):
             for catalog_item, name, price, _treatment in lines
         ])
 
-        # ── Post revenue to GL ────────────────────────────────────────────────
-        # Delegated so the billing queue writes the same self-balancing block as
-        # the POS path — cash debit, per-line revenue (including lines with no
-        # catalog item), and the discount plug — as real LedgerEntry rows.
-        # Updating ChartOfAccounts.balance alone, as this used to, left the
-        # stored balances drifting away from the journal.
-        _post_legs(invoice, _revenue_legs(
-            invoice,
-            [(catalog_item, name, Decimal('1'), price)
-             for catalog_item, name, price, _treatment in lines],
-        ))
-
-        # ── Post treatment material COGS to GL ───────────────────────────────
-        fallback_cogs = ChartOfAccounts.objects.filter(account_number=5100000).first()
-        inventory_asset = ChartOfAccounts.objects.filter(account_number=1300000).first()
-        for catalog_item, _name, _price, treatment in lines:
-            for material in treatment.materials.all():
-                _shortfall, cogs_amount = _fifo_deduct_global(material.item_id, material.quantity_small)
-                if cogs_amount <= 0:
-                    continue
-                cat = getattr(catalog_item, 'item_category', None) if catalog_item else None
-                cogs_acct = (
-                    cat.cogs_account
-                    if cat and getattr(cat, 'cogs_account_id', None)
-                    else fallback_cogs
-                )
-                label = catalog_item.name if catalog_item else treatment.name
-                if inventory_asset:
-                    _post_legs(invoice, [(
-                        inventory_asset, 'credit', cogs_amount,
-                        f'Invoice {invoice.invoice_number} – material: '
-                        f'{material.item.name} for {label}',
-                    )])
-                if cogs_acct:
-                    _post_legs(invoice, [(
-                        cogs_acct, 'debit', cogs_amount,
-                        f'Invoice {invoice.invoice_number} – material COGS: '
-                        f'{material.item.name} for {label}',
-                    )])
+        # ── Accounting + material stock deduction ─────────────────────────────
+        # Phase 2: journal posting is deferred, same as the POS-created path in
+        # invoice_page.py. The invoice is left posting_status='unposted' (model
+        # default); a journal run (POST /api/accounting/journal/run/) rebuilds
+        # its lines from these InvoiceItem rows and calls the same
+        # _post_accounting() used for POS invoices — which already knows how to
+        # walk item.treatment.materials for service lines like these — so
+        # billing-queue invoices post identically to POS ones, just later.
 
         # ── CRM refresh ───────────────────────────────────────────────────────
         if active_patient.patient_no_id:

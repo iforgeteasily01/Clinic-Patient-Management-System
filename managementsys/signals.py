@@ -4,12 +4,35 @@ Django signal handlers that push events to Vercel after:
   - A patient checks in      (ActivePatient created)
   - A treatment session starts (TreatmentSession created)
   - An invoice is created    (Invoice created)
+
+Plus one integrity guard: dropping guest-only PatientNote rows before the visit
+they hang off is deleted (see below).
 """
-from django.db.models.signals import post_save
+from django.db.models.signals import post_save, pre_delete
 from django.dispatch import receiver
 
-from .models import ActivePatient, Invoice, TreatmentSession
+from .models import ActivePatient, Invoice, PatientNote, TreatmentSession
 from .vercel_push import push
+
+
+# ── Guest note cleanup ────────────────────────────────────────────────────────
+
+@receiver(pre_delete, sender=ActivePatient)
+def on_active_patient_deleted(sender, instance, **kwargs):
+    """Delete notes that would be left with no subject at all.
+
+    ``PatientNote.active_patient`` is SET_NULL, and PatientNote carries a
+    CheckConstraint requiring patient_no OR active_patient. For a walk-in guest
+    the note has no patient_no, so the SET_NULL that Django runs while deleting
+    the visit would produce a row violating that constraint — an IntegrityError
+    right in the middle of checkout (``BillingCompleteView``) or queue-clearing.
+
+    Notes that also carry a patient_no keep their subject and are left alone;
+    they simply lose the visit link, which is what SET_NULL is for.
+    """
+    PatientNote.objects.filter(
+        active_patient_id=instance.pk, patient_no__isnull=True,
+    ).delete()
 
 
 # ── Patient check-in ──────────────────────────────────────────────────────────

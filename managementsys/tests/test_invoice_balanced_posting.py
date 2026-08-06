@@ -7,12 +7,23 @@ whole ledger out of balance by the value of every treatment billed by name.
 
 These tests pin the invariant: for any invoice, total debits equal total credits.
 """
+import datetime
 from decimal import Decimal
 
 import pytest
 from django.urls import reverse
 
 from managementsys.models import ChartOfAccounts, Invoice, LedgerEntry
+
+
+def _run_journal(auth_api, through=None):
+    """Phase 2: posting is deferred to POST /api/accounting/journal/run/ —
+    tests that check the *posted* effect of an invoice sweep it explicitly,
+    same as production usage."""
+    date_to = (through or datetime.date.today()).isoformat()
+    res = auth_api.post(reverse("accounting-journal-run"), {"date_to": date_to}, format="json")
+    assert res.status_code == 200, res.content
+    return res.json()
 
 
 def _sides(invoice):
@@ -25,7 +36,7 @@ def _sides(invoice):
 def _post(auth_api, stock, gl_accounts, items, **totals):
     payload = {
         "warehouse_id": stock["warehouse"].id,
-        "payment_method_id": gl_accounts["cash"].id,
+        "payment_method_id": gl_accounts["cash_method"].id,
         "discount": totals.get("discount", 0),
         "tax": totals.get("tax", 0),
         "additional_charges": totals.get("additional_charges", 0),
@@ -34,7 +45,10 @@ def _post(auth_api, stock, gl_accounts, items, **totals):
     }
     res = auth_api.post(reverse("invoice-create"), payload, format="json")
     assert res.status_code in (200, 201), res.content
-    return Invoice.objects.latest("id")
+    invoice = Invoice.objects.latest("id")
+    _run_journal(auth_api)
+    invoice.refresh_from_db()
+    return invoice
 
 
 @pytest.mark.django_db
@@ -153,6 +167,7 @@ class TestInvoicePostingBalances:
         }, format="json")
         assert res.status_code in (200, 201), res.content
         invoice = Invoice.objects.latest("id")
+        _run_journal(auth_api)
         debit, credit = _sides(invoice)
         assert debit == credit
         assert LedgerEntry.objects.filter(

@@ -12,7 +12,7 @@ from decimal import Decimal
 from django.db.models import F, Sum
 
 from .models import ChartOfAccounts, InventoryBatch, Invoice, InvoiceItem, LedgerEntry
-from .views.invoice_page import ACC_INVENTORY, DEBIT_NORMAL_TYPES
+from .services.journal_engine import ACC_INVENTORY, DEBIT_NORMAL_TYPES
 
 D = Decimal
 

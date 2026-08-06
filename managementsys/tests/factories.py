@@ -12,6 +12,7 @@ from managementsys.models import (
     ChartOfAccounts,
     InventoryBatch,
     InventoryItem,
+    PaymentMethod,
     Warehouse,
 )
 
@@ -76,3 +77,12 @@ class ChartOfAccountsFactory(factory.django.DjangoModelFactory):
     name = factory.Sequence(lambda n: f"Account {n}")
     account_type = "asset"
     balance = 0
+
+
+class PaymentMethodFactory(factory.django.DjangoModelFactory):
+    class Meta:
+        model = PaymentMethod
+
+    name = factory.Sequence(lambda n: f"Payment Method {n}")
+    linked_account = factory.SubFactory(ChartOfAccountsFactory)
+    is_active = True

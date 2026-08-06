@@ -21,6 +21,7 @@ from .factories import (
     ChartOfAccountsFactory,
     InventoryBatchFactory,
     InventoryItemFactory,
+    PaymentMethodFactory,
     WarehouseFactory,
 )
 
@@ -97,6 +98,10 @@ def gl_accounts(db):
     opening_equity = ChartOfAccountsFactory(
         account_number=3900000, name="Opening Balance Equity", account_type="equity",
     )
+    # PaymentMethod rows — what invoice/purchase-invoice creation actually points
+    # at now that "how the customer paid" is decoupled from the GL account.
+    cash_method = PaymentMethodFactory(name="Cash", linked_account=cash)
+    undeposited_method = PaymentMethodFactory(name="Undeposited Funds", linked_account=undeposited)
     return {
         "cash": cash,
         "revenue": revenue,
@@ -107,6 +112,8 @@ def gl_accounts(db):
         "additional_charges": additional_charges,
         "undeposited": undeposited,
         "opening_equity": opening_equity,
+        "cash_method": cash_method,
+        "undeposited_method": undeposited_method,
     }
 
 

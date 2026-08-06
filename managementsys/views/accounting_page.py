@@ -1,3 +1,4 @@
+import datetime
 import io
 import json
 from decimal import Decimal, InvalidOperation
@@ -5,7 +6,7 @@ from decimal import Decimal, InvalidOperation
 import openpyxl
 from django.db import transaction
 from django.db.models import Count, DecimalField, ExpressionWrapper, F, Max, Q, Sum
-from django.http import HttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.response import Response
@@ -13,16 +14,27 @@ from rest_framework.views import APIView
 
 from ..api.serializers import (
     AccountTransferSerializer,
+    ExpenseSerializer,
+    JournalEntryDetailSerializer,
+    JournalEntryListSerializer,
+    JournalEntryRefSerializer,
+    JournalStagingBatchSerializer,
     LedgerEntrySerializer,
     PurchaseInvoiceDetailSerializer,
     PurchaseInvoiceItemSerializer,
     PurchaseInvoiceListSerializer,
+    StagedJournalEntryDetailSerializer,
+    StagedJournalEntryListSerializer,
     SupplierSerializer,
 )
+from ..services.journal_sweep import run_journal_sweep
 from ..models import (
     AccountTransfer, AppUser, AuditLog, ChartOfAccounts,
-    InventoryBatch, InventoryItem, Invoice, LedgerEntry,
-    PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem, Supplier, Warehouse,
+    Expense, ExpenseItem,
+    InventoryBatch, InventoryItem, Invoice, JournalBatch, JournalDayLog,
+    JournalEntry, JournalStagingBatch, LedgerEntry,
+    PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem, PurchasePayment,
+    PaymentMethod, StagedJournalEntry, Supplier, Warehouse,
 )
 
 
@@ -38,180 +50,53 @@ def _safe_decimal(val) -> Decimal:
 
 
 # ── Double-entry posting helpers ─────────────────────────────────────────────
-# The financial reports recompute every balance from LedgerEntry using natural
-# (normal-balance) sign — asset/cogs/expense are debit-normal, liability/equity/
-# revenue are credit-normal. The cached ChartOfAccounts.balance is kept in the
-# same natural sign, matching invoice_page._post_accounting.
-NORMAL_BALANCE = {
-    'asset':         'debit',
-    'cogs':          'debit',
-    'expense':       'debit',
-    'other_expense': 'debit',
-    'liability':     'credit',
-    'equity':        'credit',
-    'revenue':       'credit',
-    'other_income':  'credit',
-}
-
-INVENTORY_ASSET_NUMBER = 1300000
-CENT = Decimal('0.01')
-
-
-def _apply_balance(account_id, account_type, entry_type, amount):
-    """Nudge the cached account balance in its natural direction."""
-    normal = NORMAL_BALANCE.get(account_type, 'debit')
-    signed = amount if entry_type == normal else -amount
-    ChartOfAccounts.objects.filter(pk=account_id).update(balance=F('balance') + signed)
+# Moved to managementsys/services/journal_engine.py in Phase 2 (same math, same
+# account resolution) so the journal run and the same-day void/edit memo path
+# can both call them. Re-imported here under their original names so every
+# call site below (_post_le, _post_purchase_accrual, _unpost_purchase,
+# _post_purchase_price_variance) is unchanged.
+from ..services.cash_accounts import cash_bank_account_ids
+from ..services import journal_preview
+from ..services.journal_engine import (
+    CENT, INVENTORY_ASSET_NUMBER, NORMAL_BALANCE, PRICE_VARIANCE_NUMBER,
+    LegSet,
+    _apply_purchase_balance as _apply_balance,
+    _ensure_price_variance_account, _post_expense_accrual, _post_expense_le, _post_le,
+    _post_purchase_accrual, _post_purchase_price_variance, _unpost_expense,
+    _unpost_purchase, expense_credit_account, expense_credit_memo, expense_leg_memo,
+    is_date_posted, legset_from_entry, post_account_transfer, reserve_entry_numbers,
+    reverse_legset, write_legs,
+)
 
 
-def _post_le(account, entry_type, amount, invoice, description, date):
-    """Post one purchase LedgerEntry row and update the account balance cache."""
-    _apply_balance(account.pk, account.account_type, entry_type, amount)
-    LedgerEntry.objects.create(
-        account=account,
-        date=date,
-        description=description,
-        entry_type=entry_type,
-        amount=amount,
-        source_type='purchase',
-        purchase_invoice=invoice,
-    )
+NOT_A_CASH_ACCOUNT = 'Rekening yang dipilih bukan rekening kas/bank.'
 
 
-def _post_purchase_accrual(invoice, parsed, item_objs, supplier, grand_total):
-    """Accrual double-entry for a purchase invoice:
-        Dr Inventory (stock lines) / Dr expense_account (beban lines)
-        Cr Accounts Payable — <vendor>   for the invoice total.
-    Debits are reconciled so their sum equals the (2-dp) invoice total, which
-    absorbs additional-cost rounding and any adjustment that no stock unit
-    carried (e.g. an all-expense invoice with a shipping surcharge).
+def _resolve_cash_account(data, *, current=None):
+    """Resolve the credit-side COA for an expense from request data.
+
+    Returns ``(account_or_None, error_response_or_None)``.
+
+    Accepts the new ``cash_account`` key (a ChartOfAccounts pk) and, for
+    back-compat, the old ``payment_account`` key (a PaymentMethod pk) whose
+    ``linked_account`` is used when no ``cash_account`` was sent. ``current``
+    is returned untouched when neither key is present at all.
     """
-    target = grand_total.quantize(CENT)
-    ap_account = supplier.ensure_ap_account()
-    inventory_asset = ChartOfAccounts.objects.filter(account_number=INVENTORY_ASSET_NUMBER).first()
-    post_date = invoice.purchase_date
+    if 'cash_account' in data:
+        raw = data.get('cash_account')
+        if raw in (None, '', 0, '0'):
+            return None, None
+        try:
+            account = ChartOfAccounts.objects.get(pk=raw)
+        except (ChartOfAccounts.DoesNotExist, TypeError, ValueError):
+            return None, Response({'error': NOT_A_CASH_ACCOUNT},
+                                  status=status.HTTP_400_BAD_REQUEST)
+        if account.pk not in cash_bank_account_ids():
+            return None, Response({'error': NOT_A_CASH_ACCOUNT},
+                                  status=status.HTTP_400_BAD_REQUEST)
+        return account, None
 
-    exp_ids = {p['expense_acct_id'] for p in parsed
-               if p['line_type'] == 'expense' and p['expense_acct_id']}
-    exp_map = {a.id: a for a in ChartOfAccounts.objects.filter(id__in=exp_ids)}
-
-    debit_posts = []   # [account, amount, description]
-    debit_total = Decimal('0')
-    for p, obj in zip(parsed, item_objs):
-        amt = (p['quantity'] * obj.actual_unit_cost).quantize(CENT)
-        if amt <= 0:
-            continue
-        if p['line_type'] == 'stock':
-            if not inventory_asset:
-                continue
-            debit_posts.append([inventory_asset, amt,
-                                f'Persediaan masuk: {p["item_name"]} — {invoice.internal_id}'])
-        else:
-            acct = exp_map.get(p['expense_acct_id'])
-            if not acct:
-                continue
-            debit_posts.append([acct, amt,
-                                f'Beban: {p["item_name"]} — {invoice.internal_id}'])
-        debit_total += amt
-
-    residual = target - debit_total
-    if debit_posts and residual != 0:
-        debit_posts[0][1] += residual
-    elif not debit_posts and target > 0 and inventory_asset:
-        debit_posts.append([inventory_asset, target, f'Pembelian {invoice.internal_id}'])
-
-    for acct, amt, desc in debit_posts:
-        _post_le(acct, 'debit', amt, invoice, desc, post_date)
-
-    if target > 0 and ap_account:
-        _post_le(ap_account, 'credit', target, invoice,
-                 f'Utang pembelian {invoice.internal_id} — {supplier.name}', post_date)
-
-
-def _unpost_purchase(invoice):
-    """Reverse the balance effect of every ledger entry tied to this purchase
-    invoice and delete the rows. Used before re-posting on edit; only safe when
-    the invoice has no payments (guaranteed by the PUT guard)."""
-    entries = LedgerEntry.objects.filter(purchase_invoice=invoice).select_related('account')
-    for e in entries:
-        opp = 'credit' if e.entry_type == 'debit' else 'debit'
-        _apply_balance(e.account_id, e.account.account_type, opp, e.amount)
-    entries.delete()
-
-
-PRICE_VARIANCE_NUMBER = 5200000
-COGS_HEAD_NUMBER = 5000000
-
-
-def _ensure_price_variance_account():
-    """The GL account that absorbs the purchase-price difference on units that
-    were already sold when the invoice is edited. Created lazily under the COGS
-    head so it flows into cost of sales, distinct from normal product COGS."""
-    acct = ChartOfAccounts.objects.filter(account_number=PRICE_VARIANCE_NUMBER).first()
-    if acct:
-        return acct
-    head = ChartOfAccounts.objects.filter(account_number=COGS_HEAD_NUMBER, is_head=True).first()
-    return ChartOfAccounts.objects.create(
-        account_number=PRICE_VARIANCE_NUMBER,
-        name='Selisih Harga Pembelian',
-        account_type='cogs',
-        is_system=True,
-        is_head=False,
-        parent=head,
-    )
-
-
-def _post_purchase_price_variance(invoice, sold_by_key, item_objs):
-    """Post the price variance for units sales already consumed.
-
-    For each (item, warehouse) with sold units, the new cost of those units
-    (allocated from the edited lines) is compared with the cost the sale
-    expensed (snapshotted in sold_by_key as the exact _fifo_deduct amount). The
-    difference moves between the Inventory asset and the Purchase Price Variance
-    account, so the sold goods' total recognised cost reflects the corrected
-    price while their original COGS entry on the sale is left untouched. The
-    journal stays balanced; both rows are tied to the invoice so a later edit or
-    void reverses them too."""
-    variance_acct   = _ensure_price_variance_account()
-    inventory_asset = ChartOfAccounts.objects.filter(account_number=INVENTORY_ASSET_NUMBER).first()
-    post_date       = invoice.purchase_date
-
-    # New cost of the sold units, allocated across the edited lines per key.
-    alloc    = {k: v['qty'] for k, v in sold_by_key.items()}
-    new_cost = {k: Decimal('0') for k in sold_by_key}
-    names    = {}
-    for it in item_objs:
-        if it.line_type != 'stock' or not it.item_id or not it.warehouse_id:
-            continue
-        key = (int(it.item_id), int(it.warehouse_id))
-        if key not in alloc:
-            continue
-        names.setdefault(key, it.item_name)
-        take = min(alloc[key], it.quantity)
-        if take <= 0:
-            continue
-        alloc[key] -= take
-        new_cost[key] += take * it.actual_unit_cost
-
-    for key, agg in sold_by_key.items():
-        variance = (new_cost[key] - agg['cost']).quantize(CENT)
-        if variance == 0:
-            continue
-        nm = names.get(key, '')
-        if variance > 0:
-            # Sold goods cost more than first recorded → recognise extra cost.
-            if inventory_asset:
-                _post_le(inventory_asset, 'credit', variance, invoice,
-                         f'Koreksi persediaan unit terjual: {nm} — {invoice.internal_id}', post_date)
-            _post_le(variance_acct, 'debit', variance, invoice,
-                     f'Selisih harga beli unit terjual: {nm} — {invoice.internal_id}', post_date)
-        else:
-            amt = -variance
-            if inventory_asset:
-                _post_le(inventory_asset, 'debit', amt, invoice,
-                         f'Koreksi persediaan unit terjual: {nm} — {invoice.internal_id}', post_date)
-            _post_le(variance_acct, 'credit', amt, invoice,
-                     f'Selisih harga beli unit terjual: {nm} — {invoice.internal_id}', post_date)
+    return current, None
 
 
 # ── Suppliers ──────────────────────────────────────────────────────────────────
@@ -417,6 +302,64 @@ class SupplierImportView(APIView):
 
 # ── Purchase Invoices ──────────────────────────────────────────────────────────
 
+def _resolve_payment_method(raw_id):
+    """Look up a PaymentMethod by id, returning None when it is missing or
+    unknown — callers turn that into a 400 with their own message."""
+    if not raw_id:
+        return None
+    try:
+        return PaymentMethod.objects.select_related('linked_account').get(pk=raw_id)
+    except (PaymentMethod.DoesNotExist, TypeError, ValueError):
+        return None
+
+
+def _parse_date(raw, fallback=None):
+    """Accept 'YYYY-MM-DD' (or a date), falling back when empty/unparseable."""
+    if isinstance(raw, datetime.date):
+        return raw
+    if raw:
+        try:
+            return datetime.date.fromisoformat(str(raw)[:10])
+        except ValueError:
+            pass
+    return fallback
+
+
+def _record_purchase_payment(invoice, amount, payment_method, pay_date, actor, notes=''):
+    """Record one settlement against a purchase invoice: a PurchasePayment row,
+    the running amount_paid/status on the invoice, and the double entry
+        Dr Accounts Payable — <vendor>   (the liability goes away)
+        Cr <payment method's cash/bank account>  (funds leave)
+    dated on the day the money actually moved, not the day it was keyed in.
+
+    Caller must have validated the amount against the remaining balance and be
+    inside a transaction.
+    """
+    payment = PurchasePayment.objects.create(
+        invoice=invoice,
+        payment_date=pay_date,
+        payment_method=payment_method,
+        amount=amount,
+        notes=notes,
+        created_by=actor,
+    )
+
+    invoice.amount_paid += amount
+    # Mirror the latest method onto the invoice so list/detail views keep a
+    # single "paid with" column without joining every payment.
+    invoice.payment_method = payment_method
+    invoice.refresh_status()
+    invoice.save(update_fields=['amount_paid', 'payment_method', 'status'])
+
+    ap_account = invoice.supplier.ensure_ap_account()
+    _post_le(ap_account, 'debit', amount, invoice,
+             f'Pembayaran utang {invoice.internal_id} — {invoice.supplier.name}', pay_date)
+    _post_le(payment_method.linked_account, 'credit', amount, invoice,
+             f'Pembayaran pembelian {invoice.internal_id}', pay_date)
+
+    return payment
+
+
 class PurchaseInvoiceListCreateView(APIView):
     """
     GET  /api/accounting/purchases/
@@ -426,12 +369,22 @@ class PurchaseInvoiceListCreateView(APIView):
          ?overdue=true   (due_date < today and not paid)
 
     POST /api/accounting/purchases/
-         { external_invoice_no, supplier, payment_account, purchase_date, due_date?,
-           notes?, items: [{item?, item_name, quantity, unit, unit_cost}] }
+         { external_invoice_no, supplier, purchase_date, due_date?, notes?,
+           payment_status: 'unpaid'|'paid',        (default 'unpaid')
+           payment_account, payment_date,          (required when 'paid')
+           items: [{item?, item_name, quantity, unit, unit_cost}] }
+
+    A 'paid' invoice is settled in full the moment it is created, using the
+    given payment method and payment date. An 'unpaid' one carries no payment
+    method at all until a payment is recorded via .../pay/.
     """
 
     def get(self, request):
-        qs = PurchaseInvoice.objects.select_related('supplier', 'payment_account')
+        qs = (
+            PurchaseInvoice.objects
+            .select_related('supplier', 'payment_method', 'payment_method__linked_account')
+            .prefetch_related('payments')   # last_payment_date, one query for the page
+        )
 
         q = request.query_params.get('q', '').strip()
         if q:
@@ -483,10 +436,27 @@ class PurchaseInvoiceListCreateView(APIView):
             return Response({'error': 'At least one item is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            supplier     = Supplier.objects.get(pk=data['supplier'])
-            payment_acct = ChartOfAccounts.objects.get(pk=data['payment_account'], account_type='asset')
-        except (Supplier.DoesNotExist, ChartOfAccounts.DoesNotExist, KeyError):
-            return Response({'error': 'Invalid supplier or payment account.'}, status=status.HTTP_400_BAD_REQUEST)
+            supplier = Supplier.objects.get(pk=data['supplier'])
+        except (Supplier.DoesNotExist, KeyError):
+            return Response({'error': 'Invalid supplier.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Paid-on-creation: the method and the date the money moved are both
+        # required, and the invoice is settled in full below once its total is
+        # known. Unpaid: no payment method is stored — it is chosen at payment.
+        pay_now = str(data.get('payment_status', 'unpaid')).strip().lower() == 'paid'
+        payment_method = _resolve_payment_method(data.get('payment_account'))
+        payment_date   = _parse_date(data.get('payment_date'))
+        if pay_now:
+            if payment_method is None:
+                return Response(
+                    {'error': 'Metode pembayaran wajib dipilih untuk faktur yang langsung dibayar.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if payment_date is None:
+                return Response(
+                    {'error': 'Tanggal pembayaran wajib diisi untuk faktur yang langsung dibayar.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         # Resolve optional invoice-level warehouse
         warehouse_id = data.get('warehouse') or None
@@ -510,7 +480,7 @@ class PurchaseInvoiceListCreateView(APIView):
             invoice = PurchaseInvoice.objects.create(
                 external_invoice_no=data.get('external_invoice_no', ''),
                 supplier=supplier,
-                payment_account=payment_acct,
+                payment_method=payment_method if pay_now else None,
                 warehouse=warehouse_obj,
                 purchase_date=data['purchase_date'],
                 due_date=data.get('due_date') or None,
@@ -661,8 +631,22 @@ class PurchaseInvoiceListCreateView(APIView):
             invoice.total_amount = grand_total
             invoice.save(update_fields=['total_amount'])
 
-            # Post the accrual double-entry (Dr Inventory/Expense, Cr AP-vendor)
-            _post_purchase_accrual(invoice, parsed, item_objs, supplier, grand_total)
+            # Phase 2: the accrual double-entry (Dr Inventory/Expense, Cr
+            # AP-vendor) is deferred. The invoice is created posting_status=
+            # 'unposted' (model default) with zero LedgerEntry rows; a journal
+            # run (POST /api/accounting/journal/run/) posts it later. Inventory
+            # batches above are still created immediately — stock-on-hand is a
+            # physical fact independent of when the journal catches up.
+
+            # Settled at creation: record the payment straight away, exactly as
+            # the pay endpoint would. Its Dr AP / Cr bank legs post now; the
+            # accrual's Cr AP lands whenever the journal run sweeps the
+            # purchase date, and the two net to zero AP for this vendor.
+            if pay_now and grand_total > 0:
+                _record_purchase_payment(
+                    invoice, grand_total, payment_method, payment_date, _actor(request),
+                    notes='Dibayar saat faktur dibuat',
+                )
 
             AuditLog.objects.create(
                 performed_by=_actor(request),
@@ -682,8 +666,11 @@ class PurchaseInvoiceDetailView(APIView):
     def _get(self, pk):
         try:
             return PurchaseInvoice.objects.select_related(
-                'supplier', 'payment_account', 'created_by', 'warehouse',
-            ).prefetch_related('items__item', 'items__expense_account', 'additional_costs').get(pk=pk)
+                'supplier', 'payment_method', 'payment_method__linked_account', 'created_by', 'warehouse',
+            ).prefetch_related(
+                'items__item', 'items__expense_account', 'additional_costs',
+                'payments__payment_method__linked_account', 'payments__created_by',
+            ).get(pk=pk)
         except PurchaseInvoice.DoesNotExist:
             return None
 
@@ -736,6 +723,11 @@ class PurchaseInvoiceDetailView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Phase 2: whether this invoice's transaction date has already been
+        # posted by a journal run decides how the accounting side of this edit
+        # is applied — see the branch after the new lines are built below.
+        was_posted = obj.posting_status == 'posted'
+
         # Snapshot the units this invoice's batches have already sold, per (item,
         # warehouse). A batch's (initial − remaining) is how many of its units
         # sales consumed, and (value / initial) × sold is the exact cost those
@@ -780,12 +772,13 @@ class PurchaseInvoiceDetailView(APIView):
         if not items:
             return Response({'error': 'At least one item is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Resolve supplier and payment account
+        # Resolve supplier. An edit is only allowed while nothing has been paid,
+        # so the invoice has no payment method to carry — one is only attached
+        # when a payment is recorded.
         try:
             supplier = Supplier.objects.get(pk=data['supplier'])
-            payment_acct = ChartOfAccounts.objects.get(pk=data['payment_account'], account_type='asset')
-        except (Supplier.DoesNotExist, ChartOfAccounts.DoesNotExist, KeyError):
-            return Response({'error': 'Invalid supplier or payment account.'}, status=status.HTTP_400_BAD_REQUEST)
+        except (Supplier.DoesNotExist, KeyError):
+            return Response({'error': 'Invalid supplier.'}, status=status.HTTP_400_BAD_REQUEST)
 
         warehouse_id = data.get('warehouse') or None
         warehouse_obj = None
@@ -831,10 +824,14 @@ class PurchaseInvoiceDetailView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        # Reverse and drop the prior accrual postings before re-posting. This also
-        # reverses any prior price-variance rows; they are recomputed from the
-        # frozen batches below, so the result is idempotent across repeated edits.
-        _unpost_purchase(obj)
+        # Reverse and drop the prior accrual postings before re-posting, but only
+        # when nothing has been posted yet for this invoice — _unpost_purchase
+        # deletes the LedgerEntry rows it finds, which would destroy the
+        # original transaction date's history for an already-posted invoice.
+        # That case is handled below instead, via a same-day edit memo that
+        # leaves the original rows alone.
+        if not was_posted:
+            _unpost_purchase(obj)
 
         # Remove old inventory batches and line items
         obj.inventory_batches.all().delete()
@@ -843,14 +840,13 @@ class PurchaseInvoiceDetailView(APIView):
 
         # Update header fields
         obj.supplier = supplier
-        obj.payment_account = payment_acct
         obj.warehouse = warehouse_obj
         obj.purchase_date = data.get('purchase_date', obj.purchase_date)
         obj.due_date = data.get('due_date') or None
         obj.external_invoice_no = data.get('external_invoice_no', obj.external_invoice_no)
         obj.notes = data.get('notes', obj.notes)
         obj.save(update_fields=[
-            'supplier', 'payment_account', 'warehouse',
+            'supplier', 'warehouse',
             'purchase_date', 'due_date', 'external_invoice_no', 'notes',
         ])
 
@@ -1015,11 +1011,38 @@ class PurchaseInvoiceDetailView(APIView):
         obj.total_amount = grand_total
         obj.save(update_fields=['total_amount'])
 
-        # Re-post the accrual double-entry for the replaced lines, then correct
-        # the sold-unit price difference into the variance account.
-        _post_purchase_accrual(obj, parsed, item_objs, supplier, grand_total)
-        if sold_by_key:
-            _post_purchase_price_variance(obj, sold_by_key, item_objs)
+        # Phase 2: an unposted invoice (posting_status='unposted', never swept
+        # by a journal run) stays unposted — no LedgerEntry rows are written
+        # here; the next run posts the edited values (including any
+        # price-variance on units already FIFO-consumed from its batches,
+        # since sold_by_key is derived straight from batch state, not from
+        # posting_status). An already-posted invoice instead gets a same-day
+        # "edit memo": every existing (non-memo) ledger row tied to it is
+        # reversed today, tagged source_type='edit_memo', then the accrual +
+        # any price-variance correction for the new lines is reposted today
+        # under the same tag. The original purchase_date rows and
+        # JournalDayLog are left untouched.
+        if was_posted:
+            memo_today = timezone.now().date()
+            # Reverse *everything* currently posted for this invoice — the
+            # original accrual AND any earlier edit-memo correction — so a
+            # second (or third) edit re-derives the full state from scratch
+            # instead of layering an incremental delta on top of a stale one.
+            old_entries = list(
+                LedgerEntry.objects.filter(purchase_invoice=obj)
+                .exclude(source_type='void_memo')
+                .select_related('account')
+            )
+            for e in old_entries:
+                opp = 'credit' if e.entry_type == 'debit' else 'debit'
+                _post_le(e.account, opp, e.amount, obj,
+                         f'Koreksi edit {obj.internal_id}: {e.description}',
+                         memo_today, source_type='edit_memo')
+            _post_purchase_accrual(obj, parsed, item_objs, supplier, grand_total,
+                                    post_date=memo_today, source_type='edit_memo')
+            if sold_by_key:
+                _post_purchase_price_variance(obj, sold_by_key, item_objs,
+                                               post_date=memo_today, source_type='edit_memo')
 
         AuditLog.objects.create(
             performed_by=_actor(request),
@@ -1064,13 +1087,22 @@ class PurchaseInvoiceDetailView(APIView):
         today       = timezone.now().date()
         internal_id = obj.internal_id
 
-        # Reverse every creation entry (Dr AP, Cr Inventory/Expense) as an
-        # opposite-side row so both the original posting and its reversal remain
-        # in the journal. Safe: the guard above refused any paid invoice.
-        for e in list(LedgerEntry.objects.filter(purchase_invoice=obj).select_related('account')):
+        # Phase 2: an unposted invoice has no LedgerEntry rows at all (posting
+        # is deferred until a journal run), so this loop is naturally a no-op
+        # for it — void with zero journal impact, as required. A posted
+        # invoice's rows (the original accrual AND any earlier edit-memo
+        # correction — everything currently in effect) are reversed here as a
+        # same-day "void memo" (dated today, tagged source_type='void_memo'),
+        # leaving the original transaction date's rows and JournalDayLog
+        # untouched. Safe either way: the guard above refused any paid invoice.
+        for e in list(
+            LedgerEntry.objects.filter(purchase_invoice=obj)
+            .exclude(source_type='void_memo')
+            .select_related('account')
+        ):
             opp = 'credit' if e.entry_type == 'debit' else 'debit'
             _post_le(e.account, opp, e.amount, obj,
-                     f'Pembatalan {internal_id}: {e.description}', today)
+                     f'Pembatalan {internal_id}: {e.description}', today, source_type='void_memo')
 
         # Remove inventory batches created from this invoice (stock never came in)
         obj.inventory_batches.all().delete()
@@ -1093,16 +1125,17 @@ class PurchaseInvoiceDetailView(APIView):
 class PurchaseInvoicePayView(APIView):
     """
     POST /api/accounting/purchases/<pk>/pay/
-    Body: { amount }
+    Body: { amount, payment_date, payment_account, notes? }
 
-    Records a payment against the purchase invoice.
-    Debits the payment_account balance and creates a LedgerEntry.
+    Records a payment against the purchase invoice: which bank/cash account it
+    came out of and the date it left. Debits the vendor's Accounts Payable and
+    credits the GL account behind the chosen payment method.
     """
 
     def post(self, request, pk):
         try:
             invoice = PurchaseInvoice.objects.select_related(
-                'payment_account', 'supplier', 'supplier__ap_account'
+                'payment_method', 'payment_method__linked_account', 'supplier', 'supplier__ap_account'
             ).get(pk=pk)
         except PurchaseInvoice.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -1124,27 +1157,45 @@ class PurchaseInvoicePayView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Which account the money came from, and when it left. Both are asked
+        # for at payment time; the method falls back to whatever settled this
+        # invoice last so a repeat instalment needs no re-picking.
+        payment_method = (
+            _resolve_payment_method(request.data.get('payment_account'))
+            or _resolve_payment_method(request.data.get('payment_method'))
+            or invoice.payment_method
+        )
+        if payment_method is None or payment_method.linked_account_id is None:
+            return Response(
+                {'error': 'Metode pembayaran wajib dipilih.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        pay_date = _parse_date(request.data.get('payment_date'))
+        if pay_date is None:
+            return Response(
+                {'error': 'Tanggal pembayaran wajib diisi.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if pay_date < invoice.purchase_date:
+            return Response(
+                {'error': 'Tanggal pembayaran tidak boleh sebelum tanggal pembelian.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         with transaction.atomic():
-            invoice.amount_paid += amount
-            invoice.refresh_status()
-            invoice.save(update_fields=['amount_paid', 'status'])
-
-            pay_date = timezone.now().date()
-
-            # Double entry: Dr Accounts Payable — vendor (settle the liability),
-            # Cr cash/bank payment account (funds leave).
-            ap_account = invoice.supplier.ensure_ap_account()
-            _post_le(ap_account, 'debit', amount, invoice,
-                     f'Pembayaran utang {invoice.internal_id} — {invoice.supplier.name}', pay_date)
-            _post_le(invoice.payment_account, 'credit', amount, invoice,
-                     f'Pembayaran pembelian {invoice.internal_id}', pay_date)
+            _record_purchase_payment(
+                invoice, amount, payment_method, pay_date, _actor(request),
+                notes=str(request.data.get('notes', '') or '')[:255],
+            )
 
             AuditLog.objects.create(
                 performed_by=_actor(request),
                 action='UPDATE',
                 entity_type='PurchaseInvoice',
                 entity_id=str(invoice.id),
-                description=f'Payment Rp{amount:,.0f} recorded for {invoice.internal_id}, status → {invoice.status}',
+                description=(f'Payment Rp{amount:,.0f} via {payment_method.name} on {pay_date} '
+                             f'recorded for {invoice.internal_id}, status → {invoice.status}'),
             )
 
         return Response(PurchaseInvoiceDetailSerializer(invoice, context={'request': request}).data)
@@ -1176,6 +1227,450 @@ class PurchaseLastPriceView(APIView):
                 'invoice_id': last.invoice.internal_id,
             })
         return Response({'last_price': None, 'last_date': None, 'invoice_id': None})
+
+
+# ── Cash / bank accounts ───────────────────────────────────────────────────────
+
+class CashAccountListView(APIView):
+    """
+    GET /api/accounting/cash-accounts/
+    → [{ id, name, account_number, balance }] sorted by name
+
+    The curated set of COA rows that represent real cash/bank locations — see
+    ``services.cash_accounts.cash_bank_account_ids``. ``account_number`` is
+    returned for journal previews and printed documents; the picker itself
+    shows the name only.
+    """
+
+    def get(self, request):
+        accounts = (
+            ChartOfAccounts.objects
+            .filter(pk__in=cash_bank_account_ids())
+            .order_by('name')
+            .values('id', 'name', 'account_number', 'balance')
+        )
+        return Response([
+            {
+                'id':             a['id'],
+                'name':           a['name'],
+                'account_number': a['account_number'],
+                'balance':        str(a['balance']),
+            }
+            for a in accounts
+        ])
+
+
+# ── Operating Expenses (Phase 3) ────────────────────────────────────────────────
+
+class ExpenseListCreateView(APIView):
+    """
+    GET  /api/accounting/expenses/
+         ?status=unpaid|partial|paid
+         ?q=<search memo / notes / line description / line account name>
+         ?date_from=&date_to=
+         ?cash_account=<ChartOfAccounts pk>
+
+    POST /api/accounting/expenses/
+         { expense_date, cash_account?, payment_memo?,
+           payment_account?, amount_paid?, notes?,
+           items: [{account, description?, amount}] }
+
+    ``cash_account`` is the ChartOfAccounts pk the money leaves from and must
+    be one of ``cash_bank_account_ids()``. ``payment_account`` is the legacy
+    key (a PaymentMethod pk); when only it is sent, its ``linked_account``
+    becomes the cash account. Each item's ``description`` is that leg's
+    journal memo — leave it blank to inherit ``payment_memo``.
+    """
+
+    def get(self, request):
+        qs = Expense.objects.select_related(
+            'payment_method', 'payment_method__linked_account', 'payment_account',
+        )
+
+        q = request.query_params.get('q', '').strip()
+        if q:
+            # No payee field any more — search the strings that actually
+            # identify an expense to a human: its memo, its notes, and the
+            # description/account of any of its lines.
+            qs = qs.filter(
+                Q(payment_memo__icontains=q)
+                | Q(notes__icontains=q)
+                | Q(items__description__icontains=q)
+                | Q(items__account__name__icontains=q)
+            ).distinct()
+        st = request.query_params.get('status', '').strip()
+        if st in ('unpaid', 'partial', 'paid'):
+            qs = qs.filter(status=st)
+        date_from = request.query_params.get('date_from', '').strip()
+        date_to = request.query_params.get('date_to', '').strip()
+        if date_from:
+            qs = qs.filter(expense_date__gte=date_from)
+        if date_to:
+            qs = qs.filter(expense_date__lte=date_to)
+        cash_account = request.query_params.get('cash_account', '').strip()
+        if cash_account:
+            qs = qs.filter(payment_account_id=cash_account)
+
+        return Response(ExpenseSerializer(qs.prefetch_related('items__account'), many=True).data)
+
+    def post(self, request):
+        data = request.data
+        items_raw = data.get('items', [])
+        if isinstance(items_raw, str):
+            try:
+                items = json.loads(items_raw)
+            except (json.JSONDecodeError, ValueError):
+                return Response({'error': 'Invalid items JSON.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            items = items_raw
+
+        if not items:
+            return Response({'error': 'At least one item is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        expense_date = data.get('expense_date')
+        if not expense_date:
+            return Response({'error': 'Tanggal wajib diisi.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        payment_method = None
+        payment_account_id = data.get('payment_account') or None
+        if payment_account_id:
+            try:
+                payment_method = PaymentMethod.objects.select_related('linked_account').get(pk=payment_account_id)
+            except PaymentMethod.DoesNotExist:
+                return Response({'error': 'Invalid payment method.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        cash_account, err = _resolve_cash_account(data)
+        if err:
+            return err
+        if cash_account is None and payment_method is not None:
+            # Legacy caller sent only payment_account — resolve the COA behind it.
+            cash_account = payment_method.linked_account
+
+        for row in items:
+            if not row.get('account'):
+                return Response(
+                    {'error': 'Setiap baris beban harus memiliki akun.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        with transaction.atomic():
+            expense = Expense.objects.create(
+                expense_date=expense_date,
+                payment_method=payment_method,
+                payment_account=cash_account,
+                payment_memo=(data.get('payment_memo') or '')[:255],
+                notes=data.get('notes', ''),
+                amount_paid=_safe_decimal(data.get('amount_paid', 0)),
+                created_by=_actor(request),
+            )
+
+            item_objs = []
+            total = Decimal('0')
+            for row in items:
+                amt = _safe_decimal(row.get('amount', 0))
+                if amt <= 0:
+                    continue
+                total += amt
+                item_objs.append(ExpenseItem(
+                    expense=expense,
+                    account_id=row['account'],
+                    description=row.get('description', ''),
+                    amount=amt,
+                ))
+            ExpenseItem.objects.bulk_create(item_objs)
+
+            expense.total_amount = total.quantize(Decimal('0.01'))
+            expense.refresh_status()
+            expense.save(update_fields=['total_amount', 'status'])
+
+            # Phase 2/3: the accrual double-entry (Dr expense/cogs accounts, Cr
+            # AP or payment account) is deferred, same as PurchaseInvoice — the
+            # expense is created posting_status='unposted' with zero LedgerEntry
+            # rows until a journal run sweeps its expense_date.
+
+            AuditLog.objects.create(
+                performed_by=_actor(request),
+                action='CREATE',
+                entity_type='Expense',
+                entity_id=str(expense.id),
+                description=f'Expense created: #{expense.id} (Rp{expense.total_amount:,.0f})',
+            )
+
+        return Response(
+            ExpenseSerializer(expense).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+
+class ExpenseDetailView(APIView):
+    def _get(self, pk):
+        try:
+            return Expense.objects.select_related(
+                'payment_method', 'payment_method__linked_account',
+                'payment_account', 'created_by',
+            ).prefetch_related('items__account').get(pk=pk)
+        except Expense.DoesNotExist:
+            return None
+
+    def get(self, request, pk):
+        obj = self._get(pk)
+        if not obj:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(ExpenseSerializer(obj).data)
+
+    @transaction.atomic
+    def put(self, request, pk):
+        """Full replacement of expense items and header fields. Only allowed when amount_paid == 0."""
+        obj = self._get(pk)
+        if not obj:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if obj.amount_paid > 0:
+            return Response(
+                {'error': 'Cannot edit an expense that has payments recorded.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        was_posted = obj.posting_status == 'posted'
+
+        data = request.data
+        items_raw = data.get('items', [])
+        if isinstance(items_raw, str):
+            try:
+                items = json.loads(items_raw)
+            except (json.JSONDecodeError, ValueError):
+                return Response({'error': 'Invalid items JSON.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            items = items_raw
+
+        if not items:
+            return Response({'error': 'At least one item is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        payment_method = obj.payment_method
+        payment_method_sent = False
+        payment_account_id = data.get('payment_account')
+        if payment_account_id:
+            try:
+                payment_method = PaymentMethod.objects.select_related('linked_account').get(pk=payment_account_id)
+            except PaymentMethod.DoesNotExist:
+                return Response({'error': 'Invalid payment method.'}, status=status.HTTP_400_BAD_REQUEST)
+            payment_method_sent = True
+        elif 'payment_account' in data:
+            payment_method = None
+            payment_method_sent = True
+
+        cash_account, err = _resolve_cash_account(data, current=obj.payment_account)
+        if err:
+            return err
+        if 'cash_account' not in data and payment_method_sent:
+            # Legacy caller sent only payment_account — keep the COA in step
+            # with the method it just chose (or cleared).
+            cash_account = payment_method.linked_account if payment_method else None
+
+        for row in items:
+            if not row.get('account'):
+                return Response(
+                    {'error': 'Setiap baris beban harus memiliki akun.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if not was_posted:
+            _unpost_expense(obj)
+
+        obj.items.all().delete()
+
+        obj.payment_method = payment_method
+        obj.payment_account = cash_account
+        if 'payment_memo' in data:
+            obj.payment_memo = (data.get('payment_memo') or '')[:255]
+        obj.expense_date = data.get('expense_date', obj.expense_date)
+        obj.notes = data.get('notes', obj.notes)
+
+        item_objs = []
+        total = Decimal('0')
+        for row in items:
+            amt = _safe_decimal(row.get('amount', 0))
+            if amt <= 0:
+                continue
+            total += amt
+            item_objs.append(ExpenseItem(
+                expense=obj,
+                account_id=row['account'],
+                description=row.get('description', ''),
+                amount=amt,
+            ))
+        ExpenseItem.objects.bulk_create(item_objs)
+
+        obj.total_amount = total.quantize(Decimal('0.01'))
+        obj.refresh_status()
+        obj.save(update_fields=[
+            'payment_method', 'payment_account', 'payment_memo',
+            'expense_date', 'notes', 'total_amount', 'status',
+        ])
+
+        # Same pattern as PurchaseInvoiceDetailView.put: an unposted expense
+        # stays unposted (no LedgerEntry rows here; the next journal run posts
+        # the edited values). An already-posted expense gets a same-day
+        # "edit memo": every existing (non-memo) ledger row tied to it is
+        # reversed today, tagged source_type='edit_memo', then the accrual is
+        # reposted today under the same tag. The original expense_date rows
+        # and JournalDayLog are left untouched.
+        if was_posted:
+            memo_today = timezone.now().date()
+            old_entries = list(
+                LedgerEntry.objects.filter(expense=obj)
+                .exclude(source_type='void_memo')
+                .select_related('account')
+            )
+            for e in old_entries:
+                opp = 'credit' if e.entry_type == 'debit' else 'debit'
+                _post_expense_le(e.account, opp, e.amount, obj,
+                                  f'Koreksi edit beban #{obj.pk}: {e.description}',
+                                  memo_today, source_type='edit_memo')
+            _post_expense_accrual(obj, item_objs, post_date=memo_today, source_type='edit_memo')
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='UPDATE',
+            entity_type='Expense',
+            entity_id=str(obj.id),
+            description=f'Expense fully updated: #{obj.id}',
+        )
+
+        return Response(ExpenseSerializer(self._get(pk)).data)
+
+    @transaction.atomic
+    def delete(self, request, pk):
+        """Void an expense: reverse accounting but keep the record."""
+        obj = self._get(pk)
+        if not obj:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if obj.amount_paid > 0:
+            return Response(
+                {'error': 'Cannot void an expense that has payments recorded.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        today = timezone.now().date()
+
+        # Phase 2/3 pattern: an unposted expense has no LedgerEntry rows at all
+        # (posting is deferred until a journal run), so this loop is a no-op
+        # for it. A posted expense's rows (the original accrual and any
+        # earlier edit-memo correction) are reversed here as a same-day
+        # "void memo" (dated today, tagged source_type='void_memo'), leaving
+        # the original expense_date rows and JournalDayLog untouched.
+        for e in list(
+            LedgerEntry.objects.filter(expense=obj)
+            .exclude(source_type='void_memo')
+            .select_related('account')
+        ):
+            opp = 'credit' if e.entry_type == 'debit' else 'debit'
+            _post_expense_le(e.account, opp, e.amount, obj,
+                              f'Pembatalan beban #{obj.pk}: {e.description}', today, source_type='void_memo')
+
+        entity_id = str(obj.id)
+        obj.delete()
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='DELETE',
+            entity_type='Expense',
+            entity_id=entity_id,
+            description=f'Expense voided: #{entity_id}',
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ExpensePayView(APIView):
+    """
+    POST /api/accounting/expenses/<pk>/pay/
+    Body: { amount, payment_account?, cash_account? }
+
+    Records a payment against the expense. Credits the expense's
+    ``payment_account`` (falling back to the GL account behind its
+    payment_method for legacy rows) and debits Accounts Payable, settling the
+    liability the accrual posting created — mirrors PurchaseInvoicePayView.
+    """
+
+    def post(self, request, pk):
+        try:
+            expense = Expense.objects.select_related(
+                'payment_method', 'payment_method__linked_account', 'payment_account',
+            ).get(pk=pk)
+        except Expense.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if expense.status == 'paid':
+            return Response({'error': 'Expense is already fully paid.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        amount = _safe_decimal(request.data.get('amount', 0))
+        if amount <= 0:
+            return Response({'error': 'Payment amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        remaining = expense.total_amount - expense.amount_paid
+        if amount > remaining:
+            return Response(
+                {'error': f'Payment exceeds remaining balance of Rp {remaining:,.0f}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # A caller may name the cash account outright (new) or hand over a
+        # payment method (legacy). Either way the credit leg resolves to a COA,
+        # preferring the one already recorded on the expense.
+        cash_account, err = _resolve_cash_account(request.data)
+        if err:
+            return err
+
+        payment_method = None
+        payment_method_id = request.data.get('payment_account') or expense.payment_method_id
+        if payment_method_id:
+            try:
+                payment_method = PaymentMethod.objects.select_related('linked_account').get(pk=payment_method_id)
+            except (PaymentMethod.DoesNotExist, TypeError, ValueError):
+                return Response({'error': 'Invalid payment method.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if cash_account is None:
+            if request.data.get('payment_account') and payment_method is not None:
+                # Explicit legacy override — pay out of the method the caller named.
+                cash_account = payment_method.linked_account
+            else:
+                cash_account = expense_credit_account(expense)
+        if cash_account is None:
+            return Response({'error': 'Invalid payment method.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            expense.amount_paid += amount
+            if not expense.payment_method_id and payment_method is not None:
+                expense.payment_method = payment_method
+            if not expense.payment_account_id:
+                expense.payment_account = cash_account
+            expense.refresh_status()
+            expense.save(update_fields=[
+                'amount_paid', 'status', 'payment_method', 'payment_account',
+            ])
+
+            pay_date = timezone.now().date()
+
+            # Double entry: Dr Accounts Payable (settle the liability), Cr
+            # cash/bank payment account (funds leave). Only meaningful once
+            # the expense's accrual has actually been posted — an unposted
+            # expense has no AP leg yet, so this payment simply waits to be
+            # netted against the accrual whenever the journal run catches up.
+            if expense.posting_status == 'posted':
+                ap_account = Supplier._ensure_ap_control_account()
+                _post_expense_le(ap_account, 'debit', amount, expense,
+                                  f'Pembayaran utang beban #{expense.pk}', pay_date)
+                _post_expense_le(cash_account, 'credit', amount, expense,
+                                  expense_credit_memo(expense, paid=True), pay_date)
+
+            AuditLog.objects.create(
+                performed_by=_actor(request),
+                action='UPDATE',
+                entity_type='Expense',
+                entity_id=str(expense.id),
+                description=f'Payment Rp{amount:,.0f} recorded for expense #{expense.id}, status → {expense.status}',
+            )
+
+        return Response(ExpenseSerializer(expense).data)
 
 
 # ── Account Transfers ──────────────────────────────────────────────────────────
@@ -1238,31 +1733,11 @@ class AccountTransferListCreateView(APIView):
                 created_by=_actor(request),
             )
 
-            # Update balances
-            ChartOfAccounts.objects.filter(pk=from_acct.pk).update(balance=from_acct.balance - amount)
-            ChartOfAccounts.objects.filter(pk=to_acct.pk).update(balance=to_acct.balance + amount)
-
-            # Ledger entries: credit from_account, debit to_account
-            LedgerEntry.objects.bulk_create([
-                LedgerEntry(
-                    account=from_acct,
-                    date=transfer_date,
-                    description=description,
-                    entry_type='credit',
-                    amount=amount,
-                    source_type='transfer',
-                    transfer=transfer,
-                ),
-                LedgerEntry(
-                    account=to_acct,
-                    date=transfer_date,
-                    description=description,
-                    entry_type='debit',
-                    amount=amount,
-                    source_type='transfer',
-                    transfer=transfer,
-                ),
-            ])
+            # Phase 2: posting is deferred (posting_status='unposted', the model
+            # default) — no balance update, no LedgerEntry rows here. A journal
+            # run (POST /api/accounting/journal/run/) posts this transfer via
+            # journal_engine.post_account_transfer() once it sweeps
+            # transfer_date.
 
             AuditLog.objects.create(
                 performed_by=_actor(request),
@@ -1289,17 +1764,28 @@ class AccountTransferDetailView(APIView):
         return Response(AccountTransferSerializer(obj).data)
 
     def delete(self, request, pk):
-        """Reverse a transfer: restore both account balances and remove ledger entries."""
+        """Reverse a transfer: restore both account balances and remove ledger entries.
+
+        Phase 2: an unposted transfer (the common case — see the deferred
+        posting note in the POST handler) has no balance effect and no
+        LedgerEntry rows, so this is a plain delete. A posted transfer (its
+        transfer_date has been swept by a journal run) still has real
+        balance/ledger effects, which are restored/removed here exactly as
+        before — AccountTransfer has no memo/void-exception path (unlike
+        Invoice/PurchaseInvoice, deleting a transfer is a hard delete, not a
+        void), so this remains a direct reversal on the original rows.
+        """
         obj = self._get(pk)
         if not obj:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         with transaction.atomic():
-            # Restore balances
-            ChartOfAccounts.objects.filter(pk=obj.from_account_id).update(balance=obj.from_account.balance + obj.amount)
-            ChartOfAccounts.objects.filter(pk=obj.to_account_id).update(balance=obj.to_account.balance - obj.amount)
-            # Remove ledger entries for this transfer
-            LedgerEntry.objects.filter(transfer=obj).delete()
+            if obj.posting_status == 'posted':
+                # Restore balances
+                ChartOfAccounts.objects.filter(pk=obj.from_account_id).update(balance=obj.from_account.balance + obj.amount)
+                ChartOfAccounts.objects.filter(pk=obj.to_account_id).update(balance=obj.to_account.balance - obj.amount)
+                # Remove ledger entries for this transfer
+                LedgerEntry.objects.filter(transfer=obj).delete()
 
             desc = str(obj)
             obj.delete()
@@ -1371,6 +1857,841 @@ class JournalAdjustmentView(APIView):
             )
 
         return Response(LedgerEntrySerializer(entry).data, status=status.HTTP_201_CREATED)
+
+
+# ── Journal Run (Phase 2 batch posting) ────────────────────────────────────────
+
+def _post_invoice_for_run(invoice):
+    """Rebuild the (item, item_name, quantity, price) lines from the InvoiceItem
+    rows already saved for this invoice and post it via the same
+    _post_accounting used by the (now historic) synchronous create/edit path,
+    with today's real transaction date — no date/source_type override, this is
+    a normal posting, not a memo."""
+    from .invoice_page import _post_accounting  # local import: avoids a cycle at module load
+
+    items = list(
+        invoice.items
+        .select_related('item__item_category__revenue_account')
+        .prefetch_related('item__treatment__materials__item')
+        .all()
+    )
+    items_by_id = {it.item_id: it.item for it in items if it.item_id}
+    lines_as_dicts = [
+        {'item_id': it.item_id, 'item_name': it.item_name, 'quantity': it.quantity, 'price': it.price}
+        for it in items
+    ]
+    _post_accounting(invoice, lines_as_dicts, items_by_id)
+    invoice.posting_status = 'posted'
+    invoice.save(update_fields=['posting_status'])
+
+
+def _post_purchase_for_run(pinv):
+    """Rebuild the ``parsed``/``item_objs`` shape _post_purchase_accrual expects
+    from the PurchaseInvoiceItem rows already saved for this invoice."""
+    items = list(pinv.items.select_related('item', 'expense_account', 'warehouse').all())
+    parsed = [{
+        'line_type':       it.line_type,
+        'item_id':         it.item_id,
+        'item_name':       it.item_name,
+        'quantity':        it.quantity,
+        'unit':            it.unit,
+        'unit_cost':       it.unit_cost,
+        'total_discount':  it.total_discount,
+        'adjusted_sub':    it.quantity * it.actual_unit_cost,
+        'expense_acct_id': it.expense_account_id,
+        'warehouse_id':    it.warehouse_id,
+    } for it in items]
+    _post_purchase_accrual(pinv, parsed, items, pinv.supplier, pinv.total_amount)
+    pinv.posting_status = 'posted'
+    pinv.save(update_fields=['posting_status'])
+
+
+def _post_expense_for_run(expense):
+    """Post an unposted Expense's accrual using the ExpenseItem rows already
+    saved for it, exactly like _post_purchase_for_run does for PurchaseInvoice."""
+    items = list(expense.items.select_related('account').all())
+    _post_expense_accrual(expense, items)
+    expense.posting_status = 'posted'
+    expense.save(update_fields=['posting_status'])
+
+
+def _build_journal_summary(date_from, date_to):
+    """Aggregate what a journal run just posted, for JournalBatch.summary:
+    total revenue, spend by expense/COGS account, outstanding AP total, and
+    per-account debit/credit movement — all restricted to [date_from, date_to].
+    """
+    entries = (
+        LedgerEntry.objects
+        .filter(date__gte=date_from, date__lte=date_to)
+        .select_related('account')
+    )
+
+    total_revenue = Decimal('0')
+    spend_by_account = {}
+    movement = {}
+
+    for e in entries:
+        acc = e.account
+        mv = movement.setdefault(acc.id, {
+            'account_id': acc.id, 'account_number': acc.account_number,
+            'name': acc.name, 'account_type': acc.account_type,
+            'debit': Decimal('0'), 'credit': Decimal('0'),
+        })
+        mv[e.entry_type] += e.amount
+
+        if acc.account_type == 'revenue':
+            total_revenue += e.amount if e.entry_type == 'credit' else -e.amount
+
+        if acc.account_type in ('expense', 'cogs'):
+            bucket = spend_by_account.setdefault(acc.id, {
+                'account_id': acc.id, 'account_number': acc.account_number,
+                'name': acc.name, 'amount': Decimal('0'),
+            })
+            bucket['amount'] += e.amount if e.entry_type == 'debit' else -e.amount
+
+    # Accounts payable total — sum of unpaid/partial PurchaseInvoice balances
+    # plus unpaid/partial Expense balances (Phase 3 — both post their unpaid
+    # portion to the same AP control account).
+    ap_total = (
+        PurchaseInvoice.objects
+        .filter(status__in=['unpaid', 'partial'], is_voided=False)
+        .aggregate(s=Sum('total_amount') - Sum('amount_paid'))['s']
+    ) or Decimal('0')
+    expense_ap_total = (
+        Expense.objects
+        .filter(status__in=['unpaid', 'partial'])
+        .aggregate(s=Sum('total_amount') - Sum('amount_paid'))['s']
+    ) or Decimal('0')
+    ap_total += expense_ap_total
+
+    return {
+        'total_revenue': str(total_revenue.quantize(CENT)),
+        'accounts_payable_total': str(ap_total.quantize(CENT)),
+        'spend_by_account': [
+            {**v, 'amount': str(v['amount'].quantize(CENT))}
+            for v in sorted(spend_by_account.values(), key=lambda m: m['account_number'])
+        ],
+        'account_movements': [
+            {**v, 'debit': str(v['debit'].quantize(CENT)), 'credit': str(v['credit'].quantize(CENT))}
+            for v in sorted(movement.values(), key=lambda m: m['account_number'])
+        ],
+    }
+
+
+def _post_transfer_for_run(transfer):
+    """Post an account transfer and flip it to 'posted'."""
+    post_account_transfer(transfer)
+    transfer.posting_status = 'posted'
+    transfer.save(update_fields=['posting_status'])
+
+
+# kind -> poster, injected into run_journal_sweep so the service module does not
+# need to import this views module (which would be a cycle).
+_RUN_POSTERS = {
+    'invoice': _post_invoice_for_run,
+    'purchase': _post_purchase_for_run,
+    'expense': _post_expense_for_run,
+    'transfer': _post_transfer_for_run,
+}
+
+
+def _parse_date_to(request):
+    """Shared validation for both run endpoints.
+
+    Returns (date, None) or (None, error_response). Streaming callers must run
+    this BEFORE opening the stream — once the first frame is sent the status
+    code is committed to 200 and a 400 is no longer expressible.
+    """
+    raw = request.data.get('date_to')
+    if not raw:
+        return None, Response(
+            {'error': 'date_to wajib diisi (YYYY-MM-DD).'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    try:
+        return datetime.date.fromisoformat(str(raw)), None
+    except ValueError:
+        return None, Response(
+            {'error': 'Format date_to tidak valid. Gunakan YYYY-MM-DD.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class JournalRunView(APIView):
+    """
+    POST /api/accounting/journal/run/
+    Body: { date_to: 'YYYY-MM-DD' }
+
+    Finds every Invoice/PurchaseInvoice/AccountTransfer/Expense with
+    posting_status='unposted' and a transaction date <= date_to — regardless
+    of how old, which is what makes this a "sweep": a document from weeks ago
+    that was never posted still gets caught here, not just today's. Same-day
+    void/edit memo entries (source_type='void_memo'/'edit_memo') are never
+    touched by this query — they are written directly by the void/edit
+    endpoints and are already "posted" by construction.
+
+    Upserts JournalDayLog (is_posted=True) for every calendar date from the
+    earliest date actually posted through date_to, then records everything in
+    a JournalBatch, whose summary is returned.
+
+    The request/response contract is unchanged. What changed underneath, twice:
+
+      * Phase 2 moved the transaction boundary — the sweep is no longer one
+        atomic block over the whole run, it commits one day at a time, so a
+        failure leaves earlier days posted. There is deliberately NO
+        @transaction.atomic on this method: adding one back would nest every
+        per-day transaction inside a single outer transaction and silently
+        restore all-or-nothing behaviour.
+      * Phase 4 made this a thin wrapper over preview-then-commit. It is kept
+        for scripts and the POS, but it must not carry its own posting
+        implementation — a second path writing LedgerEntry rows without a
+        JournalEntry header would reopen the flat-ledger problem Phase 4
+        closed. The web UI no longer calls this; it uses the two-phase flow.
+
+    Side effect worth knowing about: like any preview, this supersedes an open
+    draft. The documents in that draft are the ones this run is about to post,
+    so the draft would have gone stale regardless.
+    """
+
+    def post(self, request):
+        date_to, err = _parse_date_to(request)
+        if err:
+            return err
+
+        final = None
+        for evt in journal_preview.run_and_commit(
+            _actor(request), date_to, _build_journal_summary,
+        ):
+            if evt['type'] in ('done', 'error', 'stale'):
+                final = evt
+
+        if final is not None and final['type'] == 'stale':
+            # Only reachable if a document changed between this run's own
+            # preview and its commit — a genuine concurrent edit.
+            return Response(
+                {'error': final['message'], 'stale': final['stale']},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        if final is None or final['type'] == 'error':
+            message = (final or {}).get('message', 'Journal run failed.')
+            return Response(
+                {
+                    'error': message,
+                    'failed_on': (final or {}).get('date'),
+                    'days_committed': (final or {}).get('days_committed', 0),
+                },
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # `variances` is a Phase 4 addition that belongs to the two-phase flow —
+        # it reports where a committed FIFO amount drifted from what the
+        # operator previewed. This endpoint previews and commits back to back,
+        # so it can never be meaningfully populated, and callers of the legacy
+        # contract must not suddenly receive a key they never had.
+        payload = {k: v for k, v in final.items() if k not in ('type', 'variances')}
+        return Response(payload, status=status.HTTP_200_OK)
+
+
+class JournalRunStreamView(APIView):
+    """
+    POST /api/accounting/journal/run/stream/
+    Body: { date_to: 'YYYY-MM-DD' }
+
+    Same sweep as JournalRunView, but streams progress as Server-Sent Events so
+    the web UI can animate each day as it is committed:
+
+        event: start   {batch_id, date_to, total, days:[{date, documents}]}
+        event: day     {index, date, documents, status: posted|skipped}
+        event: done    {...same payload as JournalRunView...}
+        event: error   {date, message, days_committed}
+
+    Clients must read this with fetch()+ReadableStream, not EventSource:
+    EventSource is GET-only and cannot send the Authorization header.
+
+    Phase 4: like JournalRunView, this is now preview-then-commit under the
+    hood. The preview half is drained silently, so the events on the wire are
+    the commit's — identical to what this endpoint always emitted.
+    """
+
+    def post(self, request):
+        # Validate before opening the stream — once the first frame is written
+        # the status code is committed to 200.
+        date_to, err = _parse_date_to(request)
+        if err:
+            return err
+
+        # Resolve the actor up front; the generator must not touch `request`.
+        actor = _actor(request)
+
+        def frames():
+            try:
+                for evt in journal_preview.run_and_commit(
+                    actor, date_to, _build_journal_summary,
+                ):
+                    yield _sse(evt)
+            except Exception as exc:  # noqa: BLE001 — cannot become a 500 mid-stream
+                yield _sse({
+                    'type': 'error', 'date': None,
+                    'message': str(exc) or exc.__class__.__name__,
+                    'days_committed': 0,
+                })
+
+        return _stream(frames())
+
+
+class JournalStatusView(APIView):
+    """GET /api/accounting/journal/status/?date_from=&date_to=
+
+    Returns {date: is_posted} for every calendar day in the range, for a
+    calendar-style UI. A day with no JournalDayLog row at all counts as
+    is_posted=False (never swept).
+    """
+
+    def get(self, request):
+        date_from_raw = request.query_params.get('date_from', '').strip()
+        date_to_raw = request.query_params.get('date_to', '').strip()
+        if not date_from_raw or not date_to_raw:
+            return Response({'error': 'date_from dan date_to wajib diisi (YYYY-MM-DD).'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            d_from = datetime.date.fromisoformat(date_from_raw)
+            d_to = datetime.date.fromisoformat(date_to_raw)
+        except ValueError:
+            return Response({'error': 'Format tanggal tidak valid. Gunakan YYYY-MM-DD.'}, status=status.HTTP_400_BAD_REQUEST)
+        if d_from > d_to:
+            return Response({'error': 'date_from tidak boleh setelah date_to.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        posted_dates = set(
+            JournalDayLog.objects
+            .filter(date__gte=d_from, date__lte=d_to, is_posted=True)
+            .values_list('date', flat=True)
+        )
+        result = {}
+        cur = d_from
+        while cur <= d_to:
+            result[cur.isoformat()] = cur in posted_dates
+            cur += datetime.timedelta(days=1)
+        return Response(result)
+
+
+# ── Journal Preview (Phase 4 — stage, review, then commit) ────────────────────
+
+def _sse(evt):
+    return f"event: {evt['type']}\ndata: {json.dumps(evt, default=str)}\n\n"
+
+
+def _stream(frames):
+    resp = StreamingHttpResponse(frames, content_type='text/event-stream')
+    resp['Cache-Control'] = 'no-cache'
+    resp['X-Accel-Buffering'] = 'no'   # defeat nginx/proxy response buffering
+    return resp
+
+
+class JournalPreviewView(APIView):
+    """
+    POST /api/accounting/journal/preview/   Body: { date_to: 'YYYY-MM-DD' }
+    GET  /api/accounting/journal/preview/
+
+    POST builds a staging batch — every journal entry a sweep to ``date_to``
+    would post, materialised into StagedJournalEntry/StagedJournalLine rows and
+    nothing else. No ledger row is written, no document's posting_status moves,
+    no JournalDayLog is touched. Streams the same per-day SSE events as the run
+    endpoint so the existing grid animation works unchanged, except a day
+    settles as 'staged' rather than 'posted'.
+
+    Starting a preview supersedes any open draft: accounting is one set of
+    books, so there is deliberately never more than one.
+
+    GET returns the current open draft (204 when there is none) so the page can
+    drop a returning user straight back into review.
+    """
+
+    def get(self, request):
+        journal_preview.purge_expired_drafts()
+        draft = journal_preview.open_draft()
+        if draft is None:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        payload = JournalStagingBatchSerializer(draft).data
+        payload['days'] = _draft_day_counts(draft)
+        return Response(payload)
+
+    def post(self, request):
+        date_to, err = _parse_date_to(request)
+        if err:
+            return err
+        actor = _actor(request)
+
+        def frames():
+            try:
+                for evt in journal_preview.build_preview(actor, date_to):
+                    yield _sse(evt)
+            except Exception as exc:  # noqa: BLE001 — cannot become a 500 mid-stream
+                yield _sse({'type': 'error', 'date': None,
+                            'message': str(exc) or exc.__class__.__name__})
+
+        return _stream(frames())
+
+
+def _draft_day_counts(draft):
+    """Per-day entry counts for the review UI's day grouping."""
+    rows = (
+        draft.entries
+        .values('date')
+        .annotate(entries=Count('id'),
+                  debit=Sum('total_debit'), credit=Sum('total_credit'))
+        .order_by('date')
+    )
+    return [{
+        'date': r['date'].isoformat(),
+        'entries': r['entries'],
+        'total_debit': str(r['debit'] or 0),
+        'total_credit': str(r['credit'] or 0),
+    } for r in rows]
+
+
+class JournalPreviewEntriesView(APIView):
+    """
+    GET /api/accounting/journal/preview/entries/
+
+    Paginated staged entries of the open draft. A sweep of a busy clinic is
+    realistically tens of thousands of lines, so the review UI pages over them
+    server-side and never loads the batch whole.
+
+    Query params: date, date_from, date_to, source_type, account, q,
+                  only_warnings, page, page_size
+    """
+
+    def get(self, request):
+        draft = journal_preview.open_draft()
+        if draft is None:
+            return Response({'error': 'Tidak ada draf jurnal yang terbuka.'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        qs = draft.entries.all()
+
+        date        = request.query_params.get('date', '').strip()
+        date_from   = request.query_params.get('date_from', '').strip()
+        date_to     = request.query_params.get('date_to', '').strip()
+        source_type = request.query_params.get('source_type', '').strip()
+        account     = request.query_params.get('account', '').strip()
+        q           = request.query_params.get('q', '').strip()
+        only_warn   = request.query_params.get('only_warnings', '').strip().lower() in ('1', 'true', 'yes')
+
+        if date:
+            qs = qs.filter(date=date)
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+        if source_type:
+            qs = qs.filter(source_type=source_type)
+        if account:
+            qs = qs.filter(lines__account_id=account).distinct()
+        if q:
+            qs = qs.filter(Q(memo__icontains=q) | Q(source_label__icontains=q))
+        if only_warn:
+            # Everything an operator would want to look at twice: an entry that
+            # does not balance, one whose account does not exist yet, or one
+            # carrying a FIFO estimate that may move at commit.
+            qs = qs.filter(Q(is_balanced=False) | Q(has_estimate=True) |
+                           ~Q(warnings=[])).distinct()
+
+        try:
+            page      = max(1, int(request.query_params.get('page', 1)))
+            page_size = min(500, max(1, int(request.query_params.get('page_size', 100))))
+        except ValueError:
+            page, page_size = 1, 100
+
+        total = qs.count()
+        offset = (page - 1) * page_size
+        entries = qs[offset:offset + page_size]
+
+        return Response({
+            'count': total,
+            'page': page,
+            'page_size': page_size,
+            'results': StagedJournalEntryListSerializer(entries, many=True).data,
+        })
+
+
+class JournalPreviewEntryDetailView(APIView):
+    """GET /api/accounting/journal/preview/entries/<pk>/ — one staged entry and
+    its lines, for the entry detail page in 'draft' mode."""
+
+    def get(self, request, pk):
+        entry = (
+            StagedJournalEntry.objects
+            .filter(pk=pk)
+            .select_related('batch')
+            .prefetch_related('lines__account')
+            .first()
+        )
+        if entry is None:
+            return Response({'error': 'Entri tidak ditemukan.'}, status=status.HTTP_404_NOT_FOUND)
+        payload = StagedJournalEntryDetailSerializer(entry).data
+        payload['batch'] = JournalStagingBatchSerializer(entry.batch).data
+        return Response(payload)
+
+
+class JournalPreviewCommitView(APIView):
+    """
+    POST /api/accounting/journal/preview/commit/
+    Body: { staging_batch_id }  (optional — defaults to the open draft)
+
+    Writes the reviewed draft to the ledger, streaming per-day SSE events.
+
+    Emits an extra terminal event the run endpoint never had:
+
+        event: stale  {stale: [{staged_entry_id, source_label, reason}], message}
+
+    …when a source document changed after the operator reviewed it. Nothing is
+    posted in that case; the draft stays open and the UI asks for a re-preview.
+
+    There is deliberately NO @transaction.atomic here. The commit owns a
+    per-day transaction boundary — a failure on day k leaves days 1…k-1 posted,
+    which is what makes a long sweep resumable. An outer atomic block would
+    silently restore all-or-nothing behaviour.
+    """
+
+    def post(self, request):
+        batch_id = request.data.get('staging_batch_id')
+        if batch_id:
+            batch = JournalStagingBatch.objects.filter(pk=batch_id).first()
+        else:
+            batch = journal_preview.open_draft()
+
+        if batch is None:
+            return Response({'error': 'Draf jurnal tidak ditemukan. Jalankan pratinjau lebih dulu.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        if batch.status != 'draft':
+            return Response({'error': f'Draf ini berstatus "{batch.status}" dan tidak bisa dicatat.'},
+                            status=status.HTTP_409_CONFLICT)
+        if batch.expires_at <= timezone.now():
+            return Response({'error': 'Draf sudah kedaluwarsa. Jalankan pratinjau ulang.'},
+                            status=status.HTTP_409_CONFLICT)
+
+        actor = _actor(request)
+
+        def frames():
+            try:
+                for evt in journal_preview.commit_preview(actor, batch, _build_journal_summary):
+                    yield _sse(evt)
+            except Exception as exc:  # noqa: BLE001
+                yield _sse({'type': 'error', 'date': None,
+                            'message': str(exc) or exc.__class__.__name__,
+                            'days_committed': 0})
+
+        return _stream(frames())
+
+
+class JournalPreviewDiscardView(APIView):
+    """POST /api/accounting/journal/preview/discard/ — drop the open draft."""
+
+    def post(self, request):
+        draft = journal_preview.open_draft()
+        if draft is None:
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        draft.status = 'discarded'
+        draft.save(update_fields=['status'])
+        return Response({'discarded': draft.id})
+
+
+# ── Journal Entries (Phase 4 — headers, detail, corrections) ──────────────────
+
+class JournalEntryListView(APIView):
+    """
+    GET /api/accounting/journal/entries/
+
+    Posted journal entries at header level — the list behind the entry detail
+    pages. ``JournalHistoryView`` still serves the flat per-line view; this is
+    the document-level companion to it.
+
+    Query params: date_from, date_to, source_type, account, batch, q,
+                  has_correction, page, page_size
+    """
+
+    def get(self, request):
+        qs = (
+            JournalEntry.objects
+            .select_related('invoice', 'purchase_invoice', 'expense', 'transfer')
+            .annotate(line_count=Count('lines', distinct=True),
+                      reversal_count=Count('reversed_by', distinct=True))
+        )
+
+        date_from   = request.query_params.get('date_from', '').strip()
+        date_to     = request.query_params.get('date_to', '').strip()
+        source_type = request.query_params.get('source_type', '').strip()
+        account     = request.query_params.get('account', '').strip()
+        batch       = request.query_params.get('batch', '').strip()
+        q           = request.query_params.get('q', '').strip()
+        has_corr    = request.query_params.get('has_correction', '').strip().lower() in ('1', 'true', 'yes')
+
+        if date_from:
+            qs = qs.filter(date__gte=date_from)
+        if date_to:
+            qs = qs.filter(date__lte=date_to)
+        if source_type:
+            qs = qs.filter(source_type=source_type)
+        if account:
+            qs = qs.filter(lines__account_id=account).distinct()
+        if batch:
+            qs = qs.filter(batch_id=batch)
+        if q:
+            qs = qs.filter(Q(memo__icontains=q) | Q(entry_number__icontains=q))
+        if has_corr:
+            qs = qs.filter(reversal_count__gt=0)
+
+        try:
+            page      = max(1, int(request.query_params.get('page', 1)))
+            page_size = min(500, max(1, int(request.query_params.get('page_size', 100))))
+        except ValueError:
+            page, page_size = 1, 100
+
+        total = qs.count()
+        offset = (page - 1) * page_size
+        return Response({
+            'count': total,
+            'page': page,
+            'page_size': page_size,
+            'results': JournalEntryListSerializer(qs[offset:offset + page_size], many=True).data,
+        })
+
+
+def _entry_or_none(pk):
+    return (
+        JournalEntry.objects
+        .filter(pk=pk)
+        .select_related('invoice', 'purchase_invoice', 'expense', 'transfer',
+                        'created_by', 'reverses', 'corrects')
+        .prefetch_related('lines__account', 'reversed_by', 'corrections')
+        .first()
+    )
+
+
+class JournalEntryDetailView(APIView):
+    """GET /api/accounting/journal/entries/<pk>/ — header, every line with its
+    account, the source document reference, and the correction chain."""
+
+    def get(self, request, pk):
+        entry = _entry_or_none(pk)
+        if entry is None:
+            return Response({'error': 'Jurnal tidak ditemukan.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(JournalEntryDetailSerializer(entry).data)
+
+
+class JournalEntryCorrectionDraftView(APIView):
+    """
+    GET /api/accounting/journal/entries/<pk>/correction-draft/
+
+    Everything the correction editor needs to open prefilled: the original
+    entry, the reversal that will be generated for it, and an editable copy of
+    its lines as the starting point for the replacement.
+    """
+
+    def get(self, request, pk):
+        entry = _entry_or_none(pk)
+        if entry is None:
+            return Response({'error': 'Jurnal tidak ditemukan.'}, status=status.HTTP_404_NOT_FOUND)
+
+        blocked = _correction_block_reason(entry)
+        lines = [{
+            'account_id': l.account_id,
+            'account_number': l.account.account_number,
+            'account_name': l.account.name,
+            'entry_type': l.entry_type,
+            'amount': str(l.amount),
+            'description': l.description,
+        } for l in entry.lines.select_related('account').all()]
+
+        return Response({
+            'original': JournalEntryDetailSerializer(entry).data,
+            'correction_date': timezone.now().date().isoformat(),
+            'blocked_reason': blocked,
+            'lines': lines,
+        })
+
+
+def _correction_block_reason(entry):
+    """Why this entry cannot be corrected, or None when it can."""
+    if entry.source_type == 'reversal':
+        return 'Entri pembalik tidak dapat dikoreksi. Koreksi jurnal aslinya.'
+    if entry.reversed_by.exists():
+        existing = entry.reversed_by.first()
+        return f'Jurnal ini sudah dibalik oleh {existing.entry_number}.'
+    return None
+
+
+class JournalEntryCorrectView(APIView):
+    """
+    POST /api/accounting/journal/entries/<pk>/correct/
+    Body: { memo, reason, lines: [{account, entry_type, amount, description}] }
+
+    Posts a correction as two new entries, both dated **today**:
+
+      1. a full reversal of the original — auto-generated, every line flipped,
+         ``source_type='reversal'``, ``reverses=<original>``;
+      2. the operator's replacement — ``source_type='correction'``,
+         ``corrects=<original>``.
+
+    The original day's books are never rewritten, which is the whole point: a
+    period that has been reported on stays as it was reported.
+
+    Deliberately does NOT touch JournalDayLog. Reversal and correction rows are
+    already-posted by construction (same convention as the void/edit memo
+    path); marking today is_posted=True would tell the financial-reports guard
+    that today had been swept when it has not.
+
+    The source document is left alone. If the *document* is wrong the operator
+    should edit it — corrections are for entries whose accounting was wrong.
+    """
+
+    def post(self, request, pk):
+        entry = _entry_or_none(pk)
+        if entry is None:
+            return Response({'error': 'Jurnal tidak ditemukan.'}, status=status.HTTP_404_NOT_FOUND)
+
+        blocked = _correction_block_reason(entry)
+        if blocked:
+            return Response({'error': blocked}, status=status.HTTP_409_CONFLICT)
+
+        memo = (request.data.get('memo') or '').strip()
+        if not memo:
+            return Response({'error': 'Keterangan koreksi wajib diisi.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        reason = (request.data.get('reason') or '').strip()
+
+        legset, errors = _parse_correction_lines(request.data.get('lines') or [])
+        if errors:
+            return Response({'error': 'Baris jurnal tidak valid.', 'lines': errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        today = timezone.now().date()
+        actor = _actor(request)
+
+        with transaction.atomic():
+            # Re-read under lock so two managers cannot both reverse the same
+            # entry and double the reversal.
+            locked = JournalEntry.objects.select_for_update().get(pk=entry.pk)
+            if locked.reversed_by.exists():
+                return Response({'error': 'Jurnal ini baru saja dibalik oleh proses lain.'},
+                                status=status.HTTP_409_CONFLICT)
+
+            numbers = reserve_entry_numbers(today.year, 2)
+
+            reversal = write_legs(
+                reverse_legset(legset_from_entry(locked)),
+                date=today,
+                source_type='reversal',
+                document=_entry_document(locked),
+                actor=actor,
+                memo=f'Pembalikan {locked.entry_number}'[:255],
+                entry_number=numbers[0],
+                reverses=locked,
+            )
+
+            correction = write_legs(
+                legset,
+                date=today,
+                source_type='correction',
+                document=_entry_document(locked),
+                actor=actor,
+                memo=memo,
+                entry_number=numbers[1],
+                corrects=locked,
+            )
+
+            AuditLog.objects.create(
+                performed_by=actor,
+                action='CORRECT',
+                entity_type='JournalEntry',
+                entity_id=str(locked.pk),
+                description=(
+                    f'Koreksi {locked.entry_number}: pembalikan {reversal.entry_number}, '
+                    f'koreksi {correction.entry_number}. Alasan: {reason or "—"}'
+                ),
+            )
+
+        return Response({
+            'original': JournalEntryRefSerializer(locked).data,
+            'reversal': JournalEntryRefSerializer(reversal).data,
+            'correction': JournalEntryDetailSerializer(_entry_or_none(correction.pk)).data,
+        }, status=status.HTTP_201_CREATED)
+
+
+def _entry_document(entry):
+    """The source document instance an entry hangs off, or None.
+
+    A correction inherits the original's document link so the invoice/expense
+    detail page shows the whole story — original, reversal and correction —
+    rather than the original alone.
+    """
+    return entry.invoice or entry.purchase_invoice or entry.expense or entry.transfer
+
+
+def _parse_correction_lines(raw):
+    """Validate the operator's lines and turn them into a LegSet.
+
+    Returns ``(legset, errors)``; ``errors`` maps line index → message and is
+    empty when the entry is postable. Rejects anything the ledger should never
+    see: fewer than two lines, non-positive amounts, head accounts (which are
+    grouping rows, not postable), and — the important one — an entry whose
+    debits and credits do not match.
+    """
+    errors = {}
+    legset = LegSet()
+
+    if len(raw) < 2:
+        return legset, {'_': 'Jurnal koreksi butuh minimal dua baris.'}
+
+    account_ids = []
+    for i, row in enumerate(raw):
+        try:
+            account_ids.append(int(row.get('account')))
+        except (TypeError, ValueError):
+            errors[i] = 'Akun wajib dipilih.'
+            account_ids.append(None)
+
+    accounts = {a.pk: a for a in ChartOfAccounts.objects.filter(
+        pk__in=[a for a in account_ids if a is not None])}
+
+    for i, row in enumerate(raw):
+        if i in errors:
+            continue
+        account = accounts.get(account_ids[i])
+        if account is None:
+            errors[i] = 'Akun tidak ditemukan.'
+            continue
+        if account.is_head:
+            errors[i] = 'Akun induk tidak bisa dijurnal. Pilih sub-akun.'
+            continue
+
+        entry_type = (row.get('entry_type') or '').strip().lower()
+        if entry_type not in ('debit', 'credit'):
+            errors[i] = 'Tipe harus debit atau kredit.'
+            continue
+
+        amount = _safe_decimal(row.get('amount', 0))
+        if amount <= 0:
+            errors[i] = 'Jumlah harus lebih dari nol.'
+            continue
+
+        description = (row.get('description') or '').strip()
+        if not description:
+            errors[i] = 'Keterangan baris wajib diisi.'
+            continue
+
+        legset.add(account, entry_type, amount, description)
+
+    if errors:
+        return legset, errors
+
+    if not legset.is_balanced:
+        return legset, {'_': (
+            f'Jurnal tidak seimbang: debit {legset.total_debit} '
+            f'vs kredit {legset.total_credit}.'
+        )}
+
+    return legset, {}
 
 
 # ── Journal History ────────────────────────────────────────────────────────────
@@ -1458,7 +2779,7 @@ class AccountingDashboardView(APIView):
 
         unpaid_qs = PurchaseInvoice.objects.filter(
             status__in=['unpaid', 'partial']
-        ).select_related('supplier', 'payment_account').order_by('due_date', '-purchase_date')
+        ).select_related('supplier', 'payment_method', 'payment_method__linked_account').order_by('due_date', '-purchase_date')
 
         overdue_count = unpaid_qs.filter(due_date__lt=today).count()
         total_unpaid  = unpaid_qs.aggregate(
@@ -1780,7 +3101,7 @@ class DailySalesView(APIView):
         invoices = (
             Invoice.objects
             .filter(datetime__gte=day_start, datetime__lt=day_end)
-            .select_related('payment_method')
+            .select_related('payment_method', 'payment_method__linked_account')
         )
 
         grand_total = Decimal('0')
@@ -1794,9 +3115,9 @@ class DailySalesView(APIView):
             key = pm.id if pm else 0
             if key not in by_account:
                 by_account[key] = {
-                    'account_id':     pm.id             if pm else None,
-                    'account_number': pm.account_number if pm else None,
-                    'account_name':   pm.name           if pm else 'Tidak Diketahui',
+                    'account_id':     pm.id                                  if pm else None,
+                    'account_number': pm.linked_account.account_number       if pm else None,
+                    'account_name':   pm.name                                if pm else 'Tidak Diketahui',
                     'total':          Decimal('0'),
                     'invoice_count':  0,
                 }

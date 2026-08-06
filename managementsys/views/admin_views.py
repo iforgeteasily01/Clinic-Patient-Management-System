@@ -1,15 +1,18 @@
 import io
+from datetime import datetime
 
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from django.db import transaction
-from django.db.models import Q, Sum
+from django.db.models import Count, Q, Sum
 from django.http import HttpResponse
+from django.utils import timezone
 from rest_framework import generics, status
 from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from ..auth_backend import IsAppAuthenticated
+from .financial_reports_utils import ledger_rows_with_balance, unposted_dates_in_range
 
 _HEADER_FONT = Font(bold=True, color='FFFFFF')
 _HEADER_FILL = PatternFill('solid', fgColor='0284C7')
@@ -22,6 +25,7 @@ from ..api.serializers import (
     DoctorsSerializer,
     LedgerEntrySerializer,
     PatientSerializer,
+    PaymentMethodSerializer,
     SiteConfigSerializer,
     TreatmentCategorySerializer,
     TreatmentMaterialSerializer,
@@ -30,7 +34,7 @@ from ..api.serializers import (
 )
 from ..models import (
     AppUser, AuditLog, Beauticians, ChartOfAccounts, ColorPalette, Doctors, InventoryItem,
-    LedgerEntry, Patient, SiteConfig, Treatment, TreatmentCategory, TreatmentMaterial, TreatmentPackage,
+    LedgerEntry, Patient, PaymentMethod, SiteConfig, Treatment, TreatmentCategory, TreatmentMaterial, TreatmentPackage,
 )
 
 
@@ -369,8 +373,36 @@ class AppUserDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
 class ChartOfAccountsListCreateView(generics.ListCreateAPIView):
     serializer_class = ChartOfAccountsSerializer
 
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        # Treatment / item counts per category, so the COA page can show how
+        # much each per-category account actually covers without an N+1.
+        counts = {}
+        for cat_id, is_service, total in (
+            InventoryItem.objects
+            .filter(item_category__isnull=False)
+            .values_list('item_category_id', 'is_service')
+            .annotate(total=Count('id'))
+        ):
+            treatments, items = counts.get(cat_id, (0, 0))
+            if is_service:
+                treatments = total
+            else:
+                items = total
+            counts[cat_id] = (treatments, items)
+        context['category_counts'] = counts
+        return context
+
     def get_queryset(self):
-        qs = ChartOfAccounts.objects.all().order_by('account_number')
+        qs = (
+            ChartOfAccounts.objects
+            .select_related(
+                'parent',
+                'treatment_category',
+                'supplier_ap',
+            )
+            .order_by('account_number')
+        )
         range_param = self.request.query_params.get('range', '').strip()
         if range_param == 'cash':
             # Return sub-accounts of the system cash head (account 1100000).
@@ -429,6 +461,12 @@ class AccountLedgerView(APIView):
       date_from   YYYY-MM-DD
       date_to     YYYY-MM-DD
       entry_type  'debit' | 'credit'
+
+    Entries come back ASCENDING (oldest first) — a running-balance ledger has
+    to read top-down — each carrying `balance`, the account's balance after
+    that entry. `opening_balance` is the natural-signed balance before
+    `date_from` (0 when no `date_from`); `closing_balance` is the balance after
+    every entry in the window, regardless of the `entry_type` display filter.
     """
 
     def get(self, request, pk):
@@ -437,36 +475,258 @@ class AccountLedgerView(APIView):
         except ChartOfAccounts.DoesNotExist:
             return Response({'error': 'Account not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        qs = LedgerEntry.objects.filter(account=account).select_related('invoice')
-
         date_from = request.query_params.get('date_from', '').strip()
         date_to   = request.query_params.get('date_to', '').strip()
         etype     = request.query_params.get('entry_type', '').strip().lower()
 
-        if date_from:
-            qs = qs.filter(date__gte=date_from)
-        if date_to:
-            qs = qs.filter(date__lte=date_to)
-        if etype in ('debit', 'credit'):
-            qs = qs.filter(entry_type=etype)
-
-        totals = qs.aggregate(
-            total_debit=Sum('amount', filter=Q(entry_type='debit')),
-            total_credit=Sum('amount', filter=Q(entry_type='credit')),
+        rows, opening, closing, total_debit, total_credit = ledger_rows_with_balance(
+            account, date_from=date_from, date_to=date_to, entry_type=etype,
         )
 
+        # LedgerEntrySerializer is shared with other endpoints, so `balance` is
+        # not a serializer field — zip it onto the serialized dicts instead.
+        # `rows` and `.data` are the same list in the same order.
+        entries = LedgerEntrySerializer(rows, many=True).data
+        for row, entry in zip(rows, entries):
+            entry['balance'] = str(row.running_balance)
+
         return Response({
-            'account': {
-                'id': account.id,
-                'account_number': account.account_number,
-                'name': account.name,
-                'account_type': account.account_type,
-                'balance': str(account.balance),
-            },
-            'entries': LedgerEntrySerializer(qs, many=True).data,
-            'total_debit': str(totals['total_debit'] or 0),
-            'total_credit': str(totals['total_credit'] or 0),
+            # Full account serializer, not a hand-rolled dict: the ledger page
+            # is where an account's linkage (the treatment category or vendor
+            # it serves) is shown now that the COA list dropped that column.
+            'account': ChartOfAccountsSerializer(account).data,
+            'entries': entries,
+            'opening_balance': str(opening),
+            'closing_balance': str(closing),
+            'total_debit': str(total_debit),
+            'total_credit': str(total_credit),
         })
+
+
+# ── Ledger print (PDF) ───────────────────────────────────────────────────────
+
+# A full-history print of a busy cash account materialises every row twice —
+# once as data, once as a platypus flowable. Cap the window rather than let a
+# stray click OOM the server.
+MAX_LEDGER_PRINT_DAYS = 366
+
+_BOOL_TRUE = {'1', 'true', 'yes', 'on', 't', 'y'}
+_BOOL_FALSE = {'0', 'false', 'no', 'off', 'f', 'n'}
+
+_MAX_TITLE_LEN = 120
+_MAX_SUBTITLE_LEN = 300
+
+
+def _bad(message):
+    return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
+
+
+def _param_date(raw, name):
+    """-> (date|None, error|None). Blank is None, garbage is an error — never a
+    silent fallback to 'today' or 'all time'."""
+    raw = (raw or '').strip()
+    if not raw:
+        return None, None
+    try:
+        return datetime.strptime(raw, '%Y-%m-%d').date(), None
+    except ValueError:
+        return None, f"Format {name} tidak valid: '{raw}'. Gunakan YYYY-MM-DD."
+
+
+def _param_enum(raw, allowed, name):
+    """-> (value, error|None). An unrecognised value is a 400, so a typo in the
+    query string can never quietly print a different report than the one asked
+    for."""
+    value = (raw or '').strip().lower()
+    if value not in allowed:
+        shown = ', '.join(repr(a) for a in allowed)
+        return None, f"Nilai {name} tidak dikenal: '{raw}'. Pilihan: {shown}."
+    return value, None
+
+
+def _param_bool(raw, name, default=True):
+    if raw is None or not str(raw).strip():
+        return default, None
+    value = str(raw).strip().lower()
+    if value in _BOOL_TRUE:
+        return True, None
+    if value in _BOOL_FALSE:
+        return False, None
+    return None, f"Nilai {name} tidak dikenal: '{raw}'. Gunakan true atau false."
+
+
+class AccountLedgerPrintView(APIView):
+    """GET /api/admin/accounts/<pk>/ledger/print/ → application/pdf
+
+    The printable twin of ``AccountLedgerView``. Both read the same rows from
+    ``ledger_rows_with_balance()``, so the PDF and the screen can never
+    disagree about a balance.
+
+    Query params — see docs/DESIGN_expense_redesign_and_coa_print.md §4.2:
+      date_from, date_to   YYYY-MM-DD, both required
+      entry_type           '' | debit | credit          (default '')
+      title                str                          (default 'Buku Besar')
+      subtitle             str                          (default '')
+      group_by             none | day | month           (default none)
+      page_break           none | group                 (default none)
+      show_opening / show_running / show_subtotals  bool (default true)
+      orientation          portrait | landscape         (default portrait)
+
+    Served ``inline`` so the browser opens it in a tab the user can Ctrl+P,
+    rather than dropping a file in Downloads.
+    """
+
+    def get(self, request, pk):
+        try:
+            account = ChartOfAccounts.objects.get(pk=pk)
+        except ChartOfAccounts.DoesNotExist:
+            return Response({'error': 'Account not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        q = request.query_params
+
+        date_from, err = _param_date(q.get('date_from'), 'date_from')
+        if err:
+            return _bad(err)
+        date_to, err = _param_date(q.get('date_to'), 'date_to')
+        if err:
+            return _bad(err)
+        if not date_from or not date_to:
+            return _bad('date_from dan date_to wajib diisi untuk mencetak buku besar.')
+        if date_from > date_to:
+            return _bad('date_from tidak boleh melewati date_to.')
+
+        span_days = (date_to - date_from).days + 1
+        if span_days > MAX_LEDGER_PRINT_DAYS:
+            return _bad(
+                f'Rentang {span_days} hari terlalu panjang untuk dicetak '
+                f'(maksimal {MAX_LEDGER_PRINT_DAYS} hari). Persempit rentang tanggalnya.'
+            )
+
+        entry_type, err = _param_enum(q.get('entry_type'), ('', 'debit', 'credit'), 'entry_type')
+        if err:
+            return _bad(err)
+        group_by, err = _param_enum(q.get('group_by') or 'none', ('none', 'day', 'month'), 'group_by')
+        if err:
+            return _bad(err)
+        page_break, err = _param_enum(q.get('page_break') or 'none', ('none', 'group'), 'page_break')
+        if err:
+            return _bad(err)
+        orientation, err = _param_enum(
+            q.get('orientation') or 'portrait', ('portrait', 'landscape'), 'orientation',
+        )
+        if err:
+            return _bad(err)
+
+        if page_break == 'group' and group_by == 'none':
+            return _bad(
+                'page_break=group memerlukan group_by=day atau group_by=month — '
+                'tanpa pengelompokan tidak ada kelompok untuk dipisah per halaman.'
+            )
+
+        show_opening, err = _param_bool(q.get('show_opening'), 'show_opening')
+        if err:
+            return _bad(err)
+        show_running, err = _param_bool(q.get('show_running'), 'show_running')
+        if err:
+            return _bad(err)
+        show_subtotals, err = _param_bool(q.get('show_subtotals'), 'show_subtotals')
+        if err:
+            return _bad(err)
+
+        rows, opening, closing, total_debit, total_credit = ledger_rows_with_balance(
+            account, date_from=date_from, date_to=date_to, entry_type=entry_type,
+        )
+
+        # An accountant printing an incomplete ledger with no warning is the
+        # worst failure mode this endpoint has.
+        unposted_count = len(unposted_dates_in_range(date_from, date_to))
+
+        actor = _actor(request)
+        title = (q.get('title') or 'Buku Besar').strip()[:_MAX_TITLE_LEN] or 'Buku Besar'
+        subtitle = (q.get('subtitle') or '').strip()[:_MAX_SUBTITLE_LEN]
+
+        # Imported here, not at module scope: reportlab is a heavy third-party
+        # dependency and a missing/broken install should take down this one
+        # endpoint, not every admin route that shares this module.
+        from ..services.ledger_pdf import build_ledger_pdf
+
+        pdf = build_ledger_pdf(
+            account, rows, opening, closing,
+            {'debit': total_debit, 'credit': total_credit},
+            {
+                'date_from': date_from,
+                'date_to': date_to,
+                'entry_type': entry_type,
+                'title': title,
+                'subtitle': subtitle,
+                'group_by': group_by,
+                'page_break': page_break,
+                'show_opening': show_opening,
+                'show_running': show_running,
+                'show_subtotals': show_subtotals,
+                'orientation': orientation,
+                'printed_by': getattr(actor, 'display_name', '') or '',
+                'printed_at': timezone.localtime(),
+                'unposted_count': unposted_count,
+            },
+        )
+
+        filename = f'buku-besar-{account.account_number}-{date_from}-{date_to}.pdf'
+        response = HttpResponse(pdf, content_type='application/pdf')
+        response['Content-Disposition'] = f'inline; filename="{filename}"'
+        response['Content-Length'] = str(len(pdf))
+        return response
+
+
+# ── Payment Methods ──────────────────────────────────────────────────────────
+
+class PaymentMethodListCreateView(generics.ListCreateAPIView):
+    serializer_class = PaymentMethodSerializer
+
+    def get_queryset(self):
+        qs = PaymentMethod.objects.select_related('linked_account').order_by('sort_order', 'name')
+        if self.request.query_params.get('active_only', '').strip().lower() in ('1', 'true', 'yes'):
+            qs = qs.filter(is_active=True)
+        return qs
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        AuditLog.objects.create(
+            performed_by=_actor(self.request),
+            action='CREATE',
+            entity_type='PaymentMethod',
+            entity_id=str(instance.id),
+            description=f'Payment method created: {instance.name}',
+        )
+
+
+class PaymentMethodDetailView(generics.RetrieveUpdateDestroyAPIView):
+    queryset = PaymentMethod.objects.select_related('linked_account').all()
+    serializer_class = PaymentMethodSerializer
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        AuditLog.objects.create(
+            performed_by=_actor(self.request),
+            action='UPDATE',
+            entity_type='PaymentMethod',
+            entity_id=str(instance.id),
+            description=f'Payment method updated: {instance.name}',
+        )
+
+    def perform_destroy(self, instance):
+        if instance.is_system:
+            raise ValidationError('System payment methods cannot be deleted.')
+        if instance.invoices.exists() or instance.purchase_invoices.exists():
+            raise ValidationError('Payment methods already used on invoices cannot be deleted. Deactivate it instead.')
+        AuditLog.objects.create(
+            performed_by=_actor(self.request),
+            action='DELETE',
+            entity_type='PaymentMethod',
+            entity_id=str(instance.id),
+            description=f'Payment method deleted: {instance.name}',
+        )
+        instance.delete()
 
 
 # ── Treatment Categories ────────────────────────────────────────────────────
@@ -515,20 +775,14 @@ class TreatmentCategoryAuditAccountsView(APIView):
     """GET — return every category with per-account presence flags."""
 
     def get(self, request):
-        cats = TreatmentCategory.objects.select_related(
-            'revenue_account', 'cogs_account', 'expense_account'
-        ).order_by('name')
+        cats = TreatmentCategory.objects.select_related('revenue_account').order_by('name')
         results = []
         for cat in cats:
             results.append({
                 'id': cat.id,
                 'name': cat.name,
                 'revenue_account': str(cat.revenue_account) if cat.revenue_account_id else None,
-                'cogs_account': str(cat.cogs_account) if cat.cogs_account_id else None,
-                'expense_account': str(cat.expense_account) if cat.expense_account_id else None,
-                'needs_provisioning': not (
-                    cat.revenue_account_id and cat.cogs_account_id and cat.expense_account_id
-                ),
+                'needs_provisioning': not cat.revenue_account_id,
             })
         any_missing = any(r['needs_provisioning'] for r in results)
         return Response({'categories': results, 'any_missing': any_missing})
@@ -543,15 +797,13 @@ class TreatmentCategoryProvisionAccountsView(APIView):
 
     def post(self, request):
         category_ids = request.data.get('category_ids') or []
-        qs = TreatmentCategory.objects.select_related(
-            'revenue_account', 'cogs_account', 'expense_account'
-        )
+        qs = TreatmentCategory.objects.select_related('revenue_account')
         if category_ids:
             qs = qs.filter(pk__in=category_ids)
 
         provisioned = []
         for cat in qs:
-            needs = not (cat.revenue_account_id and cat.cogs_account_id and cat.expense_account_id)
+            needs = not cat.revenue_account_id
             if needs:
                 created = cat.ensure_accounts()
                 if created:

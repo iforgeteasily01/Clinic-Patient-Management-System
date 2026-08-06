@@ -25,17 +25,27 @@ backfill_migration = importlib.import_module(
 
 
 def _sell(auth_api, stock, gl_accounts, item_id, *, price, grand_total):
-    return auth_api.post(
+    res = auth_api.post(
         reverse("invoice-create"),
         {
             "warehouse_id": stock["warehouse"].id,
-            "payment_method_id": gl_accounts["cash"].id,
+            "payment_method_id": gl_accounts["cash_method"].id,
             "discount": 0, "tax": 0, "additional_charges": 0,
             "grand_total": grand_total,
             "items": [{"item_id": item_id, "price": price, "quantity": 1}],
         },
         format="json",
     )
+    if res.status_code in (200, 201):
+        # Phase 2: posting is deferred — sweep it so the GL assertions below
+        # (which check posted account balances) see the real effect.
+        import datetime
+        run = auth_api.post(
+            reverse("accounting-journal-run"),
+            {"date_to": datetime.date.today().isoformat()}, format="json",
+        )
+        assert run.status_code == 200, run.content
+    return res
 
 
 @pytest.mark.django_db
@@ -48,8 +58,11 @@ class TestTreatmentCategoryLinkage:
 
         cat = TreatmentCategory.objects.get(name="Laser")
         assert treatment.catalog_item.item_category_id == cat.id
-        # save() auto-provisions the category's three GL accounts.
-        assert cat.revenue_account_id and cat.cogs_account_id and cat.expense_account_id
+        # save() auto-provisions the category's revenue account. COGS/expense
+        # are no longer per-category as of Phase 3 (see test_expense_accounting.py).
+        assert cat.revenue_account_id
+        assert not hasattr(cat, "cogs_account")
+        assert not hasattr(cat, "expense_account")
 
     def test_category_match_is_case_insensitive(self, db):
         Treatment.objects.create(code="A", name="A", category="Facial", price=Decimal("1"))
@@ -85,9 +98,13 @@ class TestPosRoutesToCategoryAccounts:
         treatment.refresh_from_db()
         return treatment
 
-    def test_revenue_and_cogs_hit_category_accounts_not_fallbacks(
+    def test_revenue_hits_category_account_cogs_hits_fallback(
         self, auth_api, stock, gl_accounts, laser
     ):
+        """As of Phase 3, revenue still routes per-category but COGS always
+        posts to the shared fallback account (5100000) — per-category COGS
+        accounts were removed; COGS/expense now come exclusively from the
+        Expense model."""
         cat = TreatmentCategory.objects.get(name="Laser")
 
         res = _sell(auth_api, stock, gl_accounts, laser.catalog_item.id,
@@ -96,7 +113,6 @@ class TestPosRoutesToCategoryAccounts:
         assert Invoice.objects.count() == 1
 
         cat.revenue_account.refresh_from_db()
-        cat.cogs_account.refresh_from_db()
         gl_accounts["revenue"].refresh_from_db()
         gl_accounts["cogs"].refresh_from_db()
 
@@ -104,9 +120,8 @@ class TestPosRoutesToCategoryAccounts:
         assert cat.revenue_account.balance == Decimal("50000")
         assert gl_accounts["revenue"].balance == Decimal("0")
 
-        # 5 units * 5000 material COGS to the category's COGS account only.
-        assert cat.cogs_account.balance == Decimal("25000")
-        assert gl_accounts["cogs"].balance == Decimal("0")
+        # 5 units * 5000 material COGS to the shared fallback COGS account.
+        assert gl_accounts["cogs"].balance == Decimal("25000")
 
 
 @pytest.mark.django_db
@@ -129,12 +144,10 @@ class TestInventoryItemsAreOneEntity:
         gl_accounts["revenue"].refresh_from_db()
         gl_accounts["cogs"].refresh_from_db()
         cat.revenue_account.refresh_from_db()
-        cat.cogs_account.refresh_from_db()
 
         assert gl_accounts["revenue"].balance == Decimal("10000")   # product revenue
         assert gl_accounts["cogs"].balance == Decimal("5000")       # product COGS
         assert cat.revenue_account.balance == Decimal("0")          # category untouched
-        assert cat.cogs_account.balance == Decimal("0")
 
 
 @pytest.mark.django_db
@@ -170,7 +183,7 @@ class TestBackfillMigration:
         backfill_migration.backfill(global_apps, None)
 
         cat = TreatmentCategory.objects.get(name="Peeling")
-        assert cat.revenue_account_id and cat.cogs_account_id and cat.expense_account_id
+        assert cat.revenue_account_id
         assert InventoryItem.objects.get(pk=item_id).item_category_id == cat.id
 
 
@@ -196,7 +209,7 @@ class TestProvisionCommand:
         call_command('provision_category_accounts', stdout=StringIO())
 
         cat = TreatmentCategory.objects.get(name="Botox")
-        assert cat.revenue_account_id and cat.cogs_account_id and cat.expense_account_id
+        assert cat.revenue_account_id
         assert InventoryItem.objects.get(pk=treatment.catalog_item_id).item_category_id == cat.id
 
     def test_dry_run_writes_nothing(self, db):

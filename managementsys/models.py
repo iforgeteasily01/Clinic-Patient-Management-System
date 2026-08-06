@@ -419,6 +419,18 @@ class ChartOfAccounts(models.Model):
         limit_choices_to={'is_head': True},
     )
 
+    # Head account number per type — used to auto-file orphan sub-accounts.
+    TYPE_HEAD_NUMBER = {
+        'asset':         1000000,
+        'liability':     2000000,
+        'equity':        3000000,
+        'revenue':       4000000,
+        'cogs':          5000000,
+        'expense':       6000000,
+        'other_income':  7000000,
+        'other_expense': 8000000,
+    }
+
     class Meta:
         ordering = ['account_number']
         verbose_name        = 'Chart of Account'
@@ -426,6 +438,49 @@ class ChartOfAccounts(models.Model):
 
     def __str__(self):
         return f'{self.account_number} – {self.name}'
+
+    def save(self, *args, **kwargs):
+        # Sub-accounts created in code (per-category revenue/COGS/expense,
+        # per-vendor payables) frequently omit ``parent``. Without one they are
+        # invisible on the Chart of Accounts page, which renders the tree from
+        # the heads down — so file them under their type's head automatically.
+        if not self.is_head and self.parent_id is None:
+            head_number = self.TYPE_HEAD_NUMBER.get(self.account_type)
+            if head_number is not None:
+                head = ChartOfAccounts.objects.filter(
+                    account_number=head_number, is_head=True
+                ).first()
+                if head is not None:
+                    self.parent = head
+        super().save(*args, **kwargs)
+
+
+class PaymentMethod(models.Model):
+    """How a customer/supplier paid, decoupled from the GL account it resolves to.
+
+    Multiple payment methods (e.g. "Cash", "QRIS", "Debit BCA") can all settle
+    to the same cash/bank ``ChartOfAccounts`` row, or each can have its own —
+    the mapping lives here instead of being baked into the account itself.
+    """
+    name           = models.CharField(max_length=100)
+    code           = models.CharField(max_length=30, blank=True, default='')
+    linked_account = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        related_name='payment_methods',
+        limit_choices_to={'account_type': 'asset'},
+    )
+    is_active  = models.BooleanField(default=True)
+    is_system  = models.BooleanField(default=False)
+    sort_order = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['sort_order', 'name']
+        verbose_name = 'Payment Method'
+        verbose_name_plural = 'Payment Methods'
+
+    def __str__(self):
+        return self.name
 
 
 class AuditLog(models.Model):
@@ -457,11 +512,14 @@ class PatientPhoto(models.Model):
         return f"{self.patient_no_id} - {self.body_area} ({self.photo_date})"
 
 
+POSTING_STATUS_CHOICES = [('unposted', 'Unposted'), ('posted', 'Posted')]
+
+
 class Invoice(models.Model):
     invoice_number     = models.CharField(max_length=30, unique=True, blank=True)
     datetime           = models.DateTimeField()
     patient_no         = models.ForeignKey(Patient, on_delete=models.SET_NULL, null=True, blank=True, related_name='invoices')
-    payment_method     = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices', limit_choices_to={'account_type': 'asset'})
+    payment_method     = models.ForeignKey('PaymentMethod', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
     discount           = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     cashier            = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoices_as_cashier')
     warehouse          = models.ForeignKey('Warehouse', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoices')
@@ -474,6 +532,12 @@ class Invoice(models.Model):
     is_voided          = models.BooleanField(default=False)
     voided_at          = models.DateTimeField(null=True, blank=True)
     voided_by          = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='voided_invoices')
+    # Phase 2: journal posting moved off the request path. A freshly created or
+    # edited invoice sits 'unposted' until a journal run (POST
+    # /api/accounting/journal/run/) sweeps its transaction date. Void/edit of an
+    # already-posted invoice is handled live via same-day memo entries instead
+    # (see managementsys/services/journal_engine.py).
+    posting_status     = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
 
     class Meta:
         ordering = ['-datetime']
@@ -515,6 +579,14 @@ class LedgerEntry(models.Model):
         ('stock',      'Stock Movement'),
         ('opname',     'Stock Opname'),
         ('manual',     'Manual Entry'),
+        # Phase 2 same-day exception postings — written synchronously when a
+        # document whose transaction date is already 'posted' is voided or
+        # edited, rather than waiting for the next journal run. Always dated
+        # today (the void/edit date), never the original transaction date.
+        ('void_memo',  'Void Memo (reversal)'),
+        ('edit_memo',  'Edit Memo (reversal + repost)'),
+        # Phase 3 — operating expense accrual/payment postings.
+        ('expense',    'Expense'),
     ]
 
     account          = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, related_name='ledger_entries')
@@ -523,9 +595,17 @@ class LedgerEntry(models.Model):
     entry_type       = models.CharField(max_length=6, choices=ENTRY_TYPE_CHOICES)
     amount           = models.DecimalField(max_digits=18, decimal_places=2)
     source_type      = models.CharField(max_length=15, choices=SOURCE_TYPE_CHOICES, blank=True, default='')
+    # The journal document this line belongs to. Nullable only so migration 0098
+    # can backfill historic rows in chunks — every line written from Phase 4
+    # onward goes through ``write_legs`` and always has one. Grouping lines under
+    # a header is what makes a per-entry detail page and correction journals
+    # possible; the per-document FKs below are kept because JournalHistoryPage
+    # and the financial reports query them directly.
+    journal_entry    = models.ForeignKey('JournalEntry', on_delete=models.CASCADE, null=True, blank=True, related_name='lines')
     invoice          = models.ForeignKey('Invoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
     purchase_invoice = models.ForeignKey('PurchaseInvoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
     transfer         = models.ForeignKey('AccountTransfer', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
+    expense          = models.ForeignKey('Expense', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
     created_at       = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -546,19 +626,6 @@ class TreatmentCategory(models.Model):
         on_delete=models.SET_NULL,
         related_name='treatment_category',
     )
-    cogs_account = models.OneToOneField(
-        'ChartOfAccounts',
-        null=True, blank=True,
-        on_delete=models.SET_NULL,
-        related_name='cogs_category',
-    )
-    expense_account = models.OneToOneField(
-        'ChartOfAccounts',
-        null=True, blank=True,
-        on_delete=models.SET_NULL,
-        related_name='expense_category',
-    )
-
     class Meta:
         ordering = ['sort_order', 'name']
         verbose_name_plural = 'Treatment Categories'
@@ -610,25 +677,9 @@ class TreatmentCategory(models.Model):
                 account_type='revenue',
             )
             created['revenue_account'] = str(self.revenue_account)
-        if not self.cogs_account_id:
-            self.cogs_account = ChartOfAccounts.objects.create(
-                account_number=self._next_account_number(5400000, 5999999),
-                name=f'COGS – {self.name}',
-                account_type='cogs',
-            )
-            created['cogs_account'] = str(self.cogs_account)
-        if not self.expense_account_id:
-            self.expense_account = ChartOfAccounts.objects.create(
-                account_number=self._next_account_number(6900000, 6999999),
-                name=f'Expense – {self.name}',
-                account_type='expense',
-            )
-            created['expense_account'] = str(self.expense_account)
         if created:
             TreatmentCategory.objects.filter(pk=self.pk).update(
                 revenue_account_id=self.revenue_account_id,
-                cogs_account_id=self.cogs_account_id,
-                expense_account_id=self.expense_account_id,
             )
         return created
 
@@ -641,30 +692,10 @@ class TreatmentCategory(models.Model):
                     name=f'Treatment Revenue – {self.name}',
                     account_type='revenue',
                 )
-            if not self.cogs_account_id:
-                self.cogs_account = ChartOfAccounts.objects.create(
-                    account_number=self._next_account_number(5400000, 5999999),
-                    name=f'COGS – {self.name}',
-                    account_type='cogs',
-                )
-            if not self.expense_account_id:
-                self.expense_account = ChartOfAccounts.objects.create(
-                    account_number=self._next_account_number(6900000, 6999999),
-                    name=f'Expense – {self.name}',
-                    account_type='expense',
-                )
         else:
             if self.revenue_account_id:
                 ChartOfAccounts.objects.filter(pk=self.revenue_account_id).update(
                     name=f'Treatment Revenue – {self.name}',
-                )
-            if self.cogs_account_id:
-                ChartOfAccounts.objects.filter(pk=self.cogs_account_id).update(
-                    name=f'COGS – {self.name}',
-                )
-            if self.expense_account_id:
-                ChartOfAccounts.objects.filter(pk=self.expense_account_id).update(
-                    name=f'Expense – {self.name}',
                 )
         super().save(*args, **kwargs)
 
@@ -688,18 +719,60 @@ class AssessmentCode(models.Model):
 
 
 class PatientNote(models.Model):
-    patient_no = models.ForeignKey(Patient, on_delete=models.CASCADE, related_name='notes')
-    date = models.DateField()
+    """A free-form note about a patient, written by staff during the day.
+
+    Two kinds of subject exist because walk-in guests never get a Patient row:
+      * registered patient → ``patient_no`` is set (``active_patient`` may be set too)
+      * walk-in guest      → only ``active_patient`` is set
+    The CheckConstraint below guarantees at least one of the two is present.
+    """
+
+    # Nullable so a guest visit can own a note. Anything reading ``patient_no``
+    # off a note must cope with None.
+    patient_no = models.ForeignKey(
+        Patient, on_delete=models.CASCADE, related_name='notes',
+        null=True, blank=True,
+    )
+    active_patient = models.ForeignKey(
+        'ActivePatient', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='notes',
+    )
+    date = models.DateField(db_index=True)
     content = models.TextField()
+    # Legacy free-text attribution. Kept for rows written before author_user
+    # existed, and as the fallback for author_display.
     author = models.CharField(max_length=100, blank=True, default='')
+    author_user = models.ForeignKey(
+        'AppUser', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='patient_notes',
+    )
+    # Snapshot of author_user.role at write time. Users get re-roled and deleted,
+    # but the POS must still be able to label the note "Beautician" as of when it
+    # was written — so this is stored, not derived from author_user.role.
+    author_role = models.CharField(max_length=20, blank=True, default='')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ['-date', '-created_at']
+        indexes = [
+            models.Index(fields=['patient_no', 'date'], name='patientnote_pat_date_idx'),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    models.Q(patient_no__isnull=False)
+                    | models.Q(active_patient__isnull=False)
+                ),
+                name='patientnote_has_subject',
+            ),
+        ]
 
     def __str__(self):
-        return f'Note for {self.patient_no_id} on {self.date}'
+        subject = self.patient_no_id or (
+            f'visit #{self.active_patient_id}' if self.active_patient_id else '?'
+        )
+        return f'Note for {subject} on {self.date}'
 
 
 class PatientTier(models.Model):
@@ -1259,11 +1332,14 @@ class PurchaseInvoice(models.Model):
     internal_id          = models.CharField(max_length=30, unique=True, blank=True)
     external_invoice_no  = models.CharField(max_length=100, blank=True)
     supplier             = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_invoices')
-    payment_account      = models.ForeignKey(
-        'ChartOfAccounts',
+    # The method the invoice was (last) settled with. Left empty while the
+    # invoice is unpaid — a purchase on credit has no payment method yet; it is
+    # chosen when a payment is recorded (see PurchasePayment).
+    payment_method       = models.ForeignKey(
+        'PaymentMethod',
         on_delete=models.PROTECT,
+        null=True, blank=True,
         related_name='purchase_invoices',
-        limit_choices_to={'account_type': 'asset'},
     )
     purchase_date  = models.DateField()
     due_date       = models.DateField(null=True, blank=True)
@@ -1278,6 +1354,7 @@ class PurchaseInvoice(models.Model):
     is_voided      = models.BooleanField(default=False)
     voided_at      = models.DateTimeField(null=True, blank=True)
     voided_by      = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='voided_purchase_invoices')
+    posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
 
     class Meta:
         ordering = ['-purchase_date', '-created_at']
@@ -1355,6 +1432,30 @@ class PurchaseAdditionalCost(models.Model):
         return f'{self.invoice.internal_id} {sign}{self.amount}{suffix} ({self.name})'
 
 
+class PurchasePayment(models.Model):
+    """One settlement against a purchase invoice.
+
+    A purchase can be paid in full at creation or in instalments later, each
+    from a different bank/cash account — so the date and the method belong to
+    the payment, not to the invoice. ``PurchaseInvoice.amount_paid`` stays as
+    the running total these rows sum to, and ``PurchaseInvoice.payment_method``
+    mirrors the most recent payment's method for list/detail display.
+    """
+    invoice        = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='payments')
+    payment_date   = models.DateField()
+    payment_method = models.ForeignKey('PaymentMethod', on_delete=models.PROTECT, related_name='purchase_payments')
+    amount         = models.DecimalField(max_digits=14, decimal_places=2)
+    notes          = models.CharField(max_length=255, blank=True)
+    created_at     = models.DateTimeField(auto_now_add=True)
+    created_by     = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='purchase_payments')
+
+    class Meta:
+        ordering = ['payment_date', 'id']
+
+    def __str__(self):
+        return f'{self.invoice.internal_id} — {self.payment_date} {self.amount}'
+
+
 # ── Accounting: Account Transfers & Manual Adjustments ────────────────────────
 
 class AccountTransfer(models.Model):
@@ -1366,12 +1467,361 @@ class AccountTransfer(models.Model):
     reference     = models.CharField(max_length=100, blank=True)
     created_at    = models.DateTimeField(auto_now_add=True)
     created_by    = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='account_transfers')
+    posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
 
     class Meta:
         ordering = ['-transfer_date', '-created_at']
 
     def __str__(self):
         return f'{self.transfer_date} | {self.from_account} → {self.to_account}'
+
+
+# ── Accounting: Operating Expenses ─────────────────────────────────────────────
+
+class Expense(models.Model):
+    """One operating expense, read as a single journal entry.
+
+    One credit leg out of ``payment_account`` (the named cash/bank COA the
+    money leaves from) balanced by N debit legs, one per ``ExpenseItem``.
+    Every leg carries its own memo: ``payment_memo`` for the credit side and
+    ``ExpenseItem.description`` for each debit side, with a blank line memo
+    inheriting ``payment_memo``. Resolve every memo through
+    ``services.journal_engine.expense_leg_memo`` — never re-derive the chain.
+    """
+
+    STATUS_CHOICES = [
+        ('unpaid',  'Belum Dibayar'),
+        ('partial', 'Sebagian Dibayar'),
+        ('paid',    'Lunas'),
+    ]
+
+    expense_date   = models.DateField()
+    payment_method = models.ForeignKey(
+        'PaymentMethod',
+        on_delete=models.SET_NULL,
+        null=True, blank=True,
+        related_name='expenses',
+        help_text='Legacy indirection kept for back-compat. New records set '
+                  'payment_account directly; this stays populated only so old '
+                  'rows and any UI that still reasons in payment-method terms '
+                  'keep working.',
+    )
+    # The cash/bank COA the money actually leaves from. Replaces the
+    # payment_method indirection for new records. Nullable because an
+    # accrual-only expense (booked to AP, paid later) may not have one yet.
+    payment_account = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        limit_choices_to={'account_type': 'asset'},
+        related_name='expenses_paid_from',
+        help_text='Cash/bank account credited by this expense. Must be one of '
+                  'services.cash_accounts.cash_bank_account_ids().',
+    )
+    # Journal memo for the credit leg, and the fallback memo for any expense
+    # line whose own memo is left blank.
+    payment_memo   = models.CharField(
+        max_length=255, blank=True,
+        help_text='Journal memo for the cash/bank (credit) leg. Also the '
+                  'fallback memo for any expense line left without one.',
+    )
+    status         = models.CharField(max_length=10, choices=STATUS_CHOICES, default='unpaid')
+    total_amount   = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    amount_paid    = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    notes          = models.TextField(blank=True)
+    posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
+    created_by     = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='expenses')
+    created_at     = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-expense_date', '-created_at']
+
+    def __str__(self):
+        return f'Expense #{self.pk}'
+
+    def refresh_status(self):
+        if self.amount_paid <= 0:
+            self.status = 'unpaid'
+        elif self.amount_paid >= self.total_amount:
+            self.status = 'paid'
+        else:
+            self.status = 'partial'
+
+
+class ExpenseItem(models.Model):
+    """One debit leg of an expense journal entry.
+
+    ``description`` *is* this leg's journal memo — there is deliberately no
+    second ``memo`` column, because two free-text fields on the same row is
+    exactly how users end up filling in the wrong one. Leave it blank and the
+    leg inherits ``Expense.payment_memo``.
+    """
+    expense     = models.ForeignKey(Expense, on_delete=models.CASCADE, related_name='items')
+    account     = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        limit_choices_to={'account_type__in': ['expense', 'cogs']},
+        related_name='expense_items',
+    )
+    description = models.CharField(
+        max_length=255, blank=True,
+        help_text="This leg's journal memo. Blank inherits Expense.payment_memo.",
+    )
+    amount      = models.DecimalField(max_digits=14, decimal_places=2)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.expense_id} – {self.account} – {self.amount}'
+
+
+class JournalBatch(models.Model):
+    """One run of POST /api/accounting/journal/run/.
+
+    ``requested_range`` is what the caller asked for (start is always the
+    lowest transaction date among unposted documents at call time — i.e. the
+    day the previous sweep left off, or the earliest ever-unposted document if
+    none has run yet); ``swept_range`` is what was actually found and posted
+    (may be narrower than requested if there was nothing to post, or wider if
+    documents older than the nominal start were discovered)."""
+    STATUS_CHOICES = [
+        ('running',   'Running'),
+        ('completed', 'Completed'),
+        ('failed',    'Failed'),
+    ]
+
+    requested_range_start = models.DateField()
+    requested_range_end   = models.DateField()
+    swept_range_start     = models.DateField(null=True, blank=True)
+    swept_range_end       = models.DateField(null=True, blank=True)
+    status                = models.CharField(max_length=10, choices=STATUS_CHOICES, default='running')
+    run_by                = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_batches')
+    created_at             = models.DateTimeField(auto_now_add=True)
+    summary                = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'JournalBatch #{self.pk} ({self.status}) {self.requested_range_start}..{self.requested_range_end}'
+
+
+class JournalDayLog(models.Model):
+    """Per-calendar-day posting tracker. A date with no row here has never been
+    swept and reports must treat it as unposted."""
+    date              = models.DateField(unique=True)
+    is_posted         = models.BooleanField(default=False)
+    posted_at         = models.DateTimeField(null=True, blank=True)
+    posted_by         = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_day_logs')
+    batch             = models.ForeignKey('JournalBatch', on_delete=models.SET_NULL, null=True, blank=True, related_name='day_logs')
+    transaction_count = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['-date']
+
+    def __str__(self):
+        return f'{self.date} — {"posted" if self.is_posted else "unposted"}'
+
+
+class JournalEntry(models.Model):
+    """One balanced journal document.
+
+    Groups the ``LedgerEntry`` lines written together for a single source
+    document, manual adjustment, reversal or correction. Before Phase 4 the
+    ledger was flat — lines were tagged with a source FK and nothing else — so
+    there was no object a detail page could address or a correction could point
+    at. This is that object.
+
+    An entry is immutable once written. The only way to change its effect is a
+    correction: an auto-generated ``reversal`` entry dated today that negates
+    every line, plus a ``correction`` entry the operator composes. Both link
+    back to the original, so the detail page can show the full chain.
+    """
+
+    SOURCE_TYPE_CHOICES = LedgerEntry.SOURCE_TYPE_CHOICES + [
+        ('reversal',   'Reversal'),
+        ('correction', 'Correction'),
+    ]
+
+    entry_number = models.CharField(max_length=24, unique=True)
+    date         = models.DateField(db_index=True)
+    memo         = models.CharField(max_length=255, blank=True, default='')
+    source_type  = models.CharField(max_length=15, choices=SOURCE_TYPE_CHOICES, blank=True, default='')
+
+    # Mirrors LedgerEntry's document FKs so an entry reaches its source in one hop.
+    invoice          = models.ForeignKey('Invoice',         on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
+    purchase_invoice = models.ForeignKey('PurchaseInvoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
+    transfer         = models.ForeignKey('AccountTransfer', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
+    expense          = models.ForeignKey('Expense',         on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
+
+    batch = models.ForeignKey('JournalBatch', on_delete=models.SET_NULL, null=True, blank=True, related_name='entries')
+
+    # Correction chain. Both FKs point at the ORIGINAL entry: ``reverses`` is set
+    # on the auto-generated reversal, ``corrects`` on the operator's replacement.
+    # That lets the original read ``self.reversed_by`` / ``self.corrections``.
+    # PROTECT because deleting an entry someone corrected would orphan the audit
+    # trail — posted journals are never deleted.
+    reverses = models.ForeignKey('self', on_delete=models.PROTECT, null=True, blank=True, related_name='reversed_by')
+    corrects = models.ForeignKey('self', on_delete=models.PROTECT, null=True, blank=True, related_name='corrections')
+
+    total_debit  = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_credit = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    # False only for historic entries the backfill found already unbalanced.
+    # Nothing written by write_legs can be unbalanced — it raises instead.
+    is_balanced  = models.BooleanField(default=True)
+
+    created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-date', '-id']
+        indexes = [
+            models.Index(fields=['date', 'source_type']),
+            models.Index(fields=['batch']),
+        ]
+        verbose_name_plural = 'Journal Entries'
+
+    def __str__(self):
+        return f'{self.entry_number} — {self.date} ({self.source_type})'
+
+    @property
+    def source_label(self):
+        """Human reference to the document this entry came from."""
+        if self.invoice_id:
+            return self.invoice.invoice_number
+        if self.purchase_invoice_id:
+            return self.purchase_invoice.internal_id
+        if self.expense_id:
+            return f'Beban #{self.expense_id}'
+        if self.transfer_id:
+            return f'Transfer #{self.transfer_id}'
+        return ''
+
+    @property
+    def is_reversed(self):
+        return self.reversed_by.exists()
+
+
+class JournalEntrySequence(models.Model):
+    """Per-year counter behind ``JournalEntry.entry_number``.
+
+    A ``max(entry_number)+1`` scan is not safe: the commit path posts many
+    entries inside one transaction while another request may be posting a
+    correction. Callers take this row ``select_for_update()`` so numbers are
+    gapless and unique under concurrency.
+    """
+    year        = models.IntegerField(unique=True)
+    last_number = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['-year']
+
+    def __str__(self):
+        return f'{self.year}: {self.last_number}'
+
+
+# ── Journal staging (preview before commit) ───────────────────────────────────
+# A journal run is two-phase from Phase 4 on: preview materialises everything
+# the sweep *would* post into these tables, the operator reviews it, and commit
+# turns staged rows into real JournalEntry/LedgerEntry rows. Staging is a real
+# table rather than a JSON blob because a 90-day sweep is realistically tens of
+# thousands of lines and the review UI pages over them server-side.
+
+class JournalStagingBatch(models.Model):
+    STATUS_CHOICES = [
+        ('draft',      'Draft'),
+        ('committing', 'Committing'),
+        ('committed',  'Committed'),
+        ('discarded',  'Discarded'),
+        ('failed',     'Failed'),
+    ]
+
+    date_to    = models.DateField()
+    status     = models.CharField(max_length=12, choices=STATUS_CHOICES, default='draft')
+    created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_staging_batches')
+    created_at = models.DateTimeField(auto_now_add=True)
+    # Drafts are shared clinic-wide and auto-expire; see services/journal_preview.py.
+    expires_at = models.DateTimeField(db_index=True)
+
+    entry_count    = models.IntegerField(default=0)
+    document_count = models.IntegerField(default=0)
+    total_debit    = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_credit   = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    # Set once the draft has been turned into real journal entries.
+    committed_batch = models.ForeignKey('JournalBatch', on_delete=models.SET_NULL, null=True, blank=True, related_name='staging_batches')
+    days_committed  = models.IntegerField(default=0)
+    error_message   = models.TextField(blank=True, default='')
+    # FIFO lines whose recomputed amount at commit differed from the preview.
+    variance_notes  = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        verbose_name_plural = 'Journal Staging Batches'
+
+    def __str__(self):
+        return f'StagingBatch #{self.pk} ({self.status}) → {self.date_to}'
+
+
+class StagedJournalEntry(models.Model):
+    """One previewed journal document, not yet in the ledger."""
+
+    batch    = models.ForeignKey(JournalStagingBatch, on_delete=models.CASCADE, related_name='entries')
+    date     = models.DateField(db_index=True)
+    sequence = models.IntegerField(default=0)
+
+    source_type  = models.CharField(max_length=15)
+    source_model = models.CharField(max_length=32)   # invoice|purchase|transfer|expense
+    source_id    = models.IntegerField()
+    source_label = models.CharField(max_length=120, blank=True, default='')
+    memo         = models.CharField(max_length=255, blank=True, default='')
+
+    total_debit  = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    total_credit = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    is_balanced  = models.BooleanField(default=True)
+    # True when any line is FIFO-derived. Those amounts are recomputed at commit
+    # (stock can move between preview and commit), so the UI must label them.
+    has_estimate = models.BooleanField(default=False)
+    warnings     = models.JSONField(default=list, blank=True)
+
+    # SHA-256 over the source document's identity/totals/updated_at. Re-checked
+    # at commit; a mismatch means the document changed after review and the
+    # whole commit is refused.
+    source_fingerprint = models.CharField(max_length=64, blank=True, default='')
+
+    class Meta:
+        ordering = ['date', 'sequence', 'id']
+        indexes = [
+            models.Index(fields=['batch', 'date']),
+            models.Index(fields=['batch', 'source_type']),
+        ]
+        verbose_name_plural = 'Staged Journal Entries'
+
+    def __str__(self):
+        return f'{self.date} {self.source_label or self.source_type} (draft)'
+
+
+class StagedJournalLine(models.Model):
+    entry    = models.ForeignKey(StagedJournalEntry, on_delete=models.CASCADE, related_name='lines')
+    # Null when the account does not exist yet (a supplier's AP sub-account is
+    # created lazily at posting time). Preview must not create COA rows, so it
+    # records the label it *would* create instead.
+    account  = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, null=True, blank=True, related_name='staged_journal_lines')
+    pending_account_label = models.CharField(max_length=120, blank=True, default='')
+
+    entry_type   = models.CharField(max_length=6, choices=LedgerEntry.ENTRY_TYPE_CHOICES)
+    amount       = models.DecimalField(max_digits=18, decimal_places=2)
+    description  = models.CharField(max_length=255)
+    is_estimated = models.BooleanField(default=False)
+    sequence     = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['sequence', 'id']
+
+    def __str__(self):
+        label = self.account.name if self.account_id else self.pending_account_label
+        return f'{self.entry_type.upper()} {self.amount} → {label}'
 
 
 class ProductionRecipe(models.Model):

@@ -9,6 +9,7 @@ Covers:
   * Repeated edits stay balanced and correct.
   * Shrinking a line below what has already sold is refused.
 """
+import datetime
 from decimal import Decimal
 
 import pytest
@@ -64,17 +65,27 @@ def _assert_balanced():
 def _create(auth_api, supplier, stock, gl, *, qty, cost):
     res = auth_api.post(
         reverse('accounting-purchases'),
-        _payload(supplier, gl['cash'], stock['warehouse'], stock['item'], qty=qty, cost=cost),
+        _payload(supplier, gl['cash_method'], stock['warehouse'], stock['item'], qty=qty, cost=cost),
         format='json',
     )
     assert res.status_code == 201, res.content
     return PurchaseInvoice.objects.get(pk=res.json()['id'])
 
 
+def _run_journal(auth_api, through='2026-07-31'):
+    """Phase 2: purchase invoices are unposted at creation. The price-variance
+    tests below need a *posted* invoice (its edit-memo path is what recomputes
+    variance live), so they sweep it first, mirroring how the app is actually
+    used."""
+    res = auth_api.post(reverse('accounting-journal-run'), {'date_to': through}, format='json')
+    assert res.status_code == 200, res.content
+    return res.json()
+
+
 def _edit(auth_api, invoice, supplier, stock, gl, *, qty, cost):
     res = auth_api.put(
         reverse('accounting-purchase-detail', args=[invoice.id]),
-        _payload(supplier, gl['cash'], stock['warehouse'], stock['item'], qty=qty, cost=cost),
+        _payload(supplier, gl['cash_method'], stock['warehouse'], stock['item'], qty=qty, cost=cost),
         format='json',
     )
     return res
@@ -98,6 +109,7 @@ def test_purchase_batch_stores_total_value(auth_api, supplier, stock, gl_account
 @pytest.mark.django_db
 def test_edit_after_partial_sale_posts_variance_and_balances(auth_api, supplier, stock, gl_accounts):
     invoice = _create(auth_api, supplier, stock, gl_accounts, qty=10, cost=1000)
+    _run_journal(auth_api)  # posted, so the edit below takes the edit-memo path
     # 4 of the 10 units sell (draws the batch down; mirrors a POS sale FIFO).
     _fifo_deduct(stock['item'].id, stock['warehouse'].id, Decimal('4'))
 
@@ -122,6 +134,7 @@ def test_edit_after_partial_sale_posts_variance_and_balances(auth_api, supplier,
 @pytest.mark.django_db
 def test_repeated_edit_stays_balanced(auth_api, supplier, stock, gl_accounts):
     invoice = _create(auth_api, supplier, stock, gl_accounts, qty=10, cost=1000)
+    _run_journal(auth_api)  # posted, so both edits below take the edit-memo path
     _fifo_deduct(stock['item'].id, stock['warehouse'].id, Decimal('4'))
     assert _edit(auth_api, invoice, supplier, stock, gl_accounts, qty=10, cost=1500).status_code == 200
     # Two more units sell from the on-hand batch, then edit again.

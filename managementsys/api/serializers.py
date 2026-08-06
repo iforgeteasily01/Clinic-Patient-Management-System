@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -7,12 +8,16 @@ from ..models import (
     JAKARTA_TZ,
     AccountTransfer, ActivePatient, Appointment, AppointmentLocation, AppUser,
     AssessmentCode, AttendanceRecord, Beauticians,
-    ChartOfAccounts, ColorPalette, Doctors, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
-    IssueTicket, IssueTicketImage, LedgerEntry, MedRec, Patient, PatientCRMProfile,
+    ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
+    IssueTicket, IssueTicketImage, JournalEntry, JournalStagingBatch, LedgerEntry,
+    MedRec, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
+    PaymentMethod,
     ProductionRecipe, ProductionRecipeIngredient, ProductionRun, ProductionRunIngredient,
-    Promotion, PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem, SiteConfig,
-    SoapTemplate, StaffSchedule, Supplier, Treatment, TreatmentCategory, TreatmentMaterial,
+    Promotion, PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem,
+    PurchasePayment, SiteConfig,
+    SoapTemplate, StagedJournalEntry, StagedJournalLine, StaffSchedule, Supplier,
+    Treatment, TreatmentCategory, TreatmentMaterial,
     TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift, patientStatus,
 )
 
@@ -298,10 +303,34 @@ class BillingPatientSerializer(serializers.ModelSerializer):
     sessions = serializers.SerializerMethodField()
     total = serializers.SerializerMethodField()
     medrec = BillingMedRecSerializer(read_only=True)
+    notes = serializers.SerializerMethodField()
 
     class Meta:
         model = ActivePatient
-        fields = ["id", "patient_no", "patient_name", "guest_name", "visit_time", "sessions", "total", "medrec"]
+        fields = ["id", "patient_no", "patient_name", "guest_name", "visit_time", "sessions", "total", "medrec", "notes"]
+
+    def get_notes(self, obj):
+        """Today's notes for this visit, oldest first.
+
+        The caller (BillingQueueView) puts a prebuilt map in the context so the
+        whole queue costs one query. The per-object fallback below only runs
+        when this serializer is used somewhere that did not prefetch.
+        """
+        cached = self.context.get('notes_by_visit')
+        if cached is not None:
+            notes = cached.get(obj.id, [])
+        else:
+            subject = Q(active_patient_id=obj.id)
+            if obj.patient_no_id:
+                subject |= Q(patient_no_id=obj.patient_no_id)
+            notes = (
+                PatientNote.objects
+                .filter(date=timezone.localdate())
+                .filter(subject)
+                .select_related('author_user')
+                .order_by('created_at')
+            )
+        return PatientNoteSerializer(notes, many=True, context=self.context).data
 
     def get_sessions(self, obj):
         return BillingSessionSerializer(
@@ -664,6 +693,22 @@ class InvoiceReadSerializer(serializers.ModelSerializer):
         return obj.payment_method.name if obj.payment_method_id else None
 
 
+# ── Payment Methods ────────────────────────────────────────────────────────
+
+class PaymentMethodSerializer(serializers.ModelSerializer):
+    linked_account_name   = serializers.CharField(source='linked_account.name', read_only=True)
+    linked_account_number = serializers.IntegerField(source='linked_account.account_number', read_only=True)
+
+    class Meta:
+        model = PaymentMethod
+        fields = [
+            'id', 'name', 'code',
+            'linked_account', 'linked_account_name', 'linked_account_number',
+            'is_active', 'is_system', 'sort_order',
+        ]
+        read_only_fields = ['id', 'is_system']
+
+
 # ── Chart of Accounts ──────────────────────────────────────────────────────
 
 ACCOUNT_RANGES = {
@@ -688,6 +733,12 @@ class ChartOfAccountsSerializer(serializers.ModelSerializer):
     parent_number = serializers.IntegerField(
         source='parent.account_number', read_only=True, allow_null=True
     )
+    # What this account is wired to — a treatment/item category, or a vendor.
+    linked_kind       = serializers.SerializerMethodField()
+    linked_name       = serializers.SerializerMethodField()
+    linked_role       = serializers.SerializerMethodField()
+    linked_treatments = serializers.SerializerMethodField()
+    linked_items      = serializers.SerializerMethodField()
 
     class Meta:
         model = ChartOfAccounts
@@ -696,8 +747,68 @@ class ChartOfAccountsSerializer(serializers.ModelSerializer):
             'account_type', 'account_type_display',
             'balance', 'is_system', 'is_head',
             'parent', 'parent_name', 'parent_number',
+            'linked_kind', 'linked_name', 'linked_role',
+            'linked_treatments', 'linked_items',
         ]
         read_only_fields = ['id', 'balance', 'account_type_display', 'is_system', 'is_head']
+
+    # ── Linkage helpers ────────────────────────────────────────────────────
+    # Reverse OneToOne accessors raise DoesNotExist rather than returning None,
+    # so every lookup goes through _linked_category / _linked_supplier.
+
+    @staticmethod
+    def _linked_category(obj):
+        """Return (TreatmentCategory, role) this account belongs to, or (None, None)."""
+        for attr, role in (
+            ('treatment_category', 'revenue'),
+        ):
+            category = getattr(obj, attr, None)
+            if category is not None:
+                return category, role
+        return None, None
+
+    @staticmethod
+    def _linked_supplier(obj):
+        return getattr(obj, 'supplier_ap', None)
+
+    def get_linked_kind(self, obj):
+        if self._linked_category(obj)[0] is not None:
+            return 'treatment_category'
+        if self._linked_supplier(obj) is not None:
+            return 'supplier'
+        return None
+
+    def get_linked_name(self, obj):
+        category, _ = self._linked_category(obj)
+        if category is not None:
+            return category.name
+        supplier = self._linked_supplier(obj)
+        return supplier.name if supplier is not None else None
+
+    def get_linked_role(self, obj):
+        _, role = self._linked_category(obj)
+        if role is not None:
+            return role
+        return 'payable' if self._linked_supplier(obj) is not None else None
+
+    def _category_counts(self, obj):
+        """(treatment_count, item_count) for the category this account serves."""
+        category, _ = self._linked_category(obj)
+        if category is None:
+            return None, None
+        counts = self.context.get('category_counts') or {}
+        treatments, items = counts.get(category.id, (None, None))
+        if treatments is None:
+            # No prefetched map (detail view) — fall back to a direct count.
+            treatments = category.inventory_items.filter(is_service=True).count()
+            items      = category.inventory_items.filter(is_service=False).count()
+        return treatments, items
+
+    def get_linked_treatments(self, obj):
+        return self._category_counts(obj)[0]
+
+    def get_linked_items(self, obj):
+        return self._category_counts(obj)[1]
 
     def validate(self, data):
         account_type = data.get(
@@ -732,47 +843,170 @@ class TreatmentCategorySerializer(serializers.ModelSerializer):
     revenue_account_id     = serializers.IntegerField(source='revenue_account.id',             read_only=True, allow_null=True)
     revenue_account_number = serializers.IntegerField(source='revenue_account.account_number', read_only=True, allow_null=True)
     revenue_account_name   = serializers.CharField(   source='revenue_account.name',           read_only=True, allow_null=True)
-    cogs_account_id        = serializers.IntegerField(source='cogs_account.id',                read_only=True, allow_null=True)
-    cogs_account_number    = serializers.IntegerField(source='cogs_account.account_number',    read_only=True, allow_null=True)
-    cogs_account_name      = serializers.CharField(   source='cogs_account.name',              read_only=True, allow_null=True)
-    expense_account_id     = serializers.IntegerField(source='expense_account.id',             read_only=True, allow_null=True)
-    expense_account_number = serializers.IntegerField(source='expense_account.account_number', read_only=True, allow_null=True)
-    expense_account_name   = serializers.CharField(   source='expense_account.name',           read_only=True, allow_null=True)
 
     class Meta:
         model = TreatmentCategory
         fields = [
             'id', 'name', 'show_to_beautician', 'sort_order',
             'revenue_account_id', 'revenue_account_number', 'revenue_account_name',
-            'cogs_account_id', 'cogs_account_number', 'cogs_account_name',
-            'expense_account_id', 'expense_account_number', 'expense_account_name',
         ]
         read_only_fields = [
             'id',
             'revenue_account_id', 'revenue_account_number', 'revenue_account_name',
-            'cogs_account_id', 'cogs_account_number', 'cogs_account_name',
-            'expense_account_id', 'expense_account_number', 'expense_account_name',
         ]
 
 
 # ── Ledger ────────────────────────────────────────────────────────────────
 
 class LedgerEntrySerializer(serializers.ModelSerializer):
+    # invoice_id comes off the FK column itself (no extra query), and is what
+    # the journal/ledger tables link to the invoice detail page with.
+    invoice_id            = serializers.IntegerField(read_only=True, allow_null=True)
     invoice_number        = serializers.CharField(source='invoice.invoice_number', read_only=True, allow_null=True)
     purchase_invoice_id   = serializers.IntegerField(source='purchase_invoice.id', read_only=True, allow_null=True)
     purchase_internal_id  = serializers.CharField(source='purchase_invoice.internal_id', read_only=True, allow_null=True)
     transfer_id           = serializers.IntegerField(source='transfer.id', read_only=True, allow_null=True)
+    account_id            = serializers.IntegerField(read_only=True)
     account_number        = serializers.IntegerField(source='account.account_number', read_only=True)
     account_name          = serializers.CharField(source='account.name', read_only=True)
     account_type          = serializers.CharField(source='account.account_type', read_only=True)
+
+    # Phase 4: every line belongs to a JournalEntry. Surfacing the number here is
+    # what lets the flat journal history link each row to its entry detail page.
+    journal_entry_id = serializers.IntegerField(read_only=True, allow_null=True)
+    entry_number     = serializers.CharField(source='journal_entry.entry_number', read_only=True, allow_null=True)
 
     class Meta:
         model = LedgerEntry
         fields = [
             'id', 'date', 'description', 'entry_type', 'amount', 'source_type',
-            'invoice_number', 'purchase_invoice_id', 'purchase_internal_id',
-            'transfer_id', 'account_number', 'account_name', 'account_type', 'created_at',
+            'invoice_id', 'invoice_number', 'purchase_invoice_id', 'purchase_internal_id',
+            'transfer_id', 'account_id', 'account_number', 'account_name', 'account_type', 'created_at',
+            'journal_entry_id', 'entry_number',
         ]
+
+
+# ── Journal entries (Phase 4) ─────────────────────────────────────────────────
+
+class JournalEntryLineSerializer(serializers.ModelSerializer):
+    account_id     = serializers.IntegerField(read_only=True)
+    account_number = serializers.IntegerField(source='account.account_number', read_only=True)
+    account_name   = serializers.CharField(source='account.name', read_only=True)
+    account_type   = serializers.CharField(source='account.account_type', read_only=True)
+
+    class Meta:
+        model = LedgerEntry
+        fields = ['id', 'account_id', 'account_number', 'account_name', 'account_type',
+                  'description', 'entry_type', 'amount']
+
+
+class JournalEntryListSerializer(serializers.ModelSerializer):
+    source_label = serializers.CharField(read_only=True)
+    line_count   = serializers.IntegerField(read_only=True)
+    is_reversed  = serializers.SerializerMethodField()
+
+    class Meta:
+        model = JournalEntry
+        fields = ['id', 'entry_number', 'date', 'memo', 'source_type', 'source_label',
+                  'total_debit', 'total_credit', 'is_balanced', 'line_count',
+                  'is_reversed', 'created_at']
+
+    def get_is_reversed(self, obj):
+        # Annotated by the view to avoid a query per row; falls back for
+        # single-object use where the annotation is absent.
+        cached = getattr(obj, 'reversal_count', None)
+        return bool(cached) if cached is not None else obj.reversed_by.exists()
+
+
+class JournalEntryRefSerializer(serializers.ModelSerializer):
+    """Just enough of an entry to render a link in a correction chain.
+
+    Also the response shape for the two entries a correction creates.
+    """
+
+    class Meta:
+        model = JournalEntry
+        fields = ['id', 'entry_number', 'date', 'source_type', 'total_debit', 'total_credit']
+
+
+class JournalEntryDetailSerializer(serializers.ModelSerializer):
+    lines        = JournalEntryLineSerializer(many=True, read_only=True)
+    source_label = serializers.CharField(read_only=True)
+    created_by_name = serializers.CharField(source='created_by.display_name', read_only=True, allow_null=True)
+
+    # The correction chain, both directions.
+    reverses    = JournalEntryRefSerializer(read_only=True)
+    corrects    = JournalEntryRefSerializer(read_only=True)
+    reversed_by = JournalEntryRefSerializer(many=True, read_only=True)
+    corrections = JournalEntryRefSerializer(many=True, read_only=True)
+
+    # Where to send the user for the underlying document.
+    source_ref = serializers.SerializerMethodField()
+    can_correct = serializers.SerializerMethodField()
+
+    class Meta:
+        model = JournalEntry
+        fields = ['id', 'entry_number', 'date', 'memo', 'source_type', 'source_label',
+                  'total_debit', 'total_credit', 'is_balanced', 'created_at',
+                  'created_by_name', 'batch_id', 'lines',
+                  'reverses', 'corrects', 'reversed_by', 'corrections',
+                  'source_ref', 'can_correct']
+
+    def get_source_ref(self, obj):
+        if obj.invoice_id:
+            return {'kind': 'invoice', 'id': obj.invoice_id, 'label': obj.source_label}
+        if obj.purchase_invoice_id:
+            return {'kind': 'purchase', 'id': obj.purchase_invoice_id, 'label': obj.source_label}
+        if obj.expense_id:
+            return {'kind': 'expense', 'id': obj.expense_id, 'label': obj.source_label}
+        if obj.transfer_id:
+            return {'kind': 'transfer', 'id': obj.transfer_id, 'label': obj.source_label}
+        return None
+
+    def get_can_correct(self, obj):
+        # A reversal is a correction artefact, not something to correct; and an
+        # entry that is already reversed must not be reversed twice.
+        return obj.source_type != 'reversal' and not obj.reversed_by.exists()
+
+
+# ── Journal staging / preview (Phase 4) ───────────────────────────────────────
+
+class StagedJournalLineSerializer(serializers.ModelSerializer):
+    account_id     = serializers.IntegerField(read_only=True, allow_null=True)
+    account_number = serializers.IntegerField(source='account.account_number', read_only=True, allow_null=True)
+    account_name   = serializers.CharField(source='account.name', read_only=True, allow_null=True)
+    account_type   = serializers.CharField(source='account.account_type', read_only=True, allow_null=True)
+
+    class Meta:
+        model = StagedJournalLine
+        fields = ['id', 'account_id', 'account_number', 'account_name', 'account_type',
+                  'pending_account_label', 'description', 'entry_type', 'amount',
+                  'is_estimated']
+
+
+class StagedJournalEntryListSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = StagedJournalEntry
+        fields = ['id', 'date', 'source_type', 'source_model', 'source_id', 'source_label',
+                  'memo', 'total_debit', 'total_credit', 'is_balanced', 'has_estimate',
+                  'warnings']
+
+
+class StagedJournalEntryDetailSerializer(StagedJournalEntryListSerializer):
+    lines = StagedJournalLineSerializer(many=True, read_only=True)
+
+    class Meta(StagedJournalEntryListSerializer.Meta):
+        fields = StagedJournalEntryListSerializer.Meta.fields + ['lines']
+
+
+class JournalStagingBatchSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.CharField(source='created_by.display_name', read_only=True, allow_null=True)
+
+    class Meta:
+        model = JournalStagingBatch
+        fields = ['id', 'date_to', 'status', 'created_at', 'created_by_name', 'expires_at',
+                  'entry_count', 'document_count', 'total_debit', 'total_credit',
+                  'days_committed', 'error_message', 'variance_notes', 'committed_batch_id']
 
 
 # ── AppUser Admin ──────────────────────────────────────────────────────────
@@ -852,13 +1086,97 @@ class IssueTicketSerializer(serializers.ModelSerializer):
 
 # ── Patient Notes ──────────────────────────────────────────────────────────
 
+MANAGING_ROLES = ('manager', 'superuser')
+
+
 class PatientNoteSerializer(serializers.ModelSerializer):
     patient_no = serializers.CharField(source='patient_no_id', read_only=True)
+    active_patient_id = serializers.IntegerField(read_only=True)
+    author_display = serializers.SerializerMethodField()
+    can_edit = serializers.SerializerMethodField()
+    # Defaulted in PatientNoteListCreateView.create() when the client omits it,
+    # so the POS/webapp can just post content.
+    date = serializers.DateField(required=False)
 
     class Meta:
         model = PatientNote
-        fields = ['id', 'patient_no', 'date', 'content', 'author', 'created_at', 'updated_at']
-        read_only_fields = ['id', 'patient_no', 'created_at', 'updated_at']
+        fields = [
+            'id', 'patient_no', 'active_patient_id', 'date', 'content',
+            'author', 'author_display', 'author_role',
+            'created_at', 'updated_at', 'can_edit',
+        ]
+        # author_role is a server-owned snapshot — a client must not be able to
+        # claim a role it does not have.
+        read_only_fields = [
+            'id', 'patient_no', 'active_patient_id', 'author_display',
+            'author_role', 'can_edit', 'created_at', 'updated_at',
+        ]
+
+    def get_author_display(self, obj):
+        if obj.author_user_id and obj.author_user:
+            name = (obj.author_user.display_name or '').strip()
+            if name:
+                return name
+        return (obj.author or '').strip() or '—'
+
+    def get_can_edit(self, obj):
+        """True when the requesting user may PATCH/DELETE this note.
+
+        Mirrors the check enforced in PatientNoteDetailView — keep the two in
+        step or the webapp will offer buttons the server rejects. Anonymous
+        callers (the POS billing queue is AllowAny) always get False, which is
+        what makes the POS panel read-only.
+        """
+        request = self.context.get('request')
+        user = getattr(request, 'user', None)
+        if not isinstance(user, AppUser):
+            return False
+        if obj.author_user_id and obj.author_user_id == user.id:
+            return True
+        return user.role in MANAGING_ROLES
+
+
+def todays_notes_by_visit(active_patients):
+    """Today's notes for a whole billing queue, in one query.
+
+    Returns ``{active_patient_id: [PatientNote, ...]}`` ordered by created_at.
+    A note counts for a visit when it points at the visit itself OR at the
+    Patient behind it (beauticians writing from the webapp attach to the
+    patient; guests can only attach to the visit).
+
+    Without this, BillingPatientSerializer.get_notes runs one query per queue
+    entry — an N+1 across the whole queue on an endpoint the POS polls.
+    """
+    active_patients = list(active_patients)
+    if not active_patients:
+        return {}
+
+    visit_ids = [ap.id for ap in active_patients]
+    visits_by_patient = {}
+    for ap in active_patients:
+        if ap.patient_no_id:
+            visits_by_patient.setdefault(ap.patient_no_id, []).append(ap.id)
+
+    subject = Q(active_patient_id__in=visit_ids)
+    if visits_by_patient:
+        subject |= Q(patient_no_id__in=list(visits_by_patient))
+
+    notes = (
+        PatientNote.objects
+        .filter(date=timezone.localdate())
+        .filter(subject)
+        .select_related('author_user')
+        .order_by('created_at')
+    )
+
+    by_visit = {vid: [] for vid in visit_ids}
+    for note in notes:
+        targets = set(visits_by_patient.get(note.patient_no_id, ()))
+        if note.active_patient_id in by_visit:
+            targets.add(note.active_patient_id)
+        for vid in targets:
+            by_visit[vid].append(note)
+    return by_visit
 
 
 # ── CRM / Promotions ───────────────────────────────────────────────────────
@@ -1135,12 +1453,26 @@ class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
         return str(obj.quantity * obj.unit_cost - obj.total_discount)
 
 
+class PurchasePaymentSerializer(serializers.ModelSerializer):
+    payment_method_name = serializers.CharField(source='payment_method.name', read_only=True)
+    payment_account_no  = serializers.IntegerField(source='payment_method.linked_account.account_number', read_only=True)
+    created_by_name     = serializers.CharField(source='created_by.display_name', read_only=True, allow_null=True)
+
+    class Meta:
+        model = PurchasePayment
+        fields = [
+            'id', 'payment_date', 'payment_method', 'payment_method_name',
+            'payment_account_no', 'amount', 'notes', 'created_at', 'created_by_name',
+        ]
+
+
 class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
     supplier_name        = serializers.CharField(source='supplier.name', read_only=True)
-    payment_account_name = serializers.CharField(source='payment_account.name', read_only=True)
-    payment_account_no   = serializers.IntegerField(source='payment_account.account_number', read_only=True)
+    payment_account_name = serializers.CharField(source='payment_method.name', read_only=True, allow_null=True)
+    payment_account_no   = serializers.IntegerField(source='payment_method.linked_account.account_number', read_only=True, allow_null=True)
     warehouse_name       = serializers.CharField(source='warehouse.name', read_only=True, allow_null=True)
     balance_due          = serializers.SerializerMethodField()
+    last_payment_date    = serializers.SerializerMethodField()
     invoice_image_url    = serializers.SerializerMethodField()
     voided_by_name       = serializers.CharField(source='voided_by.display_name', read_only=True, allow_null=True)
 
@@ -1148,12 +1480,18 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
         model = PurchaseInvoice
         fields = [
             'id', 'internal_id', 'external_invoice_no', 'supplier', 'supplier_name',
-            'payment_account', 'payment_account_name', 'payment_account_no',
+            'payment_method', 'payment_account_name', 'payment_account_no',
             'warehouse', 'warehouse_name',
             'purchase_date', 'due_date', 'status', 'total_amount', 'amount_paid',
-            'balance_due', 'notes', 'invoice_image_url', 'created_at',
+            'balance_due', 'last_payment_date', 'notes', 'invoice_image_url', 'created_at',
             'is_voided', 'voided_at', 'voided_by_name',
         ]
+
+    def get_last_payment_date(self, obj):
+        # Read through .all() so a prefetched list is reused instead of firing
+        # one query per invoice in the list view.
+        dates = [p.payment_date for p in obj.payments.all()]
+        return max(dates) if dates else None
 
     def get_balance_due(self, obj):
         return str(obj.total_amount - obj.amount_paid)
@@ -1170,9 +1508,104 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
 class PurchaseInvoiceDetailSerializer(PurchaseInvoiceListSerializer):
     items            = PurchaseInvoiceItemSerializer(many=True, read_only=True)
     additional_costs = PurchaseAdditionalCostSerializer(many=True, read_only=True)
+    payments         = PurchasePaymentSerializer(many=True, read_only=True)
 
     class Meta(PurchaseInvoiceListSerializer.Meta):
-        fields = PurchaseInvoiceListSerializer.Meta.fields + ['items', 'additional_costs']
+        fields = PurchaseInvoiceListSerializer.Meta.fields + ['items', 'additional_costs', 'payments']
+
+
+class ExpenseItemSerializer(serializers.ModelSerializer):
+    account_name   = serializers.CharField(source='account.name', read_only=True, allow_null=True)
+    account_number = serializers.IntegerField(source='account.account_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = ExpenseItem
+        fields = ['id', 'account', 'account_name', 'account_number', 'description', 'amount']
+
+
+class ExpenseSerializer(serializers.ModelSerializer):
+    """An expense serialized as a journal document.
+
+    ``payment_method_name`` is the *payment method*'s name (it was called
+    ``payment_account_name`` until the cash-account picker landed, which made
+    the name actively misleading). The ``cash_account_*`` fields are the real
+    credit-side COA. ``resolved_legs`` is the journal preview — the same memo
+    strings the posting path will write, built with ``expense_leg_memo`` so the
+    fallback chain lives in exactly one place.
+    """
+    items                 = ExpenseItemSerializer(many=True, read_only=True)
+    payment_method_name   = serializers.CharField(source='payment_method.name', read_only=True, allow_null=True)
+    payment_account_no    = serializers.IntegerField(source='payment_method.linked_account.account_number', read_only=True, allow_null=True)
+    cash_account          = serializers.PrimaryKeyRelatedField(
+        source='payment_account',
+        queryset=ChartOfAccounts.objects.all(),
+        required=False, allow_null=True,
+    )
+    cash_account_name     = serializers.CharField(source='payment_account.name', read_only=True, allow_null=True)
+    cash_account_number   = serializers.IntegerField(source='payment_account.account_number', read_only=True, allow_null=True)
+    payment_memo          = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    resolved_legs         = serializers.SerializerMethodField()
+    balance_due           = serializers.SerializerMethodField()
+    created_by_name       = serializers.CharField(source='created_by.display_name', read_only=True, allow_null=True)
+
+    class Meta:
+        model = Expense
+        fields = [
+            'id', 'expense_date', 'payment_method',
+            'payment_method_name', 'payment_account_no',
+            'cash_account', 'cash_account_name', 'cash_account_number', 'payment_memo',
+            'status', 'total_amount', 'amount_paid', 'balance_due',
+            'notes', 'posting_status', 'created_at', 'created_by_name', 'items',
+            'resolved_legs',
+        ]
+
+    def get_balance_due(self, obj):
+        return str(obj.total_amount - obj.amount_paid)
+
+    def get_resolved_legs(self, obj):
+        """Journal preview: one credit leg + one debit leg per expense item.
+
+        ``inherited`` marks a debit memo that was borrowed from the cash side
+        (the line's own memo was blank) so the UI can render it muted.
+        """
+        from ..models import AP_CONTROL_NUMBER
+        from ..services.journal_engine import expense_credit_account, expense_leg_memo
+
+        legs = []
+
+        total = obj.total_amount or 0
+        if total:
+            fully_paid = (obj.amount_paid or 0) >= total
+            credit_account = expense_credit_account(obj) if fully_paid else None
+            if credit_account is None:
+                # Mirrors _post_expense_accrual: an unpaid expense (or one with
+                # no cash account named) credits the AP control account. Looked
+                # up read-only here — a preview must never provision an account.
+                credit_account = ChartOfAccounts.objects.filter(
+                    account_number=AP_CONTROL_NUMBER,
+                ).first()
+            legs.append({
+                'side':         'credit',
+                'account_id':   credit_account.id if credit_account else None,
+                'account_name': credit_account.name if credit_account else None,
+                'memo':         expense_leg_memo(obj),
+                'amount':       str(total),
+                'inherited':    False,
+            })
+
+        payment_memo = (obj.payment_memo or '').strip()
+        for it in obj.items.all():
+            memo = expense_leg_memo(obj, it)
+            legs.append({
+                'side':         'debit',
+                'account_id':   it.account_id,
+                'account_name': it.account.name if it.account_id else None,
+                'memo':         memo,
+                'amount':       str(it.amount),
+                'inherited':    not (it.description or '').strip() and bool(payment_memo),
+            })
+
+        return legs
 
 
 class AccountTransferSerializer(serializers.ModelSerializer):

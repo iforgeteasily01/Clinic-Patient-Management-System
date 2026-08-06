@@ -12,14 +12,20 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..api.serializers import InvoiceCreateSerializer, InvoiceReadSerializer, InvoiceUpdateSerializer
+from ..api.serializers import (
+    InvoiceCreateSerializer, InvoiceReadSerializer, InvoiceUpdateSerializer,
+    LedgerEntrySerializer,
+)
 from ..models import (
     AppUser, AuditLog, ChartOfAccounts, InventoryItem, Invoice, InvoiceItem,
-    LedgerEntry, Patient, PatientPackage, PatientPackageRedemption, PromotionUsage,
-    Treatment, TreatmentCategory, TreatmentPackage, Warehouse,
+    LedgerEntry, Patient, PatientPackage, PatientPackageRedemption, PaymentMethod,
+    PromotionUsage, Treatment, TreatmentPackage, Warehouse,
 )
+from ..services.journal_engine import LegSet, _apply_balance, _le, _post_legs, _revenue_legs
 from .crm_page import refresh_crm_profile
-from .inventory_page import _fifo_deduct, _fifo_deduct_global, _fifo_restock, _fifo_restock_global
+from .inventory_page import (
+    FifoSimulation, _fifo_deduct, _fifo_deduct_global, _fifo_restock, _fifo_restock_global,
+)
 from .promotion_page import validate_promotion
 
 logger = logging.getLogger(__name__)
@@ -41,167 +47,11 @@ def _actor(request):
     return request.user if isinstance(request.user, AppUser) else None
 
 
-def _le(account, entry_type, amount, invoice, description):
-    """Create a single LedgerEntry row."""
-    LedgerEntry.objects.create(
-        account=account,
-        date=invoice.datetime.date(),
-        description=description,
-        entry_type=entry_type,
-        amount=amount,
-        invoice=invoice,
-        source_type='invoice',
-    )
-
-
-# Account types whose natural (positive) balance sits on the debit side.
-DEBIT_NORMAL_TYPES = {'asset', 'cogs', 'expense', 'other_expense'}
-
-# System accounts the invoice posting routes to. Numbers are fixed by
-# migration 0075; see _revenue_legs for how each is used.
-ACC_SALES_DISCOUNT     = 4100000   # contra-revenue (debit-normal within revenue)
-ACC_PRODUCT_REVENUE    = 4200000
-ACC_TAX_PAYABLE        = 2200000
-ACC_ADDITIONAL_CHARGES = 7100000
-ACC_INVENTORY          = 1300000
-ACC_PRODUCT_COGS       = 5100000
-ACC_CASH               = 1100001
-# Receipts whose payment method was never captured (migration 0076).
-ACC_UNDEPOSITED        = 1100011
-ACC_OPENING_EQUITY     = 3900000
-
-
-def _apply_balance(account, entry_type, amount):
-    """Move ``account.balance`` by ``amount`` in the direction ``entry_type`` implies.
-
-    A debit raises a debit-normal account and lowers a credit-normal one, so the
-    stored balance always matches what the ledger rows derive to.
-    """
-    is_debit = (entry_type == 'debit')
-    natural = account.account_type in DEBIT_NORMAL_TYPES
-    delta = amount if is_debit == natural else -amount
-    ChartOfAccounts.objects.filter(pk=account.pk).update(balance=F('balance') + delta)
-
-
-def _sysacct(number):
-    return ChartOfAccounts.objects.filter(account_number=number).first()
-
-
-def _line_revenue_account(item, item_name, treatments_by_name, fallback_revenue):
-    """Resolve the revenue account for one invoice line.
-
-    Lines carrying an ``InventoryItem`` route by that item's category when it is a
-    service; physical goods are one shared entity and always use the product
-    account. Lines with no item FK (treatments billed by name only) are matched
-    back to a ``Treatment`` by name so they reach the same per-category account
-    the linked path would have used — without this they earn no revenue leg at all.
-    """
-    if item is not None:
-        cat = item.item_category if item.is_service else None
-        return (cat.revenue_account if cat and cat.revenue_account_id else fallback_revenue)
-
-    treatment = treatments_by_name.get((item_name or '').strip().lower())
-    if treatment is not None:
-        cat = TreatmentCategory.objects.filter(
-            name__iexact=(treatment.category or '').strip()
-        ).first() if treatment.category else None
-        if cat and cat.revenue_account_id:
-            return cat.revenue_account
-    return fallback_revenue
-
-
-def _revenue_legs(invoice, lines):
-    """Build the complete, self-balancing cash/revenue block for an invoice.
-
-    ``lines`` is a list of ``(item_or_None, item_name, quantity, price)``.
-
-    Returns ``[(account, entry_type, amount, description), ...]`` where total
-    debits equal total credits by construction:
-
-        Dr  payment account        grand_total
-        Dr  Sales Discount         (balancing plug, when positive)
-            Cr  revenue per line   gross price x quantity
-            Cr  Tax Payable        invoice.tax
-            Cr  Additional Charges invoice.additional_charges
-
-    Revenue is credited gross and every reduction — line ``discount_pct``,
-    ``invoice.discount``, and promotion or package redemptions that were never
-    written back to ``invoice.discount`` — lands in the single Sales Discount
-    contra account. That keeps gross revenue reportable and makes the entry
-    balance regardless of where the reduction came from.
-    """
-    inv_no = invoice.invoice_number
-    fallback_revenue = _sysacct(ACC_PRODUCT_REVENUE)
-
-    unlinked = [(n or '').strip().lower() for it, n, _q, _p in lines if it is None]
-    treatments_by_name = {}
-    if unlinked:
-        treatments_by_name = {
-            t.name.strip().lower(): t
-            for t in Treatment.objects.filter(name__in=[n for n in unlinked if n])
-        }
-        if len(treatments_by_name) < len(set(filter(None, unlinked))):
-            # Fall back to a full scan so case/spacing variants still match.
-            treatments_by_name = {t.name.strip().lower(): t for t in Treatment.objects.all()}
-
-    legs = []
-    gross = Decimal('0')
-
-    for item, item_name, quantity, price in lines:
-        amount = price * quantity
-        if amount == 0:
-            continue
-        gross += amount
-        acct = _line_revenue_account(item, item_name, treatments_by_name, fallback_revenue)
-        if acct:
-            label = item.name if item is not None else (item_name or 'Item')
-            legs.append((acct, 'credit', amount, f'Invoice {inv_no} – {label}'))
-
-    if invoice.tax:
-        acct = _sysacct(ACC_TAX_PAYABLE)
-        if acct:
-            legs.append((acct, 'credit', invoice.tax, f'Invoice {inv_no} – Pajak'))
-
-    if invoice.additional_charges:
-        acct = _sysacct(ACC_ADDITIONAL_CHARGES)
-        if acct:
-            legs.append((acct, 'credit', invoice.additional_charges,
-                         f'Invoice {inv_no} – Biaya tambahan'))
-
-    # An unknown payment method goes to the clearing account rather than Cash, so
-    # unidentified receipts stay visible instead of inflating the cash balance.
-    payment_acct = (invoice.payment_method
-                    or _sysacct(ACC_UNDEPOSITED)
-                    or _sysacct(ACC_CASH))
-    if payment_acct and invoice.grand_total:
-        legs.append((payment_acct, 'debit', invoice.grand_total,
-                     f'Invoice {inv_no} – Payment received'))
-
-    # Whatever is left over is the total discount granted on this invoice.
-    credited = sum(a for _ac, side, a, _d in legs if side == 'credit')
-    debited = sum(a for _ac, side, a, _d in legs if side == 'debit')
-    plug = credited - debited
-    if plug:
-        acct = _sysacct(ACC_SALES_DISCOUNT)
-        if acct:
-            side = 'debit' if plug > 0 else 'credit'
-            legs.append((acct, side, abs(plug), f'Invoice {inv_no} – Diskon penjualan'))
-
-    return legs
-
-
-def _post_legs(invoice, legs, reverse=False):
-    """Write ``legs`` to the ledger and roll account balances, optionally flipped.
-
-    ``reverse=True`` posts the exact opposite of every leg, which is what makes
-    an edit or a void undo a posting completely.
-    """
-    flip = {'debit': 'credit', 'credit': 'debit'}
-    for account, entry_type, amount, description in legs:
-        side = flip[entry_type] if reverse else entry_type
-        _apply_balance(account, side, amount)
-        _le(account, side, amount, invoice,
-            f'{description} (koreksi)' if reverse else description)
+# _le / _apply_balance / _revenue_legs / _post_legs and the ACC_* constants now
+# live in managementsys/services/journal_engine.py (Phase 2) — imported above
+# so every call site below is unchanged. This module still owns _post_accounting
+# / _reverse_accounting_instances (FIFO + package side effects), which were not
+# part of the extraction.
 
 
 def _lines_from_dicts(line_items, items_by_id):
@@ -219,79 +69,99 @@ def _lines_from_instances(item_instances):
     ]
 
 
-def _post_accounting(invoice, line_items, items_by_id):
-    """
-    Post accounting entries for a completed invoice:
+def build_invoice_legs(invoice, line_items, items_by_id, *, deduct=True, sim=None):
+    """Every journal leg a completed invoice produces, as a LegSet:
       - Cash/payment account  += grand_total  (DEBIT asset)
-      - Per service line: revenue/COGS for the treatment's category  (CREDIT revenue)
+      - Per service line: revenue for the treatment's category  (CREDIT revenue)
       - Per physical line (is_service=False): FIFO deduct stock, then
         inventory asset -= COGS  (CREDIT asset),  COGS account += COGS  (DEBIT COGS)
     Routing:
-      - Services (treatments) post to their item_category's revenue/COGS accounts.
+      - Services (treatments) post to their item_category's revenue accounts.
       - Physical inventory items are treated as a single entity — all post to the
         shared product accounts (4200000 Product Sales Revenue / 5100000 Cost of
         Products Sold), regardless of item_category.
     These product accounts also serve as the fallback when a service has no category.
-    Each balance change is mirrored as a LedgerEntry row for historical reporting.
+
+    ``deduct`` is the one thing that makes this *not* a pure function. The COGS
+    legs are a result of FIFO consumption, not an input to it, so a real posting
+    must actually consume stock to know what to post. With ``deduct=False`` the
+    FIFO walk runs against a ``FifoSimulation`` instead — no rows are touched,
+    and the resulting COGS legs are flagged ``is_estimated`` because stock can
+    move between a preview and its commit. Pass one ``sim`` for the whole
+    preview so repeated draws on the same batch stay honest.
     """
     inv_no = invoice.invoice_number
+    legset = LegSet(memo=f'Invoice {inv_no}')
 
     # Cash, revenue, tax, additional charges and the discount plug, as one
     # self-balancing block covering every line — including lines with no item FK.
-    _post_legs(invoice, _revenue_legs(invoice, _lines_from_dicts(line_items, items_by_id)))
+    for account, entry_type, amount, description in _revenue_legs(
+        invoice, _lines_from_dicts(line_items, items_by_id)
+    ):
+        legset.add(account, entry_type, amount, description)
 
     fallback_cogs = ChartOfAccounts.objects.filter(account_number=5100000).first()
     inventory_asset = ChartOfAccounts.objects.filter(account_number=1300000).first()
+
+    def cogs_pair(amount, label_asset, label_cogs):
+        """The balanced inventory/COGS pair for one consumption event."""
+        if inventory_asset:
+            legset.add(inventory_asset, 'credit', amount, label_asset, is_estimated=not deduct)
+        if fallback_cogs:
+            legset.add(fallback_cogs, 'debit', amount, label_cogs, is_estimated=not deduct)
+        if not inventory_asset or not fallback_cogs:
+            legset.warnings.append('Akun persediaan/HPP tidak lengkap — HPP tidak dijurnal.')
 
     for line in line_items:
         if not line.get('item_id'):
             continue
         item = items_by_id[line['item_id']]
-        # Only services route by category; physical goods are one shared entity.
-        cat = item.item_category if item.is_service else None
-        cogs_acct = (cat.cogs_account if cat and cat.cogs_account_id else fallback_cogs)
 
         if not item.is_service and invoice.warehouse_id:
             if line['quantity'] > 0:
-                _shortfall, cogs_amount = _fifo_deduct(item.id, invoice.warehouse_id, line['quantity'])
+                _shortfall, cogs_amount = _fifo_deduct(
+                    item.id, invoice.warehouse_id, line['quantity'],
+                    commit=deduct, sim=sim,
+                )
                 if cogs_amount > 0:
-                    if inventory_asset:
-                        ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
-                            balance=F('balance') - cogs_amount
-                        )
-                        _le(inventory_asset, 'credit', cogs_amount, invoice,
-                            f'Invoice {inv_no} – FIFO deduction: {item.name}')
-                    if cogs_acct:
-                        ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
-                            balance=F('balance') + cogs_amount
-                        )
-                        _le(cogs_acct, 'debit', cogs_amount, invoice,
-                            f'Invoice {inv_no} – COGS: {item.name}')
+                    cogs_pair(cogs_amount,
+                              f'Invoice {inv_no} – FIFO deduction: {item.name}',
+                              f'Invoice {inv_no} – COGS: {item.name}')
 
         if item.is_service:
             treatment = getattr(item, 'treatment', None)
             if treatment:
                 deduct_fn = (
-                    (lambda mid, qty: _fifo_deduct(mid, invoice.warehouse_id, qty))
+                    (lambda mid, qty: _fifo_deduct(mid, invoice.warehouse_id, qty,
+                                                   commit=deduct, sim=sim))
                     if invoice.warehouse_id
-                    else (lambda mid, qty: _fifo_deduct_global(mid, qty))
+                    else (lambda mid, qty: _fifo_deduct_global(mid, qty,
+                                                               commit=deduct, sim=sim))
                 )
                 for material in treatment.materials.all():
                     _shortfall, mat_cogs = deduct_fn(material.item_id, material.quantity_small)
                     if mat_cogs <= 0:
                         continue
-                    if inventory_asset:
-                        ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
-                            balance=F('balance') - mat_cogs
-                        )
-                        _le(inventory_asset, 'credit', mat_cogs, invoice,
-                            f'Invoice {inv_no} – material: {material.item.name} for {item.name}')
-                    if cogs_acct:
-                        ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
-                            balance=F('balance') + mat_cogs
-                        )
-                        _le(cogs_acct, 'debit', mat_cogs, invoice,
-                            f'Invoice {inv_no} – material COGS: {material.item.name} for {item.name}')
+                    cogs_pair(mat_cogs,
+                              f'Invoice {inv_no} – material: {material.item.name} for {item.name}',
+                              f'Invoice {inv_no} – material COGS: {material.item.name} for {item.name}')
+
+    return legset
+
+
+def _post_accounting(invoice, line_items, items_by_id, memo_date=None, source_type='invoice'):
+    """Write the invoice's journal legs and roll every affected balance.
+
+    The arithmetic — and the FIFO consumption it depends on — lives in
+    ``build_invoice_legs``. This is the thin writer, kept so every existing
+    create/edit/void call site is unchanged.
+    """
+    legset = build_invoice_legs(invoice, line_items, items_by_id, deduct=True)
+    _post_legs(
+        invoice,
+        [(l.account, l.entry_type, l.amount, l.description) for l in legset.legs],
+        date=memo_date, source_type=source_type,
+    )
 
 
 def _snapshot_scalars(invoice):
@@ -312,12 +182,16 @@ def _snapshot_scalars(invoice):
 
 
 def _reverse_accounting_instances(payment_method_id, grand_total, item_instances, warehouse_id,
-                                  invoice=None, old_scalars=None):
+                                  invoice=None, old_scalars=None, memo_date=None, source_type='invoice'):
     """
     Reverse every accounting entry that _post_accounting originally made,
     using InvoiceItem model instances (with item relations already prefetched).
     Called at the start of a PUT/PATCH so the edit can be re-applied cleanly.
     Each reversal is recorded as a LedgerEntry (opposite entry_type) when invoice is supplied.
+
+    ``memo_date``/``source_type`` let the void/edit-memo path (Phase 2) stamp
+    these reversal rows as today-dated, tagged 'void_memo'/'edit_memo' instead
+    of the historic 'invoice' rows on the original transaction date.
     """
     inv_no = invoice.invoice_number if invoice else '?'
 
@@ -336,10 +210,10 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
             invoice.discount           = old.get('discount', invoice.discount)
             invoice.datetime           = old.get('datetime', invoice.datetime)
             if old['payment_method_id'] != invoice.payment_method_id:
-                invoice.payment_method = ChartOfAccounts.objects.filter(
+                invoice.payment_method = PaymentMethod.objects.filter(
                     pk=old['payment_method_id']).first()
             legs = _revenue_legs(invoice, _lines_from_instances(item_instances))
-            _post_legs(invoice, legs, reverse=True)
+            _post_legs(invoice, legs, reverse=True, date=memo_date, source_type=source_type)
         finally:
             invoice.grand_total        = saved['grand_total']
             invoice.tax                = saved['tax']
@@ -347,12 +221,14 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
             invoice.discount           = saved['discount']
             invoice.datetime           = saved['datetime']
             if invoice.payment_method_id != saved['payment_method_id']:
-                invoice.payment_method = ChartOfAccounts.objects.filter(
+                invoice.payment_method = PaymentMethod.objects.filter(
                     pk=saved['payment_method_id']).first()
     elif payment_method_id:
-        acct = ChartOfAccounts.objects.filter(pk=payment_method_id).first()
-        if acct:
-            _apply_balance(acct, 'credit', grand_total)
+        method = PaymentMethod.objects.select_related('linked_account').filter(pk=payment_method_id).first()
+        if method:
+            _apply_balance(method.linked_account, 'credit', grand_total)
+    # (no LedgerEntry row for the payment-method-only branch above — matches
+    # historic behaviour; it only runs when no invoice was supplied at all)
 
     fallback_cogs    = ChartOfAccounts.objects.filter(account_number=5100000).first()
     inventory_asset  = ChartOfAccounts.objects.filter(account_number=1300000).first()
@@ -361,9 +237,8 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
         if not inst.item_id:
             continue
         item = inst.item
-        # Mirror of _post_accounting: only services route by category.
-        cat = item.item_category if item.is_service else None
-        cogs_acct    = (cat.cogs_account    if cat and cat.cogs_account_id    else fallback_cogs)
+        # Mirror of _post_accounting: COGS always posts to the shared fallback.
+        cogs_acct    = fallback_cogs
 
         if not item.is_service and warehouse_id:
             if inst.quantity > 0:
@@ -375,14 +250,16 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
                         )
                         if invoice:
                             _le(inventory_asset, 'debit', cogs_amount, invoice,
-                                f'Invoice {inv_no} – FIFO restock: {item.name}')
+                                f'Invoice {inv_no} – FIFO restock: {item.name}',
+                                date=memo_date, source_type=source_type)
                     if cogs_acct:
                         ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
                             balance=F('balance') - cogs_amount
                         )
                         if invoice:
                             _le(cogs_acct, 'credit', cogs_amount, invoice,
-                                f'Invoice {inv_no} – COGS correction: {item.name}')
+                                f'Invoice {inv_no} – COGS correction: {item.name}',
+                                date=memo_date, source_type=source_type)
 
         # Mirror of the material deduction _post_accounting does for services.
         if item.is_service:
@@ -403,14 +280,16 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
                         )
                         if invoice:
                             _le(inventory_asset, 'debit', mat_cogs, invoice,
-                                f'Invoice {inv_no} – material restock: {material.item.name} for {item.name}')
+                                f'Invoice {inv_no} – material restock: {material.item.name} for {item.name}',
+                                date=memo_date, source_type=source_type)
                     if cogs_acct:
                         ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
                             balance=F('balance') - mat_cogs
                         )
                         if invoice:
                             _le(cogs_acct, 'credit', mat_cogs, invoice,
-                                f'Invoice {inv_no} – material COGS correction: {material.item.name} for {item.name}')
+                                f'Invoice {inv_no} – material COGS correction: {material.item.name} for {item.name}',
+                                date=memo_date, source_type=source_type)
 
 
 def _handle_packages(invoice, patient, line_items, items_by_id):
@@ -553,17 +432,16 @@ class InvoiceCreateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        payment_account = None
+        payment_method_obj = None
         if data.get('payment_method_id'):
             try:
-                payment_account = ChartOfAccounts.objects.get(
+                payment_method_obj = PaymentMethod.objects.get(
                     id=data['payment_method_id'],
-                    parent__account_number=1100000,
-                    is_head=False,
+                    is_active=True,
                 )
-            except ChartOfAccounts.DoesNotExist:
+            except PaymentMethod.DoesNotExist:
                 return Response(
-                    {'payment_method_id': 'Cash/cash-equivalent account not found.'},
+                    {'payment_method_id': 'Payment method not found.'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
@@ -574,7 +452,6 @@ class InvoiceCreateView(APIView):
             obj.id: obj
             for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
                 'item_category__revenue_account',
-                'item_category__cogs_account',
             ).prefetch_related('treatment__materials__item')
         }
         missing = [iid for iid in item_ids if iid not in items_by_id]
@@ -589,7 +466,7 @@ class InvoiceCreateView(APIView):
         invoice = Invoice.objects.create(
             datetime=data.get('datetime') or timezone.now(),
             patient_no=patient,
-            payment_method=payment_account,
+            payment_method=payment_method_obj,
             discount=data['discount'],
             cashier=cashier,
             warehouse=warehouse,
@@ -615,8 +492,10 @@ class InvoiceCreateView(APIView):
         ])
 
         # ── Accounting + stock deduction ──────────────────────────────────────
-
-        _post_accounting(invoice, data['items'], items_by_id)
+        # Phase 2: journal posting is deferred. A brand-new invoice always
+        # starts posting_status='unposted' (the model default) and carries
+        # zero LedgerEntry rows until POST /api/accounting/journal/run/ sweeps
+        # its transaction date — see managementsys/services/journal_engine.py.
 
         # ── Treatment Packages: sales + redemptions ───────────────────────────
         # Sale: any line whose item is a TreatmentPackage.catalog_item creates
@@ -738,7 +617,19 @@ class InvoiceDetailView(APIView):
         invoice = self._get(pk)
         if invoice is None:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
-        return Response(InvoiceReadSerializer(invoice).data)
+        data = InvoiceReadSerializer(invoice).data
+        # The GL postings this invoice produced — including the reversal legs
+        # written by a later edit or void, which is why they are ordered
+        # oldest-first and not filtered. Only the detail endpoint carries them;
+        # the list would be one query per row.
+        entries = (
+            LedgerEntry.objects
+            .filter(invoice=invoice)
+            .select_related('account')
+            .order_by('date', 'created_at', 'id')
+        )
+        data['ledger_entries'] = LedgerEntrySerializer(entries, many=True).data
+        return Response(data)
 
     @transaction.atomic
     def patch(self, request, pk):
@@ -775,7 +666,6 @@ class InvoiceDetailView(APIView):
                 obj.id: obj
                 for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
                     'item_category__revenue_account',
-                    'item_category__cogs_account',
                 ).prefetch_related('treatment__materials__item')
             }
             missing = [iid for iid in item_ids if iid not in new_items_by_id]
@@ -802,7 +692,6 @@ class InvoiceDetailView(APIView):
             invoice.items
             .select_related(
                 'item__item_category__revenue_account',
-                'item__item_category__cogs_account',
             )
             .prefetch_related('item__treatment__materials__item')
             .all()
@@ -817,13 +706,12 @@ class InvoiceDetailView(APIView):
         if 'payment_method_id' in data:
             if data['payment_method_id']:
                 try:
-                    invoice.payment_method = ChartOfAccounts.objects.get(
+                    invoice.payment_method = PaymentMethod.objects.get(
                         id=data['payment_method_id'],
-                        parent__account_number=1100000,
-                        is_head=False,
+                        is_active=True,
                     )
-                except ChartOfAccounts.DoesNotExist:
-                    return Response({'payment_method_id': 'Cash/cash-equivalent account not found.'}, status=status.HTTP_400_BAD_REQUEST)
+                except PaymentMethod.DoesNotExist:
+                    return Response({'payment_method_id': 'Payment method not found.'}, status=status.HTTP_400_BAD_REQUEST)
             else:
                 invoice.payment_method = None
             changes.append('payment_method')
@@ -892,29 +780,46 @@ class InvoiceDetailView(APIView):
             changes.append('items')
 
         # ── Accounting: reverse old entries, re-apply for new state ──────────
+        # Phase 2: an invoice whose transaction date has never been posted
+        # (posting_status='unposted') carries zero LedgerEntry rows — editing
+        # it just updates the record; the next journal run will post the new
+        # values. An already-posted invoice (its date's JournalDayLog.is_posted
+        # =True) instead gets a same-day "edit memo": a reversal of the OLD
+        # posted values plus a fresh posting of the NEW values, both dated
+        # today and tagged source_type='edit_memo'. The original transaction
+        # date's LedgerEntry rows and JournalDayLog are left untouched.
+        was_posted = invoice.posting_status == 'posted'
+        memo_date = timezone.now().date() if was_posted else None
+        memo_source = 'edit_memo' if was_posted else 'invoice'
 
-        _reverse_accounting_instances(
-            old_payment_method_id, old_grand_total, old_item_instances, old_warehouse_id,
-            invoice=invoice, old_scalars=old_scalars,
-        )
+        if was_posted:
+            _reverse_accounting_instances(
+                old_payment_method_id, old_grand_total, old_item_instances, old_warehouse_id,
+                invoice=invoice, old_scalars=old_scalars,
+                memo_date=memo_date, source_type=memo_source,
+            )
 
         if new_line_items_data is not None:
             _reverse_packages(invoice)
-            _post_accounting(invoice, new_line_items_data, new_items_by_id)
+            if was_posted:
+                _post_accounting(invoice, new_line_items_data, new_items_by_id,
+                                  memo_date=memo_date, source_type=memo_source)
             _handle_packages(invoice, invoice.patient_no, new_line_items_data, new_items_by_id)
         else:
-            # Items unchanged — re-apply using old instances converted to dict format
-            old_lines_as_dicts = [
-                {'item_id': inst.item_id, 'item_name': inst.item_name,
-                 'quantity': inst.quantity, 'price': inst.price}
-                for inst in old_item_instances
-            ]
-            old_items_by_id = {
-                inst.item_id: inst.item
-                for inst in old_item_instances
-                if inst.item_id
-            }
-            _post_accounting(invoice, old_lines_as_dicts, old_items_by_id)
+            if was_posted:
+                # Items unchanged — re-apply using old instances converted to dict format
+                old_lines_as_dicts = [
+                    {'item_id': inst.item_id, 'item_name': inst.item_name,
+                     'quantity': inst.quantity, 'price': inst.price}
+                    for inst in old_item_instances
+                ]
+                old_items_by_id = {
+                    inst.item_id: inst.item
+                    for inst in old_item_instances
+                    if inst.item_id
+                }
+                _post_accounting(invoice, old_lines_as_dicts, old_items_by_id,
+                                  memo_date=memo_date, source_type=memo_source)
 
         AuditLog.objects.create(
             performed_by=_actor(request),
@@ -954,7 +859,6 @@ class InvoiceDetailView(APIView):
             invoice.items
             .select_related(
                 'item__item_category__revenue_account',
-                'item__item_category__cogs_account',
             )
             .prefetch_related('item__treatment__materials__item')
             .all()
@@ -963,15 +867,24 @@ class InvoiceDetailView(APIView):
         inv_no = invoice.invoice_number
         patient = invoice.patient_no
 
-        # Post reversing ledger entries (keeps the original posting + reversal as
-        # a complete audit trail) and roll the affected account balances back.
-        _reverse_accounting_instances(
-            invoice.payment_method_id,
-            invoice.grand_total,
-            old_item_instances,
-            invoice.warehouse_id,
-            invoice=invoice,
-        )
+        # Phase 2: an unposted invoice has no LedgerEntry rows to reverse — void
+        # it with zero journal impact (the next journal run will simply skip it,
+        # see the sweep query's posting_status filter). A posted invoice gets a
+        # same-day reversing "void memo" instead of touching its original
+        # transaction date: dated today, tagged source_type='void_memo',
+        # referencing this invoice. The original day's JournalDayLog is left
+        # untouched either way.
+        was_posted = invoice.posting_status == 'posted'
+        if was_posted:
+            _reverse_accounting_instances(
+                invoice.payment_method_id,
+                invoice.grand_total,
+                old_item_instances,
+                invoice.warehouse_id,
+                invoice=invoice,
+                memo_date=timezone.now().date(),
+                source_type='void_memo',
+            )
 
         invoice.is_voided = True
         invoice.voided_at = timezone.now()
@@ -1138,11 +1051,7 @@ class InvoiceImportView(APIView):
             if row['warehouse_id']:
                 warehouse = Warehouse.objects.filter(name=row['warehouse_id']).first()
 
-            payment = ChartOfAccounts.objects.filter(
-                name=row['payment_method'],
-                parent__account_number=1100000,
-                is_head=False,
-            ).first()
+            payment = PaymentMethod.objects.filter(name=row['payment_method']).first()
 
             try:
                 dt = timezone.datetime.fromisoformat(row['datetime']) if row['datetime'] else timezone.now()
