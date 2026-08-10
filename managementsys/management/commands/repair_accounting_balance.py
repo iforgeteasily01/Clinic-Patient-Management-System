@@ -40,7 +40,7 @@ from managementsys.models import (
     ChartOfAccounts, Invoice, LedgerEntry, PaymentMethod, PurchaseInvoice,
 )
 from managementsys.services.journal_engine import (
-    ACC_INVENTORY, ACC_OPENING_EQUITY, ACC_UNDEPOSITED, _post_legs, _revenue_legs,
+    ACC_INVENTORY, ACC_LEGACY_CLEARING, ACC_OPENING_EQUITY, _post_legs, _revenue_legs,
 )
 from managementsys.views.invoice_page import _lines_from_instances
 
@@ -84,7 +84,7 @@ class Command(BaseCommand):
             'Repairing ledger' if apply_changes else 'Ledger repair — DRY RUN (rolled back at the end)'
         ))
 
-        for number in (4100000, 2200000, 7100000, ACC_UNDEPOSITED):
+        for number in (4100000, 2200000, 7100000, ACC_LEGACY_CLEARING):
             if not ChartOfAccounts.objects.filter(account_number=number).exists():
                 self.stderr.write(self.style.ERROR(
                     f'Account {number} is missing. Run `manage.py migrate` first.'))
@@ -163,12 +163,16 @@ class Command(BaseCommand):
         stats = defaultdict(int)
         stats['amount'] = D('0')
 
-        clearing_account = ChartOfAccounts.objects.filter(account_number=ACC_UNDEPOSITED).first()
+        clearing_account = ChartOfAccounts.objects.filter(account_number=ACC_LEGACY_CLEARING).first()
         clearing_method = None
         if clearing_account is not None:
+            # is_active=False: this method exists only to label historical rows.
+            # Every picker queries ?active_only=1, so it must never be offered
+            # to a cashier alongside Cash and QRIS (migration 0100).
             clearing_method, _ = PaymentMethod.objects.get_or_create(
                 linked_account=clearing_account,
-                defaults={'name': clearing_account.name, 'is_system': True},
+                defaults={'name': clearing_account.name, 'is_system': True,
+                          'is_active': False},
             )
         missing = (invoices_missing_from_ledger(cutoff, include_imported)
                    .select_related('payment_method', 'payment_method__linked_account')

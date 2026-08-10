@@ -42,6 +42,14 @@ urlpatterns = [
     path('api/admin/site-config/', views.SiteConfigView.as_view(), name='admin-site-config'),
     path('api/admin/color-palettes/', views.ColorPaletteListCreateView.as_view(), name='admin-color-palettes'),
     path('api/admin/color-palettes/<int:pk>/', views.ColorPaletteDetailView.as_view(), name='admin-color-palette-detail'),
+    path('api/admin/report-settings/', views.ReportSettingsView.as_view(), name='admin-report-settings'),
+    path('api/admin/expense-aliases/', views.ExpenseAliasListCreateView.as_view(), name='admin-expense-aliases'),
+    path('api/admin/expense-aliases/<int:pk>/', views.ExpenseAliasDetailView.as_view(), name='admin-expense-alias-detail'),
+
+    # Beautician petty-cash expenses (design doc §4)
+    path('api/beautician/expense-aliases/', views.BeauticianExpenseAliasListView.as_view(), name='beautician-expense-aliases'),
+    path('api/beautician/expenses/', views.BeauticianExpenseListCreateView.as_view(), name='beautician-expenses'),
+    path('api/beautician/expenses/<int:pk>/', views.BeauticianExpenseDetailView.as_view(), name='beautician-expense-detail'),
 
     path("", views.homepage, name = 'homepage'),
     path("patient/", views.PatientListCreate.as_view(), name = "Patient-view-create"),
@@ -143,6 +151,10 @@ urlpatterns = [
     path('api/reports/sales/', views.SalesRangeReportView.as_view(), name='reports-sales'),
     path('api/reports/sales-items/', views.SalesItemsBreakdownView.as_view(), name='reports-sales-items'),
     path('api/reports/generate/', views.GenerateReportView.as_view(), name='reports-generate'),
+    path('api/reports/stock-movement/', views.StockMovementReportView.as_view(), name='reports-stock-movement'),
+    path('api/reports/stock-movement/export/', views.StockMovementExportView.as_view(), name='reports-stock-movement-export'),
+    path('api/reports/patient-activity/', views.PatientActivityReportView.as_view(), name='reports-patient-activity'),
+    path('api/reports/patient-activity/export/', views.PatientActivityExportView.as_view(), name='reports-patient-activity-export'),
 
     # Patient Notes
     path('api/patient-notes/', views.PatientNoteListCreateView.as_view(), name='patient-notes'),

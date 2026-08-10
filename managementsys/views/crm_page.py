@@ -1,5 +1,5 @@
 import logging
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from django.db.models import Count, F, Max, Q, Sum
@@ -8,9 +8,15 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import Invoice, Patient, PatientCRMProfile, PatientTier, Promotion
+from ..models import Invoice, Patient, PatientCRMProfile, PatientTier, Promotion, ReportSettings
+from ..services.patient_activity import classify
 
 logger = logging.getLogger(__name__)
+
+# Valid ?activity= values. Filtered as date ranges on crm_profile__last_visit_date
+# below rather than by calling classify() per row — same cutoffs, one query
+# instead of a full table scan in Python.
+_ACTIVITY_BUCKETS = {'active', 'lapsing', 'inactive', 'never'}
 
 ALLOWED_ORDERINGS = {
     'total_spend':       F('crm_profile__total_spend').asc(nulls_last=True),
@@ -91,6 +97,27 @@ class PatientCRMListView(APIView):
         if tier_name := request.GET.get('tier', '').strip():
             qs = qs.filter(crm_profile__tier__name__iexact=tier_name)
 
+        as_of = date.today()
+        settings_obj = ReportSettings.get_solo()
+
+        activity = request.GET.get('activity', '').strip().lower()
+        if activity in _ACTIVITY_BUCKETS:
+            active_cutoff = as_of - timedelta(days=settings_obj.patient_active_months * 30)
+            inactive_cutoff = as_of - timedelta(days=settings_obj.patient_inactive_months * 30)
+            if activity == 'active':
+                qs = qs.filter(crm_profile__last_visit_date__gte=active_cutoff)
+            elif activity == 'lapsing':
+                qs = qs.filter(
+                    crm_profile__last_visit_date__lt=active_cutoff,
+                    crm_profile__last_visit_date__gte=inactive_cutoff,
+                )
+            elif activity == 'inactive':
+                qs = qs.filter(crm_profile__last_visit_date__lt=inactive_cutoff)
+            else:  # 'never' — registered but no non-voided invoice yet
+                qs = qs.filter(
+                    Q(crm_profile__isnull=True) | Q(crm_profile__last_visit_date__isnull=True)
+                )
+
         ordering = request.GET.get('ordering', '').strip()
         if ordering in ALLOWED_ORDERINGS:
             qs = qs.order_by(ALLOWED_ORDERINGS[ordering])
@@ -117,7 +144,7 @@ class PatientCRMListView(APIView):
             'page': page,
             'page_size': page_size,
             'num_pages': max(1, -(-total // page_size)),  # ceiling division
-            'results': [_serialize_crm_row(p) for p in patients],
+            'results': [_serialize_crm_row(p, as_of=as_of, settings_obj=settings_obj) for p in patients],
         })
 
 
@@ -263,7 +290,18 @@ def _serialize_tier(t, *, patient_count):
     }
 
 
-def _serialize_crm_row(patient):
+def _serialize_crm_row(patient, *, as_of=None, settings_obj=None):
+    """Shared by the CRM list and the CRM detail view — ``activity_bucket``
+    goes through ``services.patient_activity.classify`` so this row can never
+    disagree with the patient-activity report about which bucket a patient is
+    in (design doc §5).
+
+    ``as_of``/``settings_obj`` are optional so a caller serializing many rows
+    (the list view) can compute them once and pass them down instead of this
+    function re-fetching ``ReportSettings.get_solo()`` per row.
+    """
+    as_of = as_of or date.today()
+    settings_obj = settings_obj or ReportSettings.get_solo()
     crm = getattr(patient, 'crm_profile', None)
     tier = None
     if crm and crm.tier_id:
@@ -271,6 +309,8 @@ def _serialize_crm_row(patient):
     active_packages = getattr(patient, 'active_packages_count', None)
     if active_packages is None:
         active_packages = patient.packages.filter(status='active').count()
+    last_visit_date = crm.last_visit_date if crm else None
+    days_since_last_visit = (as_of - last_visit_date).days if last_visit_date else None
     return {
         'patient_no': patient.patient_no,
         'name': patient.name,
@@ -278,6 +318,8 @@ def _serialize_crm_row(patient):
         'tier': tier,
         'total_spend': str(crm.total_spend) if crm else '0.00',
         'total_visits': crm.total_visits if crm else 0,
-        'last_visit_date': str(crm.last_visit_date) if (crm and crm.last_visit_date) else None,
+        'last_visit_date': str(last_visit_date) if last_visit_date else None,
         'active_packages': active_packages,
+        'activity_bucket': classify(last_visit_date, as_of, settings_obj),
+        'days_since_last_visit': days_since_last_visit,
     }

@@ -21,6 +21,7 @@ from ..models import (
     LedgerEntry, Patient, PatientPackage, PatientPackageRedemption, PaymentMethod,
     PromotionUsage, Treatment, TreatmentPackage, Warehouse,
 )
+from ..services.cash_accounts import cash_bank_account_ids
 from ..services.journal_engine import LegSet, _apply_balance, _le, _post_legs, _revenue_legs
 from .crm_page import refresh_crm_profile
 from .inventory_page import (
@@ -178,6 +179,7 @@ def _snapshot_scalars(invoice):
         'discount': invoice.discount,
         'datetime': invoice.datetime,
         'payment_method_id': invoice.payment_method_id,
+        'payment_account_id': invoice.payment_account_id,
     }
 
 
@@ -202,6 +204,12 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
         old = dict(old_scalars or {})
         old.setdefault('grand_total', grand_total)
         old.setdefault('payment_method_id', payment_method_id)
+        # Same treatment as payment_method_id: an edit that changes the bank
+        # account must reverse against the account the *original* posting
+        # actually debited, not the one the invoice has been updated to by
+        # the time this reversal runs — otherwise the reversal leg lands on
+        # the wrong account and both balances end up wrong.
+        old.setdefault('payment_account_id', invoice.payment_account_id)
         saved = _snapshot_scalars(invoice)
         try:
             invoice.grand_total        = old['grand_total']
@@ -212,6 +220,9 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
             if old['payment_method_id'] != invoice.payment_method_id:
                 invoice.payment_method = PaymentMethod.objects.filter(
                     pk=old['payment_method_id']).first()
+            if old['payment_account_id'] != invoice.payment_account_id:
+                invoice.payment_account = ChartOfAccounts.objects.filter(
+                    pk=old['payment_account_id']).first()
             legs = _revenue_legs(invoice, _lines_from_instances(item_instances))
             _post_legs(invoice, legs, reverse=True, date=memo_date, source_type=source_type)
         finally:
@@ -223,6 +234,9 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
             if invoice.payment_method_id != saved['payment_method_id']:
                 invoice.payment_method = PaymentMethod.objects.filter(
                     pk=saved['payment_method_id']).first()
+            if invoice.payment_account_id != saved['payment_account_id']:
+                invoice.payment_account = ChartOfAccounts.objects.filter(
+                    pk=saved['payment_account_id']).first()
     elif payment_method_id:
         method = PaymentMethod.objects.select_related('linked_account').filter(pk=payment_method_id).first()
         if method:
@@ -445,6 +459,28 @@ class InvoiceCreateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+        # ── Payment account (design doc §3) ────────────────────────────────────
+        payment_account_obj = None
+        payment_account_id = data.get('payment_account_id')
+        if payment_account_id is not None:
+            if payment_account_id not in cash_bank_account_ids():
+                return Response(
+                    {'payment_account_id': ['Not a cash/bank account.']},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                payment_account_obj = ChartOfAccounts.objects.get(pk=payment_account_id)
+            except ChartOfAccounts.DoesNotExist:
+                return Response(
+                    {'payment_account_id': ['Not a cash/bank account.']},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        elif payment_method_obj is not None:
+            # A caller that only sends payment_method_id (Medya-Cashier POS,
+            # still legacy) still gets payment_account resolved from it, so a
+            # freshly created invoice is never write-only-legacy.
+            payment_account_obj = payment_method_obj.linked_account
+
         # ── Validate all inventory items exist before writing anything ────────
 
         item_ids = [i['item_id'] for i in data['items'] if i.get('item_id')]
@@ -467,6 +503,7 @@ class InvoiceCreateView(APIView):
             datetime=data.get('datetime') or timezone.now(),
             patient_no=patient,
             payment_method=payment_method_obj,
+            payment_account=payment_account_obj,
             discount=data['discount'],
             cashier=cashier,
             warehouse=warehouse,
@@ -541,7 +578,7 @@ class InvoiceCreateView(APIView):
 
         invoice = (
             Invoice.objects
-            .select_related('patient_no', 'cashier', 'warehouse', 'payment_method')
+            .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
             .prefetch_related('items__item')
             .get(pk=invoice.pk)
         )
@@ -557,7 +594,7 @@ class InvoiceListView(APIView):
     def get(self, request):
         qs = (
             Invoice.objects
-            .select_related('patient_no', 'cashier', 'warehouse', 'payment_method')
+            .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
             .prefetch_related('items__item')
             .order_by('-datetime')
         )
@@ -572,6 +609,8 @@ class InvoiceListView(APIView):
             )
         if method := request.GET.get('payment_method', '').strip():
             qs = qs.filter(payment_method_id=method)
+        if account := request.GET.get('payment_account', '').strip():
+            qs = qs.filter(payment_account_id=account)
 
         # Hide voided invoices unless the caller explicitly asks to include them.
         if request.GET.get('include_voided', '').strip().lower() not in ('1', 'true', 'yes'):
@@ -606,7 +645,7 @@ class InvoiceDetailView(APIView):
         try:
             return (
                 Invoice.objects
-                .select_related('patient_no', 'cashier', 'warehouse', 'payment_method')
+                .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
                 .prefetch_related('items__item')
                 .get(pk=pk)
             )
@@ -712,9 +751,26 @@ class InvoiceDetailView(APIView):
                     )
                 except PaymentMethod.DoesNotExist:
                     return Response({'payment_method_id': 'Payment method not found.'}, status=status.HTTP_400_BAD_REQUEST)
+                if 'payment_account_id' not in data:
+                    # Mirrors InvoiceCreateView: a caller that only sends
+                    # payment_method_id still gets payment_account kept in step.
+                    invoice.payment_account = invoice.payment_method.linked_account
+                    changes.append('payment_account')
             else:
                 invoice.payment_method = None
             changes.append('payment_method')
+
+        if 'payment_account_id' in data:
+            if data['payment_account_id']:
+                if data['payment_account_id'] not in cash_bank_account_ids():
+                    return Response({'payment_account_id': ['Not a cash/bank account.']}, status=status.HTTP_400_BAD_REQUEST)
+                try:
+                    invoice.payment_account = ChartOfAccounts.objects.get(pk=data['payment_account_id'])
+                except ChartOfAccounts.DoesNotExist:
+                    return Response({'payment_account_id': ['Not a cash/bank account.']}, status=status.HTTP_400_BAD_REQUEST)
+            else:
+                invoice.payment_account = None
+            changes.append('payment_account')
 
         for field in ('discount', 'tax', 'additional_charges', 'grand_total'):
             if field in data:
@@ -838,7 +894,7 @@ class InvoiceDetailView(APIView):
         invoice.refresh_from_db()
         return Response(InvoiceReadSerializer(
             Invoice.objects
-            .select_related('patient_no', 'cashier', 'warehouse')
+            .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
             .prefetch_related('items__item')
             .get(pk=pk)
         ).data)
@@ -912,7 +968,7 @@ class InvoiceExportView(APIView):
     def get(self, request):
         qs = (
             Invoice.objects
-            .select_related('patient_no', 'cashier', 'warehouse', 'payment_method')
+            .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
             .prefetch_related('items__item')
             .order_by('-datetime')
         )
@@ -925,6 +981,8 @@ class InvoiceExportView(APIView):
             )
         if method := request.GET.get('payment_method', '').strip():
             qs = qs.filter(payment_method_id=method)
+        if account := request.GET.get('payment_account', '').strip():
+            qs = qs.filter(payment_account_id=account)
 
         # Hide voided invoices unless explicitly requested (mirrors the list view).
         if request.GET.get('include_voided', '').strip().lower() not in ('1', 'true', 'yes'):

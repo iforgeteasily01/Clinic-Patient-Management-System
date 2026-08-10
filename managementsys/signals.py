@@ -105,10 +105,15 @@ def on_invoice_created(sender, instance, created, **kwargs):
         patient_name = None
         patient_no   = None
 
-    # Resolve payment method name
+    # Resolve payment method name. payment_method is the legacy field the
+    # dashboard has always read; payment_account (design doc §3) is the newer
+    # direct cash/bank reference, so fall back to its name rather than send
+    # the dashboard a blank when only payment_account was set.
     payment_method_name = None
     if instance.payment_method_id and instance.payment_method:
         payment_method_name = instance.payment_method.name
+    elif instance.payment_account_id and instance.payment_account:
+        payment_method_name = instance.payment_account.name
 
     # Build line items from related InvoiceItems
     # Use prefetch if available, otherwise hit DB (signal context may not have prefetch)

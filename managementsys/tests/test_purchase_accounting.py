@@ -261,6 +261,76 @@ class TestPurchasePayment:
 
         assert PurchaseInvoice.objects.count() == 0
 
+    def test_pays_from_a_cash_account_with_no_payment_method_behind_it(
+            self, auth_api, supplier, stock, gl_accounts):
+        """An e-wallet account like Gopay is a real place money sits even when
+        no PaymentMethod points at it. Purchases settle against the account
+        directly (``cash_account``), so such an account is payable-from."""
+        wallet = ChartOfAccountsFactory(
+            account_number=1102500, name='Gopay 1', account_type='asset',
+            is_head=False, parent=gl_accounts['cash'].parent,
+        )
+        auth_api.post(
+            reverse('accounting-purchases'),
+            _stock_payload(supplier, gl_accounts['cash_method'], stock['warehouse'], stock['item'],
+                           qty=10, cost=1000),
+            format='json',
+        )
+        _run_journal(auth_api)
+        invoice = PurchaseInvoice.objects.latest('id')
+
+        res = auth_api.post(
+            reverse('accounting-purchase-pay', args=[invoice.id]),
+            {'amount': 10000, 'payment_date': '2026-08-05', 'cash_account': wallet.id},
+            format='json',
+        )
+        assert res.status_code == 200, res.content
+
+        invoice.refresh_from_db()
+        assert invoice.status == 'paid'
+        assert invoice.payment_account_id == wallet.id
+        payment = invoice.payments.get()
+        assert payment.payment_account_id == wallet.id
+        assert payment.payment_method_id is None
+        assert _bal(1102500) == Decimal('-10000')
+        supplier.refresh_from_db()
+        assert supplier.ap_account.balance == Decimal('0')
+        _assert_balanced()
+
+    def test_non_cash_account_is_refused_as_a_payment_source(
+            self, auth_api, supplier, stock, gl_accounts):
+        """A rejected account must not quietly fall through to the account that
+        settled the last instalment — that would post the money out of the
+        wrong pot."""
+        auth_api.post(
+            reverse('accounting-purchases'),
+            _stock_payload(supplier, gl_accounts['cash_method'], stock['warehouse'], stock['item'],
+                           qty=10, cost=1000),
+            format='json',
+        )
+        _run_journal(auth_api)
+        invoice = PurchaseInvoice.objects.latest('id')
+        url = reverse('accounting-purchase-pay', args=[invoice.id])
+
+        # First instalment from a real cash account, so a fallback now exists.
+        assert auth_api.post(
+            url,
+            {'amount': 4000, 'payment_date': '2026-08-05',
+             'cash_account': gl_accounts['cash'].id},
+            format='json',
+        ).status_code == 200
+
+        res = auth_api.post(
+            url,
+            {'amount': 6000, 'payment_date': '2026-08-06',
+             'cash_account': gl_accounts['inventory_asset'].id},
+            format='json',
+        )
+        assert res.status_code == 400, res.content
+        invoice.refresh_from_db()
+        assert invoice.payments.count() == 1
+        assert invoice.amount_paid == Decimal('4000')
+
     def test_unpaid_invoice_stores_no_payment_method(self, auth_api, supplier, stock, gl_accounts):
         # payment_account is sent but ignored — an unpaid purchase has not been
         # settled from any account yet.

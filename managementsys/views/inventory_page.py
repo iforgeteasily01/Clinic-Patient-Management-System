@@ -5,7 +5,7 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from django.db import transaction
 from django.db import models
-from django.db.models import Sum, Value
+from django.db.models import Case, F, Sum, Value, When
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
@@ -180,6 +180,53 @@ class WarehouseDetailView(APIView):
 
 # ── Stock levels ───────────────────────────────────────────────────────────
 
+def _batch_value_expr():
+    """The remaining value of a batch, apportioned from its total purchase cost.
+
+    ``(value / quantity_initial) * quantity_remaining`` is the same
+    original-cost-per-unit basis ``production_page.unit_cost_small`` uses when
+    it walks batches in Python — this is the DB-side form of the identical
+    maths, so both a per-item weighted-average lookup and a bulk aggregate can
+    share one definition of "what is this stock worth". Guarded against
+    ``quantity_initial=0`` so a malformed batch cannot raise DivisionByZero
+    inside an aggregate query.
+    """
+    return Case(
+        When(quantity_initial__gt=0,
+             then=F('value') / F('quantity_initial') * F('quantity_remaining')),
+        default=Value(Decimal('0')),
+        output_field=models.DecimalField(max_digits=20, decimal_places=6),
+    )
+
+
+def stock_valuation_by_item(item_ids=None, warehouse_id=None):
+    """{item_id: {'qty_on_hand': Decimal, 'stock_value': Decimal}} across
+    remaining batches, optionally scoped to a warehouse or a set of items.
+
+    The one place bulk stock valuation happens. ``StockLevelView`` below and
+    the stock-movement report (``views/stock_movement_report.py``) both call
+    this instead of each summing ``InventoryBatch`` rows their own way — two
+    different stock valuations in one system is a bug waiting to be argued
+    about (see docs/stock-movement-patient-activity-design.md §2).
+    """
+    qs = InventoryBatch.objects.filter(quantity_remaining__gt=0)
+    if item_ids is not None:
+        qs = qs.filter(item_id__in=item_ids)
+    if warehouse_id:
+        qs = qs.filter(warehouse_id=warehouse_id)
+    rows = qs.values('item_id').annotate(
+        qty_on_hand=Sum('quantity_remaining'),
+        stock_value=Sum(_batch_value_expr()),
+    )
+    return {
+        r['item_id']: {
+            'qty_on_hand': r['qty_on_hand'] or Decimal('0'),
+            'stock_value': r['stock_value'] or Decimal('0'),
+        }
+        for r in rows
+    }
+
+
 class StockLevelView(APIView):
     def get(self, request):
         qs = (
@@ -192,7 +239,10 @@ class StockLevelView(APIView):
                 'item__min_stock', 'item__selling_price', 'item__is_active',
                 'warehouse__code', 'warehouse__name',
             )
-            .annotate(total_quantity=Sum('quantity_remaining'))
+            .annotate(
+                total_quantity=Sum('quantity_remaining'),
+                stock_value=Sum(_batch_value_expr()),
+            )
             .order_by('item__name', 'warehouse__name')
         )
         result = [
@@ -212,6 +262,7 @@ class StockLevelView(APIView):
                 'warehouse_code': r['warehouse__code'],
                 'warehouse_name': r['warehouse__name'],
                 'total_quantity': r['total_quantity'] or 0,
+                'stock_value': str(r['stock_value'] or Decimal('0')),
             }
             for r in qs
         ]

@@ -519,7 +519,22 @@ class Invoice(models.Model):
     invoice_number     = models.CharField(max_length=30, unique=True, blank=True)
     datetime           = models.DateTimeField()
     patient_no         = models.ForeignKey(Patient, on_delete=models.SET_NULL, null=True, blank=True, related_name='invoices')
+    # payment_method stays, unchanged, PROTECT: PurchasePayment, Expense and the
+    # repair_accounting_balance / void_duplicate_billing_invoices commands still
+    # reference it, and cash_accounts.cash_bank_account_ids() unions
+    # PaymentMethod.linked_account into its allowed set. payment_account below is
+    # the direct COA reference new code should use; it is not a replacement, the
+    # two are resolved together in journal_engine's payment leg.
     payment_method     = models.ForeignKey('PaymentMethod', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
+    payment_account    = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        limit_choices_to={'account_type': 'asset'},
+        related_name='invoices_received_into',
+        help_text='Cash/bank account debited by this invoice. Must be one of '
+                  'services.cash_accounts.cash_bank_account_ids().',
+    )
     discount           = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     cashier            = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoices_as_cashier')
     warehouse          = models.ForeignKey('Warehouse', on_delete=models.SET_NULL, null=True, blank=True, related_name='invoices')
@@ -1166,6 +1181,36 @@ class SiteConfig(models.Model):
         return obj
 
 
+class ReportSettings(models.Model):
+    """Singleton row (always pk=1) holding tunable report classification windows.
+
+    Deliberately not folded into ``SiteConfig``: that model is about receipt
+    printing, and mixing report windows into it would make the Receipt
+    Settings admin page lie about its scope. Same ``get_solo()`` shape as
+    ``SiteConfig`` so both singletons are handled identically everywhere else.
+    """
+
+    # ── Stock movement classification ──
+    stock_fast_window_days = models.IntegerField(default=30)
+    stock_fast_top_percent = models.IntegerField(default=20)   # 1..100
+    stock_slow_months      = models.IntegerField(default=2)
+    stock_dead_months      = models.IntegerField(default=4)
+
+    # ── Patient activity classification ──
+    patient_active_months   = models.IntegerField(default=6)
+    patient_inactive_months = models.IntegerField(default=12)
+
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = 'Report Settings'
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
 class IssueTicket(models.Model):
     STATUS_CHOICES = [
         ('open', 'Open'),
@@ -1332,14 +1377,25 @@ class PurchaseInvoice(models.Model):
     internal_id          = models.CharField(max_length=30, unique=True, blank=True)
     external_invoice_no  = models.CharField(max_length=100, blank=True)
     supplier             = models.ForeignKey('Supplier', on_delete=models.PROTECT, related_name='purchase_invoices')
-    # The method the invoice was (last) settled with. Left empty while the
-    # invoice is unpaid — a purchase on credit has no payment method yet; it is
-    # chosen when a payment is recorded (see PurchasePayment).
+    # Legacy indirection kept for back-compat and for old rows. New records set
+    # payment_account directly.
     payment_method       = models.ForeignKey(
         'PaymentMethod',
         on_delete=models.PROTECT,
         null=True, blank=True,
         related_name='purchase_invoices',
+    )
+    # The cash/bank COA the invoice was (last) settled from. Left empty while
+    # the invoice is unpaid — a purchase on credit has no payment account yet;
+    # it is chosen when a payment is recorded (see PurchasePayment).
+    payment_account      = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        limit_choices_to={'account_type': 'asset'},
+        related_name='purchase_invoices_paid_from',
+        help_text='Cash/bank account the invoice was last settled from. Must be '
+                  'one of services.cash_accounts.cash_bank_account_ids().',
     )
     purchase_date  = models.DateField()
     due_date       = models.DateField(null=True, blank=True)
@@ -1436,14 +1492,31 @@ class PurchasePayment(models.Model):
     """One settlement against a purchase invoice.
 
     A purchase can be paid in full at creation or in instalments later, each
-    from a different bank/cash account — so the date and the method belong to
+    from a different bank/cash account — so the date and the account belong to
     the payment, not to the invoice. ``PurchaseInvoice.amount_paid`` stays as
-    the running total these rows sum to, and ``PurchaseInvoice.payment_method``
-    mirrors the most recent payment's method for list/detail display.
+    the running total these rows sum to, and ``PurchaseInvoice.payment_account``
+    mirrors the most recent payment's account for list/detail display.
     """
     invoice        = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='payments')
     payment_date   = models.DateField()
-    payment_method = models.ForeignKey('PaymentMethod', on_delete=models.PROTECT, related_name='purchase_payments')
+    # Legacy indirection kept for back-compat; new rows only set payment_account.
+    payment_method = models.ForeignKey(
+        'PaymentMethod',
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name='purchase_payments',
+    )
+    # The cash/bank COA the money actually left from — the credit leg of
+    # Dr Accounts Payable / Cr <this account>.
+    payment_account = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        limit_choices_to={'account_type': 'asset'},
+        related_name='purchase_payments_from',
+        help_text='Cash/bank account credited by this payment. Must be one of '
+                  'services.cash_accounts.cash_bank_account_ids().',
+    )
     amount         = models.DecimalField(max_digits=14, decimal_places=2)
     notes          = models.CharField(max_length=255, blank=True)
     created_at     = models.DateTimeField(auto_now_add=True)
@@ -1478,6 +1551,39 @@ class AccountTransfer(models.Model):
 
 # ── Accounting: Operating Expenses ─────────────────────────────────────────────
 
+class ExpenseAlias(models.Model):
+    """A friendly, staff-facing name for an expense GL account.
+
+    Lets a beautician log 'Beli kapas' without knowing that it debits
+    5200003 Perlengkapan Klinik. Purely a naming layer: the Expense rows
+    written through it are indistinguishable from hand-entered ones apart
+    from Expense.source. Chosen over a separate posting model specifically
+    so this feature never has to touch the journal engine — the posting
+    code stays exactly as dangerous, and exactly as untouched, as it was.
+    """
+    SCOPE_CHOICES = [('beautician', 'Beautician'), ('general', 'General')]
+
+    name       = models.CharField(max_length=120)
+    account    = models.ForeignKey(
+        'ChartOfAccounts', on_delete=models.PROTECT,
+        limit_choices_to={'account_type__in': ['expense', 'cogs']},
+        related_name='expense_aliases',
+    )
+    scope      = models.CharField(max_length=20, choices=SCOPE_CHOICES, default='beautician')
+    is_active  = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=0)
+    notes      = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        ordering = ['sort_order', 'name']
+        constraints = [
+            models.UniqueConstraint(fields=['name', 'scope'], name='uniq_expense_alias_name_scope'),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
 class Expense(models.Model):
     """One operating expense, read as a single journal entry.
 
@@ -1494,6 +1600,12 @@ class Expense(models.Model):
         ('partial', 'Sebagian Dibayar'),
         ('paid',    'Lunas'),
     ]
+    # Who wrote this expense, not how it was paid. 'beautician' rows come
+    # through the alias-picking petty-cash flow (services/expense_create.py)
+    # instead of the full GL-account expense form; kept as a plain field
+    # rather than inferred from ExpenseItem.alias so a row is filterable even
+    # after every one of its items has had its alias SET_NULL out from under it.
+    SOURCE_CHOICES = [('general', 'General'), ('beautician', 'Beautician')]
 
     expense_date   = models.DateField()
     payment_method = models.ForeignKey(
@@ -1526,6 +1638,7 @@ class Expense(models.Model):
                   'fallback memo for any expense line left without one.',
     )
     status         = models.CharField(max_length=10, choices=STATUS_CHOICES, default='unpaid')
+    source         = models.CharField(max_length=20, choices=SOURCE_CHOICES, default='general', db_index=True)
     total_amount   = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     amount_paid    = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     notes          = models.TextField(blank=True)
@@ -1568,6 +1681,15 @@ class ExpenseItem(models.Model):
         help_text="This leg's journal memo. Blank inherits Expense.payment_memo.",
     )
     amount      = models.DecimalField(max_digits=14, decimal_places=2)
+    # SET_NULL, not PROTECT: deleting a retired alias must not be blocked by,
+    # or destroy, a year of posted expense history. account and description
+    # above are the record of truth for what was posted; alias is only
+    # provenance ("which friendly name did the beautician pick"), so losing
+    # it on delete is acceptable where losing a posted line never would be.
+    alias       = models.ForeignKey(
+        'ExpenseAlias', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='expense_items',
+    )
 
     class Meta:
         ordering = ['id']

@@ -9,8 +9,8 @@ the patient's recorded spend.
 Scope is deliberately narrow, because voiding a real sale is worse than leaving a
 phantom in place:
 
-* Only invoices ``repair_accounting_balance`` routed to the Undeposited Funds
-  clearing account are considered. That is the exact signature of the billing queue:
+* Only invoices ``repair_accounting_balance`` routed to the legacy clearing account
+  (1100011) are considered. That is the exact signature of the billing queue:
   no cashier, no warehouse, no payment method of its own. iPos-imported rows are
   never candidates — they are not in the ledger and are not queue output.
 * A candidate is matched only against an invoice that is **not itself a candidate**
@@ -35,7 +35,7 @@ from django.utils import timezone
 from managementsys.accounting_checks import GO_LIVE, IMPORTED_INVOICE_PREFIX
 from managementsys.models import AuditLog, Invoice, LedgerEntry
 from managementsys.views.crm_page import refresh_crm_profile
-from managementsys.services.journal_engine import ACC_UNDEPOSITED
+from managementsys.services.journal_engine import ACC_LEGACY_CLEARING
 
 D = Decimal
 
@@ -78,7 +78,7 @@ class Command(BaseCommand):
         candidates = list(
             Invoice.objects
             .filter(datetime__date__gte=since, is_voided=False,
-                    payment_method__linked_account__account_number=ACC_UNDEPOSITED)
+                    payment_method__linked_account__account_number=ACC_LEGACY_CLEARING)
             .exclude(invoice_number__startswith=IMPORTED_INVOICE_PREFIX)
             .prefetch_related('items__item')
             # Tie-break on id. A POS run stamps every invoice of a visit with

@@ -91,8 +91,17 @@ def gl_accounts(db):
     additional_charges = ChartOfAccountsFactory(
         account_number=7100000, name="Additional Charges", account_type="other_income",
     )
-    undeposited = ChartOfAccountsFactory(
-        account_number=1100011, name="Undeposited Funds",
+    # A second real cash location, so tests that move money between two cash
+    # accounts (transfers) have a valid counterparty. ``undeposited`` cannot
+    # serve: migration 0100 retired 1100011 out of the cash set.
+    bank = ChartOfAccountsFactory(
+        account_number=1102000, name="Bank BCA",
+        account_type="asset", is_head=False, parent=cash_head,
+    )
+    # The retired clearing account (migration 0076, renamed and retired by 0100).
+    # Only legacy rows point at it; it must never be offered as a cash account.
+    legacy_clearing = ChartOfAccountsFactory(
+        account_number=1100011, name="Kas Penjualan iPos (histori)",
         account_type="asset", is_head=False, parent=cash_head,
     )
     opening_equity = ChartOfAccountsFactory(
@@ -101,7 +110,10 @@ def gl_accounts(db):
     # PaymentMethod rows — what invoice/purchase-invoice creation actually points
     # at now that "how the customer paid" is decoupled from the GL account.
     cash_method = PaymentMethodFactory(name="Cash", linked_account=cash)
-    undeposited_method = PaymentMethodFactory(name="Undeposited Funds", linked_account=undeposited)
+    legacy_clearing_method = PaymentMethodFactory(
+        name="Kas Penjualan iPos (histori)", linked_account=legacy_clearing,
+        is_active=False,
+    )
     return {
         "cash": cash,
         "revenue": revenue,
@@ -110,10 +122,11 @@ def gl_accounts(db):
         "sales_discount": sales_discount,
         "tax_payable": tax_payable,
         "additional_charges": additional_charges,
-        "undeposited": undeposited,
+        "bank": bank,
+        "legacy_clearing": legacy_clearing,
         "opening_equity": opening_equity,
         "cash_method": cash_method,
-        "undeposited_method": undeposited_method,
+        "legacy_clearing_method": legacy_clearing_method,
     }
 
 

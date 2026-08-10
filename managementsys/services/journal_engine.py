@@ -247,8 +247,13 @@ ACC_ADDITIONAL_CHARGES = 7100000
 ACC_INVENTORY          = 1300000
 ACC_PRODUCT_COGS       = 5100000
 ACC_CASH               = 1100001
-# Receipts whose payment method was never captured (migration 0076).
-ACC_UNDEPOSITED        = 1100011
+# Created by migration 0076 as "Undeposited Funds", retired and renamed to
+# "Kas Penjualan iPos (histori)" by 0100 — in practice it only ever held the cash
+# side of the imported iPos history. Live documents can no longer reach it: the
+# billing queue requires a payment method and the POS always sends one. It stays
+# here as the last-resort leg so re-posting a legacy method-less invoice still
+# balances instead of silently asserting Cash.
+ACC_LEGACY_CLEARING    = 1100011
 ACC_OPENING_EQUITY     = 3900000
 
 
@@ -366,12 +371,17 @@ def _revenue_legs(invoice, lines):
             legs.append((acct, 'credit', invoice.additional_charges,
                          f'Invoice {inv_no} – Biaya tambahan'))
 
-    # An unknown payment method goes to the clearing account rather than Cash, so
-    # unidentified receipts stay visible instead of inflating the cash balance.
-    # ``invoice.payment_method`` is a PaymentMethod row — the GL account to
-    # debit is whatever cash/bank account it resolves to via ``linked_account``.
-    payment_acct = ((invoice.payment_method.linked_account if invoice.payment_method_id else None)
-                    or _sysacct(ACC_UNDEPOSITED)
+    # ``invoice.payment_account`` (design doc §3) is the direct cash/bank COA
+    # reference and wins whenever it is set. ``invoice.payment_method`` is the
+    # older PaymentMethod indirection — the GL account to debit is whatever
+    # cash/bank account it resolves to via ``linked_account`` — kept as the
+    # fallback for rows written before payment_account existed and for callers
+    # (Medya-Cashier POS) that still only send payment_method_id. Only legacy
+    # rows with neither reach the ACC_LEGACY_CLEARING fallback; it keeps the
+    # entry balanced without asserting a payment method nobody recorded.
+    payment_acct = (invoice.payment_account
+                    or (invoice.payment_method.linked_account if invoice.payment_method_id else None)
+                    or _sysacct(ACC_LEGACY_CLEARING)
                     or _sysacct(ACC_CASH))
     if payment_acct and invoice.grand_total:
         legs.append((payment_acct, 'debit', invoice.grand_total,

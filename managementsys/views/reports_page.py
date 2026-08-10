@@ -587,7 +587,15 @@ def _write_banner(ws, title, period_label, ncols):
 
     # Place + size the logo first so we know how far to indent the text.
     indent = 0
-    logo_path = getattr(getattr(cfg, 'logo', None), 'path', None)
+    # `.path` raises ValueError on an ImageField with no file (and on non-local
+    # storage), so a bare getattr() default is not enough of a guard here.
+    logo = getattr(cfg, 'logo', None)
+    logo_path = None
+    if logo:
+        try:
+            logo_path = logo.path
+        except (ValueError, NotImplementedError):
+            logo_path = None
     has_logo = bool(logo_path and os.path.exists(logo_path))
     if has_logo:
         try:

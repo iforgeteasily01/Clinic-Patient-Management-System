@@ -56,6 +56,7 @@ def _safe_decimal(val) -> Decimal:
 # call site below (_post_le, _post_purchase_accrual, _unpost_purchase,
 # _post_purchase_price_variance) is unchanged.
 from ..services.cash_accounts import cash_bank_account_ids
+from ..services.expense_create import create_expense
 from ..services import journal_preview
 from ..services.journal_engine import (
     CENT, INVENTORY_ASSET_NUMBER, NORMAL_BALANCE, PRICE_VARIANCE_NUMBER,
@@ -313,6 +314,39 @@ def _resolve_payment_method(raw_id):
         return None
 
 
+def _resolve_purchase_cash_account(data):
+    """The cash/bank COA a purchase is settled from.
+
+    Prefers the ``cash_account`` key (a ChartOfAccounts pk, what the picker
+    sends now). Falls back to the legacy ``payment_account``/``payment_method``
+    keys (a PaymentMethod pk) so older clients keep working, resolving them
+    through ``linked_account``.
+
+    Returns ``(account_or_None, legacy_method_or_None, error_response_or_None)``.
+    The method is carried along only so the legacy mirror column stays
+    populated. A *sent but unusable* account is an error rather than a silent
+    ``None`` — otherwise callers that fall back to the invoice's last account
+    would post the payment against the wrong account.
+    """
+    raw = data.get('cash_account')
+    if raw not in (None, '', 0, '0'):
+        try:
+            account = ChartOfAccounts.objects.get(pk=raw)
+        except (ChartOfAccounts.DoesNotExist, TypeError, ValueError):
+            return None, None, Response({'error': NOT_A_CASH_ACCOUNT},
+                                        status=status.HTTP_400_BAD_REQUEST)
+        if account.pk not in cash_bank_account_ids():
+            return None, None, Response({'error': NOT_A_CASH_ACCOUNT},
+                                        status=status.HTTP_400_BAD_REQUEST)
+        return account, None, None
+
+    method = (_resolve_payment_method(data.get('payment_account'))
+              or _resolve_payment_method(data.get('payment_method')))
+    if method is not None and method.linked_account_id:
+        return method.linked_account, method, None
+    return None, method, None
+
+
 def _parse_date(raw, fallback=None):
     """Accept 'YYYY-MM-DD' (or a date), falling back when empty/unparseable."""
     if isinstance(raw, datetime.date):
@@ -325,12 +359,17 @@ def _parse_date(raw, fallback=None):
     return fallback
 
 
-def _record_purchase_payment(invoice, amount, payment_method, pay_date, actor, notes=''):
+def _record_purchase_payment(invoice, amount, cash_account, pay_date, actor,
+                             notes='', payment_method=None):
     """Record one settlement against a purchase invoice: a PurchasePayment row,
     the running amount_paid/status on the invoice, and the double entry
         Dr Accounts Payable — <vendor>   (the liability goes away)
-        Cr <payment method's cash/bank account>  (funds leave)
+        Cr <cash_account>                (funds leave)
     dated on the day the money actually moved, not the day it was keyed in.
+
+    ``cash_account`` is a ChartOfAccounts row from ``cash_bank_account_ids()``.
+    ``payment_method`` is the legacy PaymentMethod, stored only when a legacy
+    client sent one — nothing reads it for posting.
 
     Caller must have validated the amount against the remaining balance and be
     inside a transaction.
@@ -339,22 +378,24 @@ def _record_purchase_payment(invoice, amount, payment_method, pay_date, actor, n
         invoice=invoice,
         payment_date=pay_date,
         payment_method=payment_method,
+        payment_account=cash_account,
         amount=amount,
         notes=notes,
         created_by=actor,
     )
 
     invoice.amount_paid += amount
-    # Mirror the latest method onto the invoice so list/detail views keep a
-    # single "paid with" column without joining every payment.
+    # Mirror the latest account onto the invoice so list/detail views keep a
+    # single "paid from" column without joining every payment.
+    invoice.payment_account = cash_account
     invoice.payment_method = payment_method
     invoice.refresh_status()
-    invoice.save(update_fields=['amount_paid', 'payment_method', 'status'])
+    invoice.save(update_fields=['amount_paid', 'payment_account', 'payment_method', 'status'])
 
     ap_account = invoice.supplier.ensure_ap_account()
     _post_le(ap_account, 'debit', amount, invoice,
              f'Pembayaran utang {invoice.internal_id} — {invoice.supplier.name}', pay_date)
-    _post_le(payment_method.linked_account, 'credit', amount, invoice,
+    _post_le(cash_account, 'credit', amount, invoice,
              f'Pembayaran pembelian {invoice.internal_id}', pay_date)
 
     return payment
@@ -382,7 +423,7 @@ class PurchaseInvoiceListCreateView(APIView):
     def get(self, request):
         qs = (
             PurchaseInvoice.objects
-            .select_related('supplier', 'payment_method', 'payment_method__linked_account')
+            .select_related('supplier', 'payment_account', 'payment_method', 'payment_method__linked_account')
             .prefetch_related('payments')   # last_payment_date, one query for the page
         )
 
@@ -440,16 +481,19 @@ class PurchaseInvoiceListCreateView(APIView):
         except (Supplier.DoesNotExist, KeyError):
             return Response({'error': 'Invalid supplier.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Paid-on-creation: the method and the date the money moved are both
-        # required, and the invoice is settled in full below once its total is
-        # known. Unpaid: no payment method is stored — it is chosen at payment.
+        # Paid-on-creation: the cash/bank account and the date the money moved
+        # are both required, and the invoice is settled in full below once its
+        # total is known. Unpaid: no payment account is stored — it is chosen at
+        # payment time.
         pay_now = str(data.get('payment_status', 'unpaid')).strip().lower() == 'paid'
-        payment_method = _resolve_payment_method(data.get('payment_account'))
+        cash_account, payment_method, cash_err = _resolve_purchase_cash_account(data)
+        if cash_err is not None:
+            return cash_err
         payment_date   = _parse_date(data.get('payment_date'))
         if pay_now:
-            if payment_method is None:
+            if cash_account is None:
                 return Response(
-                    {'error': 'Metode pembayaran wajib dipilih untuk faktur yang langsung dibayar.'},
+                    {'error': 'Rekening kas/bank wajib dipilih untuk faktur yang langsung dibayar.'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             if payment_date is None:
@@ -481,6 +525,7 @@ class PurchaseInvoiceListCreateView(APIView):
                 external_invoice_no=data.get('external_invoice_no', ''),
                 supplier=supplier,
                 payment_method=payment_method if pay_now else None,
+                payment_account=cash_account if pay_now else None,
                 warehouse=warehouse_obj,
                 purchase_date=data['purchase_date'],
                 due_date=data.get('due_date') or None,
@@ -644,8 +689,9 @@ class PurchaseInvoiceListCreateView(APIView):
             # purchase date, and the two net to zero AP for this vendor.
             if pay_now and grand_total > 0:
                 _record_purchase_payment(
-                    invoice, grand_total, payment_method, payment_date, _actor(request),
+                    invoice, grand_total, cash_account, payment_date, _actor(request),
                     notes='Dibayar saat faktur dibuat',
+                    payment_method=payment_method,
                 )
 
             AuditLog.objects.create(
@@ -666,10 +712,12 @@ class PurchaseInvoiceDetailView(APIView):
     def _get(self, pk):
         try:
             return PurchaseInvoice.objects.select_related(
-                'supplier', 'payment_method', 'payment_method__linked_account', 'created_by', 'warehouse',
+                'supplier', 'payment_account', 'payment_method', 'payment_method__linked_account',
+                'created_by', 'warehouse',
             ).prefetch_related(
                 'items__item', 'items__expense_account', 'additional_costs',
-                'payments__payment_method__linked_account', 'payments__created_by',
+                'payments__payment_account', 'payments__payment_method__linked_account',
+                'payments__created_by',
             ).get(pk=pk)
         except PurchaseInvoice.DoesNotExist:
             return None
@@ -1125,17 +1173,19 @@ class PurchaseInvoiceDetailView(APIView):
 class PurchaseInvoicePayView(APIView):
     """
     POST /api/accounting/purchases/<pk>/pay/
-    Body: { amount, payment_date, payment_account, notes? }
+    Body: { amount, payment_date, cash_account, notes? }
 
     Records a payment against the purchase invoice: which bank/cash account it
     came out of and the date it left. Debits the vendor's Accounts Payable and
-    credits the GL account behind the chosen payment method.
+    credits the chosen cash/bank account. ``payment_account``/``payment_method``
+    (a PaymentMethod pk) are still accepted for back-compat.
     """
 
     def post(self, request, pk):
         try:
             invoice = PurchaseInvoice.objects.select_related(
-                'payment_method', 'payment_method__linked_account', 'supplier', 'supplier__ap_account'
+                'payment_account', 'payment_method', 'payment_method__linked_account',
+                'supplier', 'supplier__ap_account',
             ).get(pk=pk)
         except PurchaseInvoice.DoesNotExist:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -1158,16 +1208,16 @@ class PurchaseInvoicePayView(APIView):
             )
 
         # Which account the money came from, and when it left. Both are asked
-        # for at payment time; the method falls back to whatever settled this
+        # for at payment time; the account falls back to whatever settled this
         # invoice last so a repeat instalment needs no re-picking.
-        payment_method = (
-            _resolve_payment_method(request.data.get('payment_account'))
-            or _resolve_payment_method(request.data.get('payment_method'))
-            or invoice.payment_method
-        )
-        if payment_method is None or payment_method.linked_account_id is None:
+        cash_account, payment_method, cash_err = _resolve_purchase_cash_account(request.data)
+        if cash_err is not None:
+            return cash_err
+        if cash_account is None:
+            cash_account = invoice.payment_account
+        if cash_account is None:
             return Response(
-                {'error': 'Metode pembayaran wajib dipilih.'},
+                {'error': 'Rekening kas/bank wajib dipilih.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1185,8 +1235,9 @@ class PurchaseInvoicePayView(APIView):
 
         with transaction.atomic():
             _record_purchase_payment(
-                invoice, amount, payment_method, pay_date, _actor(request),
+                invoice, amount, cash_account, pay_date, _actor(request),
                 notes=str(request.data.get('notes', '') or '')[:255],
+                payment_method=payment_method,
             )
 
             AuditLog.objects.create(
@@ -1194,7 +1245,7 @@ class PurchaseInvoicePayView(APIView):
                 action='UPDATE',
                 entity_type='PurchaseInvoice',
                 entity_id=str(invoice.id),
-                description=(f'Payment Rp{amount:,.0f} via {payment_method.name} on {pay_date} '
+                description=(f'Payment Rp{amount:,.0f} from {cash_account.name} on {pay_date} '
                              f'recorded for {invoice.internal_id}, status → {invoice.status}'),
             )
 
@@ -1269,6 +1320,9 @@ class ExpenseListCreateView(APIView):
          ?q=<search memo / notes / line description / line account name>
          ?date_from=&date_to=
          ?cash_account=<ChartOfAccounts pk>
+         ?source=general|beautician  — separates hand-entered expenses from
+             ones written through the beautician petty-cash flow (design doc
+             §4). Every row already carries ``source``/``created_by_name``.
 
     POST /api/accounting/expenses/
          { expense_date, cash_account?, payment_memo?,
@@ -1310,8 +1364,16 @@ class ExpenseListCreateView(APIView):
         cash_account = request.query_params.get('cash_account', '').strip()
         if cash_account:
             qs = qs.filter(payment_account_id=cash_account)
+        src = request.query_params.get('source', '').strip()
+        if src in ('general', 'beautician'):
+            qs = qs.filter(source=src)
 
-        return Response(ExpenseSerializer(qs.prefetch_related('items__account'), many=True).data)
+        return Response(
+            ExpenseSerializer(
+                qs.select_related('created_by').prefetch_related('items__account', 'items__alias'),
+                many=True,
+            ).data
+        )
 
     def post(self, request):
         data = request.data
@@ -1353,48 +1415,19 @@ class ExpenseListCreateView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
-        with transaction.atomic():
-            expense = Expense.objects.create(
-                expense_date=expense_date,
-                payment_method=payment_method,
-                payment_account=cash_account,
-                payment_memo=(data.get('payment_memo') or '')[:255],
-                notes=data.get('notes', ''),
-                amount_paid=_safe_decimal(data.get('amount_paid', 0)),
-                created_by=_actor(request),
-            )
-
-            item_objs = []
-            total = Decimal('0')
-            for row in items:
-                amt = _safe_decimal(row.get('amount', 0))
-                if amt <= 0:
-                    continue
-                total += amt
-                item_objs.append(ExpenseItem(
-                    expense=expense,
-                    account_id=row['account'],
-                    description=row.get('description', ''),
-                    amount=amt,
-                ))
-            ExpenseItem.objects.bulk_create(item_objs)
-
-            expense.total_amount = total.quantize(Decimal('0.01'))
-            expense.refresh_status()
-            expense.save(update_fields=['total_amount', 'status'])
-
-            # Phase 2/3: the accrual double-entry (Dr expense/cogs accounts, Cr
-            # AP or payment account) is deferred, same as PurchaseInvoice — the
-            # expense is created posting_status='unposted' with zero LedgerEntry
-            # rows until a journal run sweeps its expense_date.
-
-            AuditLog.objects.create(
-                performed_by=_actor(request),
-                action='CREATE',
-                entity_type='Expense',
-                entity_id=str(expense.id),
-                description=f'Expense created: #{expense.id} (Rp{expense.total_amount:,.0f})',
-            )
+        # The write itself lives in services.expense_create — the beautician
+        # petty-cash flow (views/beautician_expense_page.py) calls the exact
+        # same function, so there is one expense-creation code path, not two.
+        expense = create_expense(
+            expense_date=expense_date,
+            payment_method=payment_method,
+            payment_account=cash_account,
+            payment_memo=data.get('payment_memo'),
+            notes=data.get('notes', ''),
+            amount_paid=data.get('amount_paid', 0),
+            items=items,
+            actor=_actor(request),
+        )
 
         return Response(
             ExpenseSerializer(expense).data,
@@ -1408,7 +1441,7 @@ class ExpenseDetailView(APIView):
             return Expense.objects.select_related(
                 'payment_method', 'payment_method__linked_account',
                 'payment_account', 'created_by',
-            ).prefetch_related('items__account').get(pk=pk)
+            ).prefetch_related('items__account', 'items__alias').get(pk=pk)
         except Expense.DoesNotExist:
             return None
 
@@ -1680,6 +1713,11 @@ class AccountTransferListCreateView(APIView):
     GET  /api/accounting/transfers/?date_from=&date_to=&account=
     POST /api/accounting/transfers/
          { transfer_date, from_account, to_account, amount, description, reference? }
+
+    Both accounts must be cash/bank accounts (``cash_bank_account_ids()``). A
+    transfer is a move of funds between two places money physically sits —
+    anything else (writing down inventory, reclassifying an expense) is a
+    manual adjustment or a correction journal, not a transfer.
     """
 
     def get(self, request):
@@ -1709,6 +1747,15 @@ class AccountTransferListCreateView(APIView):
 
         if from_acct.id == to_acct.id:
             return Response({'error': 'Rekening asal dan tujuan tidak boleh sama.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        cash_ids = cash_bank_account_ids()
+        not_cash = [a.name for a in (from_acct, to_acct) if a.pk not in cash_ids]
+        if not_cash:
+            return Response(
+                {'error': 'Transfer hanya diperbolehkan antar rekening kas/bank. '
+                          f'Bukan rekening kas/bank: {", ".join(not_cash)}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         amount = _safe_decimal(data.get('amount', 0))
         if amount <= 0:
@@ -2779,7 +2826,7 @@ class AccountingDashboardView(APIView):
 
         unpaid_qs = PurchaseInvoice.objects.filter(
             status__in=['unpaid', 'partial']
-        ).select_related('supplier', 'payment_method', 'payment_method__linked_account').order_by('due_date', '-purchase_date')
+        ).select_related('supplier', 'payment_account', 'payment_method', 'payment_method__linked_account').order_by('due_date', '-purchase_date')
 
         overdue_count = unpaid_qs.filter(due_date__lt=today).count()
         total_unpaid  = unpaid_qs.aggregate(

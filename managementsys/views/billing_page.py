@@ -7,7 +7,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..api.serializers import BillingPatientSerializer, todays_notes_by_visit
-from ..models import ActivePatient, AppUser, AuditLog, Invoice, InvoiceItem, PaymentMethod
+from ..models import ActivePatient, AppUser, AuditLog, ChartOfAccounts, Invoice, InvoiceItem, PaymentMethod
+from ..services.cash_accounts import cash_bank_account_ids
 
 
 def _already_invoiced(active_patient, lines):
@@ -162,6 +163,55 @@ class BillingCompleteView(APIView):
                 status=status.HTTP_200_OK,
             )
 
+        # ── Payment method / account ──────────────────────────────────────────
+        # At least one of payment_method_id / payment_account_id is required.
+        # This endpoint used to accept a checkout with no method at all, which
+        # left the cash side of the journal with nowhere to go but the
+        # 1100011 clearing account — asserting a receipt nobody could later
+        # explain. Validated before anything is written so a rejected checkout
+        # leaves the queue entry untouched and the cashier can retry.
+        #
+        # BillingPage.tsx replaced its PaymentMethod <select> with
+        # CashAccountPicker (design doc §3) and now only ever sends
+        # payment_account_id — so payment_method_id must be optional here, the
+        # same as InvoiceCreateView, or every checkout 400s.
+        method_id = request.data.get('payment_method_id')
+        payment_account_id = request.data.get('payment_account_id')
+        if not method_id and not payment_account_id:
+            return Response(
+                {'payment_account_id': 'A payment account is required to complete billing.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        payment_method_obj = None
+        if method_id:
+            payment_method_obj = PaymentMethod.objects.filter(
+                pk=method_id, is_active=True,
+            ).first()
+            if payment_method_obj is None:
+                return Response(
+                    {'payment_method_id': 'Payment method not found or inactive.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        # ── Payment account (design doc §3) ────────────────────────────────────
+        if payment_account_id:
+            if payment_account_id not in cash_bank_account_ids():
+                return Response(
+                    {'payment_account_id': ['Not a cash/bank account.']},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            payment_account_obj = ChartOfAccounts.objects.filter(pk=payment_account_id).first()
+            if payment_account_obj is None:
+                return Response(
+                    {'payment_account_id': ['Not a cash/bank account.']},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+        else:
+            # Not sent — resolved from the payment method, same as
+            # InvoiceCreateView, so a checkout is never write-only-legacy.
+            payment_account_obj = payment_method_obj.linked_account
+
         # ── Totals ────────────────────────────────────────────────────────────
         subtotal = sum(price for _, _, price, _ in lines)
         discount = _safe_decimal(request.data.get('discount', 0))
@@ -169,21 +219,11 @@ class BillingCompleteView(APIView):
         promotion_code = (request.data.get('promotion_code') or '').strip()
 
         # ── Create Invoice ────────────────────────────────────────────────────
-        # The cash side has to land somewhere or the entry cannot balance. The
-        # billing queue does not capture how the patient paid, so an unspecified
-        # method is left blank — _revenue_legs falls back to the clearing account
-        # (Cash would assert a payment method nobody recorded).
-        payment_method_obj = None
-        if request.data.get('payment_method_id'):
-            payment_method_obj = PaymentMethod.objects.filter(
-                pk=request.data['payment_method_id'],
-                is_active=True,
-            ).first()
-
         invoice = Invoice.objects.create(
             datetime=timezone.now(),
             patient_no=active_patient.patient_no,
             payment_method=payment_method_obj,
+            payment_account=payment_account_obj,
             discount=discount,
             tax=Decimal('0'),
             additional_charges=Decimal('0'),

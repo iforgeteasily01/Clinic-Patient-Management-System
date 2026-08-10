@@ -64,7 +64,7 @@ class TestUnpostedCreationHasNoLedgerEffect:
         res = auth_api.post(reverse("accounting-transfers"), {
             "transfer_date": "2026-08-01",
             "from_account": gl_accounts["cash"].id,
-            "to_account": gl_accounts["undeposited"].id,
+            "to_account": gl_accounts["bank"].id,
             "amount": 5000,
             "description": "test transfer",
         }, format="json")

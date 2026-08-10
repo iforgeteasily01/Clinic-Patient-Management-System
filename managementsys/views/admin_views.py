@@ -23,9 +23,11 @@ from ..api.serializers import (
     ChartOfAccountsSerializer,
     ColorPaletteSerializer,
     DoctorsSerializer,
+    ExpenseAliasSerializer,
     LedgerEntrySerializer,
     PatientSerializer,
     PaymentMethodSerializer,
+    ReportSettingsSerializer,
     SiteConfigSerializer,
     TreatmentCategorySerializer,
     TreatmentMaterialSerializer,
@@ -33,8 +35,9 @@ from ..api.serializers import (
     TreatmentSerializer,
 )
 from ..models import (
-    AppUser, AuditLog, Beauticians, ChartOfAccounts, ColorPalette, Doctors, InventoryItem,
-    LedgerEntry, Patient, PaymentMethod, SiteConfig, Treatment, TreatmentCategory, TreatmentMaterial, TreatmentPackage,
+    AppUser, AuditLog, Beauticians, ChartOfAccounts, ColorPalette, Doctors, ExpenseAlias, InventoryItem,
+    LedgerEntry, Patient, PaymentMethod, ReportSettings, SiteConfig, Treatment, TreatmentCategory,
+    TreatmentMaterial, TreatmentPackage,
 )
 
 
@@ -1075,6 +1078,145 @@ class SiteConfigView(APIView):
             serializer.save()
             return Response(serializer.data)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ── Report Settings ──────────────────────────────────────────────────────────
+
+class ReportSettingsView(APIView):
+    """GET/PATCH the singleton report classification thresholds (design §1).
+
+    GET is open to any authenticated user — the stock-movement and
+    patient-activity reports need to read it just to render bucket labels.
+    PATCH is restricted to superuser/manager, same convention as every other
+    admin-settings write in this file.
+    """
+
+    def get(self, request):
+        return Response(ReportSettingsSerializer(ReportSettings.get_solo()).data)
+
+    def patch(self, request):
+        if request.user.role not in ('superuser', 'manager'):
+            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        obj = ReportSettings.get_solo()
+        serializer = ReportSettingsSerializer(obj, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+# ── Expense Aliases (beautician petty-cash naming layer, design §4) ──────────
+
+class ExpenseAliasListCreateView(APIView):
+    """
+    GET  /api/admin/expense-aliases/  ?scope=beautician|general  ?active_only=1  ?q=
+         Open to any authenticated user — the beautician-facing picker needs
+         to read this list too (see views/beautician_expense_page.py, which
+         hits the narrower /api/beautician/expense-aliases/ instead).
+    POST /api/admin/expense-aliases/  — superuser/manager only.
+    """
+
+    def get(self, request):
+        qs = ExpenseAlias.objects.select_related('account')
+        scope = request.query_params.get('scope', '').strip()
+        if scope:
+            qs = qs.filter(scope=scope)
+        if request.query_params.get('active_only', '').strip().lower() in ('1', 'true', 'yes'):
+            qs = qs.filter(is_active=True)
+        if q := request.query_params.get('q', '').strip():
+            qs = qs.filter(name__icontains=q)
+        return Response(ExpenseAliasSerializer(qs, many=True).data)
+
+    def post(self, request):
+        if request.user.role not in ('superuser', 'manager'):
+            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        serializer = ExpenseAliasSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        instance = serializer.save()
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='CREATE',
+            entity_type='ExpenseAlias',
+            entity_id=str(instance.id),
+            description=f'Expense alias created: {instance.name} → {instance.account.name}',
+        )
+        return Response(ExpenseAliasSerializer(instance).data, status=status.HTTP_201_CREATED)
+
+
+class ExpenseAliasDetailView(APIView):
+    """GET/PUT/DELETE /api/admin/expense-aliases/<pk>/ — write ops superuser/manager only."""
+
+    def _get(self, pk):
+        try:
+            return ExpenseAlias.objects.select_related('account').get(pk=pk)
+        except ExpenseAlias.DoesNotExist:
+            return None
+
+    def get(self, request, pk):
+        instance = self._get(pk)
+        if instance is None:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(ExpenseAliasSerializer(instance).data)
+
+    def put(self, request, pk):
+        if request.user.role not in ('superuser', 'manager'):
+            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        instance = self._get(pk)
+        if instance is None:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        serializer = ExpenseAliasSerializer(instance, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        serializer.save()
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='UPDATE',
+            entity_type='ExpenseAlias',
+            entity_id=str(instance.id),
+            description=f'Expense alias updated: {instance.name}',
+        )
+        return Response(serializer.data)
+
+    def delete(self, request, pk):
+        if request.user.role not in ('superuser', 'manager'):
+            return Response({'error': 'Forbidden'}, status=status.HTTP_403_FORBIDDEN)
+        instance = self._get(pk)
+        if instance is None:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # An alias with posted history behind it (design §4): SET_NULL on
+        # ExpenseItem.alias means a hard delete wouldn't even break anything
+        # referentially, but it would still erase the "which friendly name did
+        # the beautician pick" provenance for a year of expenses. Deactivate
+        # instead and say so; hard-delete only when genuinely unused.
+        if instance.expense_items.exists():
+            instance.is_active = False
+            instance.save(update_fields=['is_active'])
+            AuditLog.objects.create(
+                performed_by=_actor(request),
+                action='UPDATE',
+                entity_type='ExpenseAlias',
+                entity_id=str(instance.id),
+                description=f'Expense alias deactivated (in use, soft-delete): {instance.name}',
+            )
+            return Response(
+                {
+                    'detail': 'Alias sudah pernah dipakai — dinonaktifkan, bukan dihapus.',
+                    'alias': ExpenseAliasSerializer(instance).data,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='DELETE',
+            entity_type='ExpenseAlias',
+            entity_id=str(instance.id),
+            description=f'Expense alias deleted: {instance.name}',
+        )
+        instance.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class ColorPaletteListCreateView(APIView):

@@ -127,26 +127,40 @@ class TestExpenseLegMemoResolution:
 
 @pytest.mark.django_db
 class TestCashBankAccountSet:
-    def test_set_is_payment_method_accounts_not_every_asset(self, gl_accounts):
+    def test_set_is_the_cash_band_not_every_asset(self, gl_accounts):
         ids = cash_bank_account_ids()
         assert gl_accounts['cash'].id in ids
-        assert gl_accounts['undeposited'].id in ids
+        assert gl_accounts['bank'].id in ids
         # Assets that are not cash locations must stay out.
         assert gl_accounts['inventory_asset'].id not in ids
+        # …as must the iPos clearing account, retired by migration 0100 even
+        # though it sits in the band.
+        assert gl_accounts['legacy_clearing'].id not in ids
 
-    def test_inactive_payment_method_account_drops_out_unless_already_used(self, gl_accounts, expense_account):
-        retired_account = ChartOfAccountsFactory(
-            account_number=1102000, name='Bank Lama', account_type='asset',
+    def test_band_membership_does_not_depend_on_a_payment_method(self):
+        """An e-wallet account with no PaymentMethod pointing at it is still a
+        place money sits — the 11xxxxx band is the definition, not the set of
+        accounts some active payment method happens to reference."""
+        wallet = ChartOfAccountsFactory(
+            account_number=1102500, name='Gopay 1', account_type='asset',
         )
-        method = PaymentMethodFactory(name='Bank Lama', linked_account=retired_account)
-        assert retired_account.id in cash_bank_account_ids()
+        assert wallet.id in cash_bank_account_ids()
 
+        method = PaymentMethodFactory(name='Gopay 1', linked_account=wallet)
         method.is_active = False
         method.save(update_fields=['is_active'])
+        assert wallet.id in cash_bank_account_ids()
+
+    def test_retired_account_is_excluded_unless_already_used(self):
+        """Migration 0089 retires drained accounts with a name suffix (COA has
+        no is_active flag). Those must not be offered — but one already used to
+        pay an expense stays selectable so historical rows never fail
+        validation on edit."""
+        retired_account = ChartOfAccountsFactory(
+            account_number=1102001, name='Debit BCA (nonaktif)', account_type='asset',
+        )
         assert retired_account.id not in cash_bank_account_ids()
 
-        # …but an account already used to pay an expense stays selectable, so
-        # historical rows never fail validation on edit.
         Expense.objects.create(
             expense_date=datetime.date(2026, 7, 30),
             payment_account=retired_account, total_amount=Decimal('0'),

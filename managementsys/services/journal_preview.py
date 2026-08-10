@@ -96,6 +96,11 @@ def fingerprint_document(kind, obj) -> str:
         return _fingerprint([
             'invoice', obj.pk, obj.datetime, obj.grand_total, obj.tax,
             obj.additional_charges, obj.discount, obj.payment_method_id,
+            # obj.payment_account_id resolves the payment leg's GL account
+            # (see journal_engine._revenue_legs) — without it here, changing
+            # an invoice's bank account would not invalidate a staged preview
+            # entry, and commit would post the stale (wrong) account.
+            obj.payment_account_id,
             obj.warehouse_id, obj.is_voided, lines,
         ])
     if kind == 'purchase':

@@ -8,14 +8,14 @@ from ..models import (
     JAKARTA_TZ,
     AccountTransfer, ActivePatient, Appointment, AppointmentLocation, AppUser,
     AssessmentCode, AttendanceRecord, Beauticians,
-    ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
+    ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseAlias, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
     IssueTicket, IssueTicketImage, JournalEntry, JournalStagingBatch, LedgerEntry,
     MedRec, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
     PaymentMethod,
     ProductionRecipe, ProductionRecipeIngredient, ProductionRun, ProductionRunIngredient,
     Promotion, PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem,
-    PurchasePayment, SiteConfig,
+    PurchasePayment, ReportSettings, SiteConfig,
     SoapTemplate, StagedJournalEntry, StagedJournalLine, StaffSchedule, Supplier,
     Treatment, TreatmentCategory, TreatmentMaterial,
     TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift, patientStatus,
@@ -397,6 +397,11 @@ class ItemSyncSerializer(serializers.ModelSerializer):
             'id', 'code', 'name', 'selling_price',
             'unit_small', 'unit_medium', 'unit_medium_qty',
             'unit_large', 'unit_large_qty',
+            # The POS mirrors this payload into SQLite with an upsert that
+            # overwrites every column it knows about. It has category and
+            # legal_code columns, so leaving them out of the payload did not
+            # merely skip them — each sync wiped the local values to NULL.
+            'category', 'legal_code',
             'is_active', 'is_service', 'min_stock',
             'created_at', 'updated_at',
         ]
@@ -609,6 +614,10 @@ class InvoiceCreateSerializer(serializers.Serializer):
     datetime           = serializers.DateTimeField(required=False)
     patient_no         = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     payment_method_id  = serializers.IntegerField(required=False, allow_null=True)
+    # The direct cash/bank COA reference (design doc §3). payment_method_id is
+    # kept accepted for back-compat — Medya-Cashier POS still sends it — and
+    # the view resolves payment_account from it when this is omitted.
+    payment_account_id = serializers.IntegerField(required=False, allow_null=True)
     discount           = serializers.DecimalField(max_digits=14, decimal_places=2, default=0)
     cashier_id         = serializers.IntegerField(required=False, allow_null=True)
     warehouse_id       = serializers.IntegerField(required=False, allow_null=True)
@@ -629,6 +638,7 @@ class InvoiceUpdateSerializer(serializers.Serializer):
     datetime           = serializers.DateTimeField(required=False)
     patient_no         = serializers.CharField(required=False, allow_null=True, allow_blank=True)
     payment_method_id  = serializers.IntegerField(required=False, allow_null=True)
+    payment_account_id = serializers.IntegerField(required=False, allow_null=True)
     discount           = serializers.DecimalField(max_digits=14, decimal_places=2, required=False)
     cashier_id         = serializers.IntegerField(required=False, allow_null=True)
     warehouse_id       = serializers.IntegerField(required=False, allow_null=True)
@@ -660,12 +670,16 @@ class InvoiceItemReadSerializer(serializers.ModelSerializer):
 
 
 class InvoiceReadSerializer(serializers.ModelSerializer):
-    items                = InvoiceItemReadSerializer(many=True, read_only=True)
-    patient_name         = serializers.SerializerMethodField()
-    cashier_name         = serializers.SerializerMethodField()
-    warehouse_name       = serializers.SerializerMethodField()
-    payment_method_name  = serializers.SerializerMethodField()
-    voided_by_name       = serializers.CharField(source='voided_by.display_name', read_only=True, allow_null=True)
+    items                 = InvoiceItemReadSerializer(many=True, read_only=True)
+    patient_name          = serializers.SerializerMethodField()
+    cashier_name          = serializers.SerializerMethodField()
+    warehouse_name        = serializers.SerializerMethodField()
+    payment_method_name   = serializers.SerializerMethodField()
+    # The direct cash/bank COA (design doc §3). payment_method_id/_name stay in
+    # the payload unchanged — the Vercel push and the WinUI POS still read them.
+    payment_account_name  = serializers.SerializerMethodField()
+    payment_account_no    = serializers.SerializerMethodField()
+    voided_by_name        = serializers.CharField(source='voided_by.display_name', read_only=True, allow_null=True)
 
     class Meta:
         model = Invoice
@@ -673,6 +687,7 @@ class InvoiceReadSerializer(serializers.ModelSerializer):
             'id', 'invoice_number', 'datetime',
             'patient_no_id', 'patient_name',
             'payment_method_id', 'payment_method_name',
+            'payment_account_id', 'payment_account_name', 'payment_account_no',
             'discount', 'tax', 'additional_charges', 'grand_total',
             'cashier_id', 'cashier_name',
             'warehouse_id', 'warehouse_name',
@@ -691,6 +706,12 @@ class InvoiceReadSerializer(serializers.ModelSerializer):
 
     def get_payment_method_name(self, obj):
         return obj.payment_method.name if obj.payment_method_id else None
+
+    def get_payment_account_name(self, obj):
+        return obj.payment_account.name if obj.payment_account_id else None
+
+    def get_payment_account_no(self, obj):
+        return obj.payment_account.account_number if obj.payment_account_id else None
 
 
 # ── Payment Methods ────────────────────────────────────────────────────────
@@ -1405,6 +1426,73 @@ class SiteConfigSerializer(serializers.ModelSerializer):
                   "receipt_header_extra", "receipt_footer", "logo"]
 
 
+class ReportSettingsSerializer(serializers.ModelSerializer):
+    """Validates the tunable classification windows as a set, not field-by-field.
+
+    Each threshold is meaningless alone — a dead-months <= slow-months window
+    silently zeroes out the slow bucket, and a fast window as long as (or
+    longer than) the slow window lets one item land in both buckets at once.
+    Rejecting the whole payload with a field-keyed error, rather than
+    clamping, is deliberate: a manager who fat-fingers one of these numbers
+    should see exactly why, not have the report quietly reinterpret what they
+    typed. See docs/stock-movement-patient-activity-design.md §1.
+    """
+    class Meta:
+        model = ReportSettings
+        fields = [
+            'stock_fast_window_days', 'stock_fast_top_percent',
+            'stock_slow_months', 'stock_dead_months',
+            'patient_active_months', 'patient_inactive_months',
+            'updated_at',
+        ]
+        read_only_fields = ['updated_at']
+
+    _INT_FIELDS = (
+        'stock_fast_window_days', 'stock_fast_top_percent',
+        'stock_slow_months', 'stock_dead_months',
+        'patient_active_months', 'patient_inactive_months',
+    )
+
+    def validate(self, attrs):
+        # PATCH only carries the changed fields — merge onto the existing
+        # instance so the cross-field checks below see the values the row
+        # would actually have *after* saving, not just what this request sent.
+        merged = {
+            f: attrs.get(f, getattr(self.instance, f, None))
+            for f in self._INT_FIELDS
+        }
+
+        errors = {}
+        for f in self._INT_FIELDS:
+            if merged[f] is None:
+                errors[f] = 'Wajib diisi.'
+            elif merged[f] < 1:
+                errors[f] = 'Harus bernilai minimal 1.'
+        if 'stock_fast_top_percent' not in errors and merged['stock_fast_top_percent'] > 100:
+            errors['stock_fast_top_percent'] = 'Tidak boleh lebih dari 100.'
+
+        if not errors:
+            if merged['stock_dead_months'] <= merged['stock_slow_months']:
+                errors['stock_dead_months'] = (
+                    'Harus lebih besar dari stock_slow_months — jika tidak, kategori '
+                    'lambat (slow) tidak akan pernah terisi.'
+                )
+            if merged['patient_inactive_months'] <= merged['patient_active_months']:
+                errors['patient_inactive_months'] = (
+                    'Harus lebih besar dari patient_active_months — jika tidak, kategori '
+                    'kurang aktif (lapsing) tidak akan pernah terisi.'
+                )
+            if merged['stock_fast_window_days'] >= merged['stock_slow_months'] * 30:
+                errors['stock_fast_window_days'] = (
+                    'Harus lebih pendek dari stock_slow_months * 30 hari — jika tidak, '
+                    'sebuah item bisa masuk kategori cepat (fast) dan lambat (slow) sekaligus.'
+                )
+
+        if errors:
+            raise serializers.ValidationError(errors)
+        return attrs
+
+
 # ── Accounting serializers ─────────────────────────────────────────────────────
 
 class SupplierSerializer(serializers.ModelSerializer):
@@ -1453,23 +1541,68 @@ class PurchaseInvoiceItemSerializer(serializers.ModelSerializer):
         return str(obj.quantity * obj.unit_cost - obj.total_discount)
 
 
-class PurchasePaymentSerializer(serializers.ModelSerializer):
-    payment_method_name = serializers.CharField(source='payment_method.name', read_only=True)
-    payment_account_no  = serializers.IntegerField(source='payment_method.linked_account.account_number', read_only=True)
-    created_by_name     = serializers.CharField(source='created_by.display_name', read_only=True, allow_null=True)
+def _purchase_cash_account(obj):
+    """The cash/bank COA a purchase invoice or payment settled from.
+
+    ``payment_account`` for anything written since the cash-account picker
+    landed; the legacy method's ``linked_account`` for older rows the backfill
+    could not resolve.
+    """
+    if obj.payment_account_id:
+        return obj.payment_account
+    if obj.payment_method_id:
+        return obj.payment_method.linked_account
+    return None
+
+
+class PurchaseCashAccountMixin:
+    """Getters for the three cash-account fields shared by the purchase invoice
+    and purchase payment serializers.
+
+    ``payment_account_name``/``payment_account_no`` name the *account* the money
+    moved from — they used to name the PaymentMethod, which stopped being the
+    source of truth once purchases started paying from a cash account directly.
+    ``cash_account`` is that account's pk, for the picker.
+
+    Only the methods live here: DRF's metaclass collects declared fields from a
+    class's own attrs and from serializer bases, so a plain mixin's field
+    declarations would be silently dropped. Each serializer declares its own.
+    """
+
+    def get_cash_account(self, obj):
+        acct = _purchase_cash_account(obj)
+        return acct.id if acct else None
+
+    def get_payment_account_name(self, obj):
+        acct = _purchase_cash_account(obj)
+        return acct.name if acct else None
+
+    def get_payment_account_no(self, obj):
+        acct = _purchase_cash_account(obj)
+        return acct.account_number if acct else None
+
+
+class PurchasePaymentSerializer(PurchaseCashAccountMixin, serializers.ModelSerializer):
+    cash_account         = serializers.SerializerMethodField()
+    payment_account_name = serializers.SerializerMethodField()
+    payment_account_no   = serializers.SerializerMethodField()
+    payment_method_name  = serializers.CharField(source='payment_method.name', read_only=True, allow_null=True)
+    created_by_name      = serializers.CharField(source='created_by.display_name', read_only=True, allow_null=True)
 
     class Meta:
         model = PurchasePayment
         fields = [
             'id', 'payment_date', 'payment_method', 'payment_method_name',
-            'payment_account_no', 'amount', 'notes', 'created_at', 'created_by_name',
+            'cash_account', 'payment_account_name', 'payment_account_no',
+            'amount', 'notes', 'created_at', 'created_by_name',
         ]
 
 
-class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
+class PurchaseInvoiceListSerializer(PurchaseCashAccountMixin, serializers.ModelSerializer):
     supplier_name        = serializers.CharField(source='supplier.name', read_only=True)
-    payment_account_name = serializers.CharField(source='payment_method.name', read_only=True, allow_null=True)
-    payment_account_no   = serializers.IntegerField(source='payment_method.linked_account.account_number', read_only=True, allow_null=True)
+    cash_account         = serializers.SerializerMethodField()
+    payment_account_name = serializers.SerializerMethodField()
+    payment_account_no   = serializers.SerializerMethodField()
     warehouse_name       = serializers.CharField(source='warehouse.name', read_only=True, allow_null=True)
     balance_due          = serializers.SerializerMethodField()
     last_payment_date    = serializers.SerializerMethodField()
@@ -1480,7 +1613,7 @@ class PurchaseInvoiceListSerializer(serializers.ModelSerializer):
         model = PurchaseInvoice
         fields = [
             'id', 'internal_id', 'external_invoice_no', 'supplier', 'supplier_name',
-            'payment_method', 'payment_account_name', 'payment_account_no',
+            'payment_method', 'cash_account', 'payment_account_name', 'payment_account_no',
             'warehouse', 'warehouse_name',
             'purchase_date', 'due_date', 'status', 'total_amount', 'amount_paid',
             'balance_due', 'last_payment_date', 'notes', 'invoice_image_url', 'created_at',
@@ -1514,13 +1647,42 @@ class PurchaseInvoiceDetailSerializer(PurchaseInvoiceListSerializer):
         fields = PurchaseInvoiceListSerializer.Meta.fields + ['items', 'additional_costs', 'payments']
 
 
+class ExpenseAliasSerializer(serializers.ModelSerializer):
+    """A friendly, staff-facing name for an expense GL account (design §4).
+
+    ``account_name``/``account_number`` are read-only lookups for display; the
+    manager admin picks ``account`` itself from the expense/cogs COA range
+    (enforced by the model's ``limit_choices_to``, not repeated here).
+    """
+    account_name   = serializers.CharField(source='account.name', read_only=True)
+    account_number = serializers.IntegerField(source='account.account_number', read_only=True)
+
+    class Meta:
+        model = ExpenseAlias
+        fields = [
+            'id', 'name', 'account', 'account_name', 'account_number',
+            'scope', 'is_active', 'sort_order', 'notes',
+        ]
+
+
 class ExpenseItemSerializer(serializers.ModelSerializer):
     account_name   = serializers.CharField(source='account.name', read_only=True, allow_null=True)
     account_number = serializers.IntegerField(source='account.account_number', read_only=True, allow_null=True)
+    # Provenance only (Expense.alias is SET_NULL) — account/description above
+    # remain the record of truth even after an alias is retired.
+    alias_id       = serializers.SerializerMethodField()
+    alias_name     = serializers.SerializerMethodField()
 
     class Meta:
         model = ExpenseItem
-        fields = ['id', 'account', 'account_name', 'account_number', 'description', 'amount']
+        fields = ['id', 'account', 'account_name', 'account_number', 'description', 'amount',
+                  'alias_id', 'alias_name']
+
+    def get_alias_id(self, obj):
+        return obj.alias_id
+
+    def get_alias_name(self, obj):
+        return obj.alias.name if obj.alias_id else None
 
 
 class ExpenseSerializer(serializers.ModelSerializer):
@@ -1554,7 +1716,7 @@ class ExpenseSerializer(serializers.ModelSerializer):
             'id', 'expense_date', 'payment_method',
             'payment_method_name', 'payment_account_no',
             'cash_account', 'cash_account_name', 'cash_account_number', 'payment_memo',
-            'status', 'total_amount', 'amount_paid', 'balance_due',
+            'status', 'source', 'total_amount', 'amount_paid', 'balance_due',
             'notes', 'posting_status', 'created_at', 'created_by_name', 'items',
             'resolved_legs',
         ]
@@ -1606,6 +1768,32 @@ class ExpenseSerializer(serializers.ModelSerializer):
             })
 
         return legs
+
+
+class BeauticianExpenseItemInputSerializer(serializers.Serializer):
+    """One petty-cash line: an alias pick + amount, nothing that names a GL
+    account — see views.beautician_expense_page for the alias→account resolve."""
+    alias_id    = serializers.IntegerField()
+    amount      = serializers.DecimalField(max_digits=14, decimal_places=2)
+    description = serializers.CharField(required=False, allow_blank=True, default='')
+
+    def validate_amount(self, value):
+        if value <= 0:
+            raise serializers.ValidationError('Jumlah harus lebih besar dari 0.')
+        return value
+
+
+class BeauticianExpenseCreateSerializer(serializers.Serializer):
+    expense_date       = serializers.DateField()
+    payment_account_id = serializers.IntegerField()
+    payment_memo       = serializers.CharField(required=False, allow_blank=True, default='')
+    notes              = serializers.CharField(required=False, allow_blank=True, default='')
+    items               = BeauticianExpenseItemInputSerializer(many=True)
+
+    def validate_items(self, value):
+        if not value:
+            raise serializers.ValidationError('Minimal satu baris pengeluaran diperlukan.')
+        return value
 
 
 class AccountTransferSerializer(serializers.ModelSerializer):

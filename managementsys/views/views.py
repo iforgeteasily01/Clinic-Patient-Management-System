@@ -41,6 +41,13 @@ from .admin_views import (
     PaymentMethodListCreateView, PaymentMethodDetailView,
     SiteConfigView,
     ColorPaletteListCreateView, ColorPaletteDetailView,
+    ReportSettingsView,
+    ExpenseAliasListCreateView, ExpenseAliasDetailView,
+)
+from .stock_movement_report import StockMovementReportView, StockMovementExportView
+from .patient_activity_report import PatientActivityReportView, PatientActivityExportView
+from .beautician_expense_page import (
+    BeauticianExpenseAliasListView, BeauticianExpenseListCreateView, BeauticianExpenseDetailView,
 )
 from .appointments_scheduled import (
     ScheduledAppointmentListCreateView,
