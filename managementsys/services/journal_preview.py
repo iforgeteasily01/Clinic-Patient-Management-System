@@ -93,6 +93,10 @@ def fingerprint_document(kind, obj) -> str:
     """
     if kind == 'invoice':
         lines = list(obj.items.values_list('item_id', 'item_name', 'quantity', 'price'))
+        # Split payments are part of the entry's debit side — editing one changes
+        # which accounts get debited without touching any scalar below.
+        splits = list(obj.payments.values_list(
+            'payment_account_id', 'payment_method_id', 'amount', 'sort_order'))
         return _fingerprint([
             'invoice', obj.pk, obj.datetime, obj.grand_total, obj.tax,
             obj.additional_charges, obj.discount, obj.payment_method_id,
@@ -101,7 +105,7 @@ def fingerprint_document(kind, obj) -> str:
             # an invoice's bank account would not invalidate a staged preview
             # entry, and commit would post the stale (wrong) account.
             obj.payment_account_id,
-            obj.warehouse_id, obj.is_voided, lines,
+            obj.warehouse_id, obj.is_voided, lines, splits,
         ])
     if kind == 'purchase':
         lines = list(obj.items.values_list(

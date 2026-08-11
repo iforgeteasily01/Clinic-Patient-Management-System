@@ -22,7 +22,7 @@ from django.urls import reverse
 from django.utils import timezone
 
 from managementsys.models import (
-    ChartOfAccounts, LedgerEntry, PurchaseInvoice, Supplier,
+    ChartOfAccounts, InventoryBatch, LedgerEntry, PurchaseInvoice, Supplier,
 )
 
 from .factories import ChartOfAccountsFactory
@@ -396,6 +396,131 @@ class TestPurchaseRoundTrips:
         assert supplier.ap_account.balance == Decimal('0')
         assert _bal(1300000) == Decimal('0')
         _assert_balanced()
+
+
+@pytest.mark.django_db
+class TestPurchaseRestore:
+    """Un-voiding a cancelled purchase must put back exactly what the void took
+    — the stock, and (only when the invoice had been posted) the accrual."""
+
+    def _create(self, auth_api, supplier, stock, gl_accounts, **kw):
+        res = auth_api.post(
+            reverse('accounting-purchases'),
+            _stock_payload(supplier, gl_accounts['cash_method'], stock['warehouse'],
+                           stock['item'], qty=10, cost=1000, **kw),
+            format='json',
+        )
+        assert res.status_code == 201, res.content
+        return PurchaseInvoice.objects.latest('id')
+
+    def test_restore_unposted_returns_stock_without_touching_the_journal(
+        self, auth_api, supplier, stock, gl_accounts,
+    ):
+        invoice = self._create(auth_api, supplier, stock, gl_accounts)
+        auth_api.delete(reverse('accounting-purchase-detail', args=[invoice.id]))
+        assert not InventoryBatch.objects.filter(purchase_invoice=invoice).exists()
+
+        res = auth_api.post(reverse('accounting-purchase-restore', args=[invoice.id]))
+        assert res.status_code == 200, res.content
+
+        invoice.refresh_from_db()
+        assert invoice.is_voided is False
+        assert invoice.voided_at is None and invoice.voided_by_id is None
+
+        batch = InventoryBatch.objects.get(purchase_invoice=invoice)
+        assert batch.quantity_initial == Decimal('10')
+        assert batch.quantity_remaining == Decimal('10')
+        assert batch.value == Decimal('10000')
+        assert str(batch.input_date) == '2026-07-30'
+
+        # Never posted → nothing was reversed, so nothing is re-posted either.
+        assert not LedgerEntry.objects.filter(purchase_invoice=invoice).exists()
+
+        # And the deferred sweep still picks it up, exactly as if it had never
+        # been voided.
+        _run_journal(auth_api)
+        supplier.refresh_from_db()
+        assert supplier.ap_account.balance == Decimal('10000')
+        assert _bal(1300000) == Decimal('10000')
+        _assert_balanced()
+
+    def test_restore_posted_reinstates_the_accrual(
+        self, auth_api, supplier, stock, gl_accounts,
+    ):
+        invoice = self._create(auth_api, supplier, stock, gl_accounts)
+        _run_journal(auth_api)
+        auth_api.delete(reverse('accounting-purchase-detail', args=[invoice.id]))
+        supplier.refresh_from_db()
+        assert supplier.ap_account.balance == Decimal('0')
+
+        res = auth_api.post(reverse('accounting-purchase-restore', args=[invoice.id]))
+        assert res.status_code == 200, res.content
+
+        supplier.refresh_from_db()
+        assert supplier.ap_account.balance == Decimal('10000')
+        assert _bal(1300000) == Decimal('10000')
+        _assert_balanced()
+
+        # The original transaction-date rows are untouched; the repair is a
+        # same-day memo.
+        today = timezone.now().date()
+        memo = LedgerEntry.objects.filter(purchase_invoice=invoice, source_type='restore_memo')
+        assert memo.exists()
+        assert all(e.date == today for e in memo)
+        assert LedgerEntry.objects.filter(
+            purchase_invoice=invoice, source_type='purchase',
+            date=datetime.date(2026, 7, 30),
+        ).exists()
+
+    def test_void_restore_void_lands_back_on_zero(
+        self, auth_api, supplier, stock, gl_accounts,
+    ):
+        """The second void must reverse the *net* state, not the original rows
+        a second time."""
+        invoice = self._create(auth_api, supplier, stock, gl_accounts)
+        _run_journal(auth_api)
+        url = reverse('accounting-purchase-detail', args=[invoice.id])
+
+        auth_api.delete(url)
+        assert auth_api.post(
+            reverse('accounting-purchase-restore', args=[invoice.id])
+        ).status_code == 200
+        assert auth_api.delete(url).status_code == 200
+
+        supplier.refresh_from_db()
+        assert supplier.ap_account.balance == Decimal('0')
+        assert _bal(1300000) == Decimal('0')
+        assert not InventoryBatch.objects.filter(purchase_invoice=invoice).exists()
+        _assert_balanced()
+
+    def test_edit_after_restore_stays_value_neutral(
+        self, auth_api, supplier, stock, gl_accounts,
+    ):
+        invoice = self._create(auth_api, supplier, stock, gl_accounts)
+        _run_journal(auth_api)
+        url = reverse('accounting-purchase-detail', args=[invoice.id])
+        auth_api.delete(url)
+        auth_api.post(reverse('accounting-purchase-restore', args=[invoice.id]))
+
+        res = auth_api.put(
+            url,
+            _stock_payload(supplier, gl_accounts['cash_method'], stock['warehouse'],
+                           stock['item'], qty=20, cost=1000),
+            format='json',
+        )
+        assert res.status_code == 200, res.content
+        supplier.refresh_from_db()
+        assert supplier.ap_account.balance == Decimal('20000')
+        assert _bal(1300000) == Decimal('20000')
+        _assert_balanced()
+
+    def test_restoring_a_live_invoice_is_refused(
+        self, auth_api, supplier, stock, gl_accounts,
+    ):
+        invoice = self._create(auth_api, supplier, stock, gl_accounts)
+        res = auth_api.post(reverse('accounting-purchase-restore', args=[invoice.id]))
+        assert res.status_code == 400, res.content
+        assert InventoryBatch.objects.filter(purchase_invoice=invoice).count() == 1
 
 
 # ── Backfill command ────────────────────────────────────────────────────────

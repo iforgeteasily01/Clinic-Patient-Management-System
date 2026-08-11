@@ -8,7 +8,7 @@ from ..models import (
     JAKARTA_TZ,
     AccountTransfer, ActivePatient, Appointment, AppointmentLocation, AppUser,
     AssessmentCode, AttendanceRecord, Beauticians,
-    ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseAlias, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem,
+    ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseAlias, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem, InvoicePayment,
     IssueTicket, IssueTicketImage, JournalEntry, JournalStagingBatch, LedgerEntry,
     MedRec, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
@@ -610,6 +610,24 @@ class InvoiceItemInputSerializer(serializers.Serializer):
     treatment_id              = serializers.IntegerField(required=False, allow_null=True)
 
 
+class InvoicePaymentInputSerializer(serializers.Serializer):
+    """One tender of a split payment. Send at least one of the two ids.
+
+    Amounts are what each method settles against the invoice — not what the
+    patient handed over — so they must sum to ``grand_total``; change is the
+    cashier's arithmetic, not the ledger's.
+    """
+    payment_method_id  = serializers.IntegerField(required=False, allow_null=True)
+    payment_account_id = serializers.IntegerField(required=False, allow_null=True)
+    amount             = serializers.DecimalField(max_digits=14, decimal_places=2)
+
+    def validate(self, attrs):
+        if not attrs.get('payment_method_id') and not attrs.get('payment_account_id'):
+            raise serializers.ValidationError(
+                'Each payment needs payment_method_id or payment_account_id.')
+        return attrs
+
+
 class InvoiceCreateSerializer(serializers.Serializer):
     datetime           = serializers.DateTimeField(required=False)
     patient_no         = serializers.CharField(required=False, allow_null=True, allow_blank=True)
@@ -627,6 +645,9 @@ class InvoiceCreateSerializer(serializers.Serializer):
     notes              = serializers.CharField(required=False, allow_blank=True, default='')
     promotion_code     = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     items              = InvoiceItemInputSerializer(many=True)
+    # Split payment. Omit for the ordinary one-method invoice — payment_method_id
+    # / payment_account_id above still describe it on their own.
+    payments           = InvoicePaymentInputSerializer(many=True, required=False)
 
     def validate_items(self, value):
         if not value:
@@ -646,6 +667,9 @@ class InvoiceUpdateSerializer(serializers.Serializer):
     additional_charges = serializers.DecimalField(max_digits=14, decimal_places=2, required=False)
     grand_total        = serializers.DecimalField(max_digits=14, decimal_places=2, required=False)
     items              = InvoiceItemInputSerializer(many=True, required=False)
+    # Present = replace the split rows wholesale (an empty list clears them and
+    # returns the invoice to a single-method payment). Absent = leave as they are.
+    payments           = InvoicePaymentInputSerializer(many=True, required=False)
 
     def validate_items(self, value):
         if value is not None and len(value) == 0:
@@ -669,8 +693,25 @@ class InvoiceItemReadSerializer(serializers.ModelSerializer):
         fields = ['id', 'item_id', 'item_code', 'item_name', 'quantity', 'price', 'discount_pct']
 
 
+class InvoicePaymentReadSerializer(serializers.ModelSerializer):
+    payment_method_name  = serializers.CharField(source='payment_method.name', read_only=True, allow_null=True)
+    payment_account_name = serializers.CharField(source='payment_account.name', read_only=True, allow_null=True)
+    payment_account_no   = serializers.IntegerField(source='payment_account.account_number', read_only=True, allow_null=True)
+
+    class Meta:
+        model = InvoicePayment
+        fields = [
+            'id', 'payment_method_id', 'payment_method_name',
+            'payment_account_id', 'payment_account_name', 'payment_account_no',
+            'amount', 'sort_order',
+        ]
+
+
 class InvoiceReadSerializer(serializers.ModelSerializer):
     items                 = InvoiceItemReadSerializer(many=True, read_only=True)
+    # Empty for a single-method invoice — payment_method_* / payment_account_*
+    # below describe those in full.
+    payments              = InvoicePaymentReadSerializer(many=True, read_only=True)
     patient_name          = serializers.SerializerMethodField()
     cashier_name          = serializers.SerializerMethodField()
     warehouse_name        = serializers.SerializerMethodField()
@@ -692,7 +733,7 @@ class InvoiceReadSerializer(serializers.ModelSerializer):
             'cashier_id', 'cashier_name',
             'warehouse_id', 'warehouse_name',
             'is_voided', 'voided_at', 'voided_by_name',
-            'items',
+            'items', 'payments',
         ]
 
     def get_patient_name(self, obj):

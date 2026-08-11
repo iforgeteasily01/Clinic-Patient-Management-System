@@ -383,7 +383,34 @@ def _revenue_legs(invoice, lines):
                     or (invoice.payment_method.linked_account if invoice.payment_method_id else None)
                     or _sysacct(ACC_LEGACY_CLEARING)
                     or _sysacct(ACC_CASH))
-    if payment_acct and invoice.grand_total:
+
+    # A split payment carries one InvoicePayment row per tender, and each one
+    # debits its own cash/bank account. Collapsing them onto the first method's
+    # account (which is what the invoice-level payment_account describes) would
+    # overstate that account and leave the others at nil. Any rounding remainder
+    # between the rows and grand_total still lands on the invoice-level account
+    # so the entry stays balanced without silently inflating Sales Discount.
+    splits = list(invoice.payments.select_related(
+        'payment_account', 'payment_method__linked_account'))
+    if splits and invoice.grand_total:
+        allocated = Decimal('0')
+        for sp in splits:
+            if not sp.amount:
+                continue
+            acct = (sp.payment_account
+                    or (sp.payment_method.linked_account if sp.payment_method_id else None)
+                    or payment_acct)
+            if not acct:
+                continue
+            label = sp.payment_method.name if sp.payment_method_id else acct.name
+            legs.append((acct, 'debit', sp.amount,
+                         f'Invoice {inv_no} – Payment received ({label})'))
+            allocated += sp.amount
+        remainder = invoice.grand_total - allocated
+        if remainder and payment_acct:
+            legs.append((payment_acct, 'debit' if remainder > 0 else 'credit', abs(remainder),
+                         f'Invoice {inv_no} – Payment received'))
+    elif payment_acct and invoice.grand_total:
         legs.append((payment_acct, 'debit', invoice.grand_total,
                      f'Invoice {inv_no} – Payment received'))
 

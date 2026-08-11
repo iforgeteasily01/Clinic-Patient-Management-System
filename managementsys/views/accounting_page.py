@@ -68,6 +68,7 @@ from ..services.journal_engine import (
     is_date_posted, legset_from_entry, post_account_transfer, reserve_entry_numbers,
     reverse_legset, write_legs,
 )
+from .reports_page import payment_method_breakdown
 
 
 NOT_A_CASH_ACCOUNT = 'Rekening yang dipilih bukan rekening kas/bank.'
@@ -1076,9 +1077,12 @@ class PurchaseInvoiceDetailView(APIView):
             # original accrual AND any earlier edit-memo correction — so a
             # second (or third) edit re-derives the full state from scratch
             # instead of layering an incremental delta on top of a stale one.
+            # *Every* row attached to the invoice, memos included: their sum is
+            # its current posted state, so reversing all of them nets it to
+            # zero. (A restored invoice carries a void_memo/restore_memo pair;
+            # skipping the void_memo would leave its reversal stranded.)
             old_entries = list(
                 LedgerEntry.objects.filter(purchase_invoice=obj)
-                .exclude(source_type='void_memo')
                 .select_related('account')
             )
             for e in old_entries:
@@ -1138,14 +1142,15 @@ class PurchaseInvoiceDetailView(APIView):
         # Phase 2: an unposted invoice has no LedgerEntry rows at all (posting
         # is deferred until a journal run), so this loop is naturally a no-op
         # for it — void with zero journal impact, as required. A posted
-        # invoice's rows (the original accrual AND any earlier edit-memo
-        # correction — everything currently in effect) are reversed here as a
+        # invoice's rows (the original accrual AND any earlier edit-, void- or
+        # restore-memo — everything currently in effect) are reversed here as a
         # same-day "void memo" (dated today, tagged source_type='void_memo'),
         # leaving the original transaction date's rows and JournalDayLog
-        # untouched. Safe either way: the guard above refused any paid invoice.
+        # untouched. Reversing the whole set is what makes the net zero, so an
+        # invoice voided → restored → voided again lands back on nothing.
+        # Safe either way: the guard above refused any paid invoice.
         for e in list(
             LedgerEntry.objects.filter(purchase_invoice=obj)
-            .exclude(source_type='void_memo')
             .select_related('account')
         ):
             opp = 'credit' if e.entry_type == 'debit' else 'debit'
@@ -1168,6 +1173,130 @@ class PurchaseInvoiceDetailView(APIView):
             description=f'Purchase invoice voided: {internal_id} — inventory reversed, journal updated',
         )
         return Response(PurchaseInvoiceDetailSerializer(obj, context={'request': request}).data)
+
+
+class PurchaseInvoiceRestoreView(APIView):
+    """
+    POST /api/accounting/purchases/<pk>/restore/
+
+    Un-void a cancelled purchase invoice — the inverse of ``DELETE`` on the
+    detail view. The record itself was never deleted, so nothing is re-entered:
+    the stored lines, costs and totals come back as they were, under the same
+    ``internal_id``.
+
+    Two effects to undo:
+
+    * **Stock.** The void deleted this invoice's inventory batches, and it could
+      only do so because none of them had been consumed. They are recreated
+      here from the saved lines at their ``actual_unit_cost``, dated the
+      original ``purchase_date`` so FIFO order is unchanged.
+    * **Journal.** An invoice that was never posted has no ledger rows at all —
+      restoring it is a pure no-op there, and the next journal run sweeps it
+      (``is_voided=False`` is in the sweep filter). A posted one gets a same-day
+      "restore memo": every row currently attached to the invoice is reversed
+      (their sum *is* the current state, so this nets it to zero) and the
+      accrual is re-posted, all dated today and tagged
+      ``source_type='restore_memo'``. The original transaction date's rows and
+      ``JournalDayLog`` are left untouched, exactly as the void/edit memos do.
+    """
+
+    @transaction.atomic
+    def post(self, request, pk):
+        try:
+            invoice = PurchaseInvoice.objects.select_related(
+                'supplier', 'supplier__ap_account',
+            ).get(pk=pk)
+        except PurchaseInvoice.DoesNotExist:
+            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not invoice.is_voided:
+            return Response(
+                {'error': 'Faktur ini tidak dibatalkan.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        items = list(invoice.items.all())
+        if not items:
+            return Response(
+                {'error': 'Faktur tanpa baris tidak dapat dipulihkan.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # A void is refused while any payment exists, so a voided invoice can
+        # only be unpaid. If that ever stops holding, restoring would re-post
+        # the accrual without the payment legs — refuse instead of guessing.
+        if invoice.amount_paid > 0:
+            return Response(
+                {'error': 'Faktur dengan pembayaran tidak dapat dipulihkan.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        today = timezone.now().date()
+
+        # Put the stock back. The void left no batches behind; the delete is
+        # defensive so a half-finished earlier attempt cannot double the stock.
+        invoice.inventory_batches.all().delete()
+        for it in items:
+            if (it.line_type != 'stock' or not it.item_id
+                    or not it.warehouse_id or it.quantity <= 0):
+                continue
+            InventoryBatch.objects.create(
+                item_id=it.item_id,
+                warehouse_id=it.warehouse_id,
+                input_date=invoice.purchase_date,
+                quantity_initial=it.quantity,
+                quantity_remaining=it.quantity,
+                value=it.actual_unit_cost * it.quantity,
+                purchase_invoice=invoice,
+            )
+
+        # Rebuild the (parsed, item_objs) pair the accrual builder expects,
+        # straight from the stored lines — same order, so build_purchase_legs
+        # can zip them. Nothing is recomputed: the totals were frozen when the
+        # invoice was created or last edited.
+        parsed = [{
+            'line_type':       it.line_type,
+            'item_id':         it.item_id,
+            'item_name':       it.item_name,
+            'quantity':        it.quantity,
+            'unit':            it.unit,
+            'unit_cost':       it.unit_cost,
+            'total_discount':  it.total_discount,
+            'adjusted_sub':    it.quantity * it.unit_cost - it.total_discount,
+            'expense_acct_id': it.expense_account_id,
+            'warehouse_id':    it.warehouse_id,
+        } for it in items]
+
+        existing = list(
+            LedgerEntry.objects.filter(purchase_invoice=invoice).select_related('account')
+        )
+        if existing:
+            for e in existing:
+                opp = 'credit' if e.entry_type == 'debit' else 'debit'
+                _post_le(e.account, opp, e.amount, invoice,
+                         f'Pemulihan {invoice.internal_id}: {e.description}',
+                         today, source_type='restore_memo')
+            _post_purchase_accrual(
+                invoice, parsed, items, invoice.supplier, invoice.total_amount,
+                post_date=today, source_type='restore_memo',
+            )
+
+        invoice.is_voided = False
+        invoice.voided_at = None
+        invoice.voided_by = None
+        invoice.save(update_fields=['is_voided', 'voided_at', 'voided_by'])
+
+        AuditLog.objects.create(
+            performed_by=_actor(request),
+            action='RESTORE',
+            entity_type='PurchaseInvoice',
+            entity_id=str(invoice.pk),
+            description=f'Purchase invoice restored: {invoice.internal_id} — '
+                        f'inventory returned, journal updated',
+        )
+        return Response(
+            PurchaseInvoiceDetailSerializer(invoice, context={'request': request}).data
+        )
 
 
 class PurchaseInvoicePayView(APIView):
@@ -3152,28 +3281,23 @@ class DailySalesView(APIView):
         )
 
         grand_total = Decimal('0')
-        by_account: dict = {}
         total_count = 0
-
         for inv in invoices:
             grand_total += inv.grand_total
             total_count += 1
-            pm = inv.payment_method
-            key = pm.id if pm else 0
-            if key not in by_account:
-                by_account[key] = {
-                    'account_id':     pm.id                                  if pm else None,
-                    'account_number': pm.linked_account.account_number       if pm else None,
-                    'account_name':   pm.name                                if pm else 'Tidak Diketahui',
-                    'total':          Decimal('0'),
-                    'invoice_count':  0,
-                }
-            by_account[key]['total']         += inv.grand_total
-            by_account[key]['invoice_count'] += 1
 
-        breakdown = sorted(by_account.values(), key=lambda x: -x['total'])
-        for row in breakdown:
-            row['total'] = str(row['total'])
+        # Split payments are broken out per method rather than heaped onto the
+        # first one — this report is what the drawer gets counted against.
+        breakdown = [
+            {
+                'account_id':     r['payment_method_id'],
+                'account_number': r['account_number'],
+                'account_name':   r['method'],
+                'total':          str(r['total']),
+                'invoice_count':  r['invoice_count'],
+            }
+            for r in payment_method_breakdown(invoices)
+        ]
 
         return Response({
             'date':          str(target_date),

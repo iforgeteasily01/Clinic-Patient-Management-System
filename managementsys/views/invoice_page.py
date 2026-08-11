@@ -18,6 +18,7 @@ from ..api.serializers import (
 )
 from ..models import (
     AppUser, AuditLog, ChartOfAccounts, InventoryItem, Invoice, InvoiceItem,
+    InvoicePayment,
     LedgerEntry, Patient, PatientPackage, PatientPackageRedemption, PaymentMethod,
     PromotionUsage, Treatment, TreatmentPackage, Warehouse,
 )
@@ -46,6 +47,71 @@ ITEM_HEADERS = ['invoice_number','item_code','item_name','quantity','price']
 
 def _actor(request):
     return request.user if isinstance(request.user, AppUser) else None
+
+
+class PaymentSplitError(Exception):
+    """Raised by _resolve_payment_splits with the DRF error body to return."""
+
+    def __init__(self, detail):
+        super().__init__(detail)
+        self.detail = detail
+
+
+def _resolve_payment_splits(payments, grand_total):
+    """Validate split-payment input and resolve it to unsaved InvoicePayment rows.
+
+    Returns every tender in order. The caller takes the first for the invoice's
+    own ``payment_method`` / ``payment_account`` fields, and only *persists* the
+    rows when there are two or more — a single tender is fully described by
+    those scalars, and storing it as a row would make every one-method invoice
+    look like a split to any reader that checks for one.
+
+    Raises ``PaymentSplitError`` on anything that would post an unbalanced or
+    unroutable entry — an unknown method, a non-cash account, or amounts that do
+    not sum to ``grand_total``. The last one is the important one: these rows are
+    the debit side of the journal entry, so if the POS sends cash tendered
+    instead of cash applied, the entry silently lands the change in Sales
+    Discount. Better to reject it.
+    """
+    if not payments:
+        return []
+
+    cash_ids = cash_bank_account_ids()
+    rows = []
+    total = Decimal('0')
+
+    for idx, p in enumerate(payments):
+        method = None
+        if p.get('payment_method_id'):
+            method = PaymentMethod.objects.select_related('linked_account').filter(
+                pk=p['payment_method_id']).first()
+            if method is None:
+                raise PaymentSplitError(
+                    {'payments': [f'Payment method {p["payment_method_id"]} not found.']})
+
+        account = None
+        if p.get('payment_account_id'):
+            if p['payment_account_id'] not in cash_ids:
+                raise PaymentSplitError(
+                    {'payments': [f'Account {p["payment_account_id"]} is not a cash/bank account.']})
+            account = ChartOfAccounts.objects.filter(pk=p['payment_account_id']).first()
+        elif method is not None:
+            account = method.linked_account
+
+        amount = p['amount']
+        total += amount
+        rows.append(InvoicePayment(
+            payment_method=method, payment_account=account,
+            amount=amount, sort_order=idx,
+        ))
+
+    if abs(total - grand_total) > Decimal('0.01'):
+        raise PaymentSplitError({'payments': [
+            f'Payment amounts total {total}, which does not match grand_total '
+            f'{grand_total}. Send the amount each method settles, not the cash tendered.'
+        ]})
+
+    return rows
 
 
 # _le / _apply_balance / _revenue_legs / _post_legs and the ACC_* constants now
@@ -481,6 +547,23 @@ class InvoiceCreateView(APIView):
             # freshly created invoice is never write-only-legacy.
             payment_account_obj = payment_method_obj.linked_account
 
+        # ── Split payment (optional) ──────────────────────────────────────────
+        try:
+            tenders = _resolve_payment_splits(data.get('payments'), data['grand_total'])
+        except PaymentSplitError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+
+        # Only a genuine split is stored as rows; see _resolve_payment_splits.
+        split_rows = tenders if len(tenders) > 1 else []
+
+        if tenders:
+            # The invoice-level fields keep describing the first tender, so
+            # every existing reader (list filters, export, receipt, Vercel push)
+            # still sees a payment method. The split rows carry the rest.
+            first = tenders[0]
+            payment_method_obj  = payment_method_obj or first.payment_method
+            payment_account_obj = payment_account_obj or first.payment_account
+
         # ── Validate all inventory items exist before writing anything ────────
 
         item_ids = [i['item_id'] for i in data['items'] if i.get('item_id')]
@@ -527,6 +610,13 @@ class InvoiceCreateView(APIView):
             )
             for i in data['items']
         ])
+
+        # ── Split payment rows ────────────────────────────────────────────────
+
+        if split_rows:
+            for row in split_rows:
+                row.invoice = invoice
+            InvoicePayment.objects.bulk_create(split_rows)
 
         # ── Accounting + stock deduction ──────────────────────────────────────
         # Phase 2: journal posting is deferred. A brand-new invoice always
@@ -579,7 +669,7 @@ class InvoiceCreateView(APIView):
         invoice = (
             Invoice.objects
             .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
-            .prefetch_related('items__item')
+            .prefetch_related('items__item', 'payments__payment_method', 'payments__payment_account')
             .get(pk=invoice.pk)
         )
         return Response(
@@ -595,7 +685,7 @@ class InvoiceListView(APIView):
         qs = (
             Invoice.objects
             .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
-            .prefetch_related('items__item')
+            .prefetch_related('items__item', 'payments__payment_method', 'payments__payment_account')
             .order_by('-datetime')
         )
         if inv_no := request.GET.get('invoice_number', '').strip():
@@ -646,7 +736,7 @@ class InvoiceDetailView(APIView):
             return (
                 Invoice.objects
                 .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
-                .prefetch_related('items__item')
+                .prefetch_related('items__item', 'payments__payment_method', 'payments__payment_account')
                 .get(pk=pk)
             )
         except Invoice.DoesNotExist:
@@ -720,6 +810,21 @@ class InvoiceDetailView(APIView):
                               'Void the redeeming invoice first.'},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+        # ── Split payment (optional) ──────────────────────────────────────────
+        # Resolved up-front so a bad split is a 400 before anything is written,
+        # but the rows are only swapped in *after* the reversal below — the
+        # reversal rebuilds the old legs off invoice.payments and would unwind
+        # the new split instead of the posted one.
+        replacing_payments = 'payments' in data
+        new_tenders = []
+        if replacing_payments:
+            effective_total = data.get('grand_total', invoice.grand_total)
+            try:
+                new_tenders = _resolve_payment_splits(data['payments'], effective_total)
+            except PaymentSplitError as exc:
+                return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+        new_split_rows = new_tenders if len(new_tenders) > 1 else []
 
         # ── Capture old state before any modifications ────────────────────────
         old_scalars           = _snapshot_scalars(invoice)
@@ -855,6 +960,25 @@ class InvoiceDetailView(APIView):
                 memo_date=memo_date, source_type=memo_source,
             )
 
+        # Old legs are unwound; the new split can go in now. An edit that leaves
+        # `payments` out keeps whatever rows the invoice already had — if it also
+        # changed grand_total those rows no longer sum to it, and the engine puts
+        # the difference on the invoice-level payment account rather than
+        # silently misstating the split.
+        if replacing_payments:
+            invoice.payments.all().delete()
+            for row in new_split_rows:
+                row.invoice = invoice
+            InvoicePayment.objects.bulk_create(new_split_rows)
+            if new_tenders:
+                first = new_tenders[0]
+                if 'payment_method_id' not in data and first.payment_method_id:
+                    invoice.payment_method = first.payment_method
+                if 'payment_account_id' not in data and first.payment_account_id:
+                    invoice.payment_account = first.payment_account
+                invoice.save(update_fields=['payment_method', 'payment_account'])
+            changes.append('payments')
+
         if new_line_items_data is not None:
             _reverse_packages(invoice)
             if was_posted:
@@ -895,7 +1019,7 @@ class InvoiceDetailView(APIView):
         return Response(InvoiceReadSerializer(
             Invoice.objects
             .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
-            .prefetch_related('items__item')
+            .prefetch_related('items__item', 'payments__payment_method', 'payments__payment_account')
             .get(pk=pk)
         ).data)
 
@@ -969,7 +1093,7 @@ class InvoiceExportView(APIView):
         qs = (
             Invoice.objects
             .select_related('patient_no', 'cashier', 'warehouse', 'payment_method', 'payment_account')
-            .prefetch_related('items__item')
+            .prefetch_related('items__item', 'payments__payment_method', 'payments__payment_account')
             .order_by('-datetime')
         )
         if q := request.GET.get('q', '').strip():

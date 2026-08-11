@@ -15,9 +15,9 @@ document foreign key, and only where source_type is one of
 
 WHAT IT DELIBERATELY LEAVES ALONE
 ---------------------------------
-* void_memo / edit_memo — written synchronously by the void/edit endpoints and
-  dated the day of the void. A sweep NEVER recreates these; deleting them would
-  be permanent loss.
+* void_memo / edit_memo / restore_memo — written synchronously by the void,
+  edit and restore endpoints and dated the day of that action. A sweep NEVER
+  recreates these; deleting them would be permanent loss.
 * stock / opname / adjustment / manual — inventory movements and hand-written
   journal entries. Not the sweep's output either.
 * Voided documents — a voided invoice's original entries are balanced by a
@@ -52,7 +52,8 @@ from managementsys.models import (
 SWEEP_SOURCE_TYPES = ('invoice', 'purchase', 'transfer', 'expense')
 
 PROTECTED_SOURCE_TYPES = (
-    'void_memo', 'edit_memo', 'stock', 'opname', 'adjustment', 'manual',
+    'void_memo', 'edit_memo', 'restore_memo', 'stock', 'opname', 'adjustment',
+    'manual',
 )
 
 

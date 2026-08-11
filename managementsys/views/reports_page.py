@@ -1,6 +1,7 @@
 import datetime
 import io
 import os
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 import openpyxl
@@ -37,12 +38,74 @@ from ..models import (
     InventoryItem,
     Invoice,
     InvoiceItem,
+    InvoicePayment,
     PurchaseInvoice,
     SiteConfig,
     StockOutLog,
 )
 
 _JAKARTA = ZoneInfo('Asia/Jakarta')
+
+
+def payment_method_breakdown(invoices):
+    """Sales per payment method over ``invoices``, honouring split payments.
+
+    Grouping straight on ``Invoice.payment_method`` credits a split invoice's
+    whole grand total to whichever method the cashier picked first — the cash
+    drawer then reads high by the part that went to the bank, which is exactly
+    what the cashier is trying to reconcile. So: invoices with no split rows are
+    summed on their own method as before, and split invoices are summed from
+    their ``InvoicePayment`` rows instead.
+
+    ``invoice_count`` counts an invoice once per method it touched, so the counts
+    across methods can exceed the number of invoices in the range.
+
+    Returns ``[{'payment_method_id', 'method', 'account_number', 'total',
+    'invoice_count'}]``, largest first, with ``total`` as a Decimal.
+    """
+    split_invoice_ids = set(
+        InvoicePayment.objects
+        .filter(invoice__in=invoices)
+        .values_list('invoice_id', flat=True)
+    )
+
+    rows = {}
+
+    def add(method_id, name, account_number, total, count):
+        row = rows.setdefault(method_id, {
+            'payment_method_id': method_id,
+            'method': name or 'Tidak Diketahui',
+            'account_number': account_number,
+            'total': Decimal('0'),
+            'invoice_count': 0,
+        })
+        row['total'] += total or Decimal('0')
+        row['invoice_count'] += count
+
+    unsplit = (
+        invoices.exclude(id__in=split_invoice_ids)
+        .values('payment_method_id', 'payment_method__name',
+                'payment_method__linked_account__account_number')
+        .annotate(total=Sum('grand_total'), invoice_count=Count('id'))
+    )
+    for r in unsplit:
+        add(r['payment_method_id'], r['payment_method__name'],
+            r['payment_method__linked_account__account_number'],
+            r['total'], r['invoice_count'])
+
+    split = (
+        InvoicePayment.objects
+        .filter(invoice__in=invoices)
+        .values('payment_method_id', 'payment_method__name',
+                'payment_method__linked_account__account_number')
+        .annotate(total=Sum('amount'), invoice_count=Count('invoice_id', distinct=True))
+    )
+    for r in split:
+        add(r['payment_method_id'], r['payment_method__name'],
+            r['payment_method__linked_account__account_number'],
+            r['total'], r['invoice_count'])
+
+    return sorted(rows.values(), key=lambda r: r['total'], reverse=True)
 
 
 class DashboardReportView(APIView):
@@ -72,12 +135,7 @@ class DashboardReportView(APIView):
         month_agg = inv_month.aggregate(total=Sum('grand_total'), count=Count('id'))
         last_month_agg = inv_last_month.aggregate(total=Sum('grand_total'), count=Count('id'))
 
-        payment_breakdown = list(
-            inv_month
-            .values('payment_method_id', 'payment_method__name')
-            .annotate(total=Sum('grand_total'), count=Count('id'))
-            .order_by('-total')
-        )
+        payment_breakdown = payment_method_breakdown(inv_month)
 
         items_qs = InventoryItem.objects.filter(is_service=False, is_active=True).annotate(
             total_stock=Coalesce(Sum('batches__quantity_remaining'), Value(0, output_field=DecimalField()))
@@ -113,9 +171,9 @@ class DashboardReportView(APIView):
                 'by_payment_method': [
                     {
                         'payment_method_id': r['payment_method_id'],
-                        'method': r['payment_method__name'],
+                        'method': r['method'],
                         'total': str(r['total'] or 0),
-                        'count': r['count'],
+                        'count': r['invoice_count'],
                     }
                     for r in payment_breakdown
                 ],
@@ -169,12 +227,7 @@ class SalesRangeReportView(APIView):
         invoices = Invoice.objects.filter(datetime__gte=range_start, datetime__lt=range_end)
         agg = invoices.aggregate(total=Sum('grand_total'), count=Count('id'))
 
-        breakdown = (
-            invoices
-            .values('payment_method_id', 'payment_method__name', 'payment_method__linked_account__account_number')
-            .annotate(total=Sum('grand_total'), invoice_count=Count('id'))
-            .order_by('-total')
-        )
+        breakdown = payment_method_breakdown(invoices)
 
         return Response({
             'start': str(start),
@@ -184,8 +237,8 @@ class SalesRangeReportView(APIView):
             'by_account': [
                 {
                     'account_id': r['payment_method_id'],
-                    'account_number': r['payment_method__linked_account__account_number'],
-                    'account_name': r['payment_method__name'] or 'Tidak Diketahui',
+                    'account_number': r['account_number'],
+                    'account_name': r['method'],
                     'total': str(r['total'] or 0),
                     'invoice_count': r['invoice_count'],
                 }

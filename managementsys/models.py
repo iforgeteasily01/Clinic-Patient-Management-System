@@ -584,6 +584,51 @@ class InvoiceItem(models.Model):
         return f"{self.invoice.invoice_number} – {self.item.name} ×{self.quantity}"
 
 
+class InvoicePayment(models.Model):
+    """One tender against a sales invoice — the split-payment row.
+
+    An invoice settled by a single method needs none of these; ``Invoice
+    .payment_account`` alone describes it and the journal engine keeps posting
+    one debit leg. A split payment (Rp 200.000 cash + Rp 150.000 BCA) writes one
+    row per method, and the engine debits each account for its own amount
+    instead of collapsing the whole grand total onto the first method's account.
+
+    ``Invoice.payment_method`` / ``payment_account`` stay populated from the
+    first row so every existing list, filter, export and receipt that reads a
+    single method off the invoice keeps working.
+
+    The rows must sum to ``Invoice.grand_total`` — they are the debit side of
+    the entry, not the cash tendered, so change given to the patient is never
+    part of them. The API enforces this on write.
+    """
+    invoice        = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='payments')
+    payment_method = models.ForeignKey(
+        'PaymentMethod',
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        related_name='invoice_payments',
+    )
+    payment_account = models.ForeignKey(
+        'ChartOfAccounts',
+        on_delete=models.PROTECT,
+        null=True, blank=True,
+        limit_choices_to={'account_type': 'asset'},
+        related_name='invoice_payments_into',
+        help_text='Cash/bank account debited by this tender. Must be one of '
+                  'services.cash_accounts.cash_bank_account_ids().',
+    )
+    amount     = models.DecimalField(max_digits=14, decimal_places=2)
+    sort_order = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['sort_order', 'id']
+
+    def __str__(self):
+        label = self.payment_method.name if self.payment_method_id else (
+            self.payment_account.name if self.payment_account_id else '?')
+        return f'{self.invoice.invoice_number} – {label} {self.amount}'
+
+
 class LedgerEntry(models.Model):
     ENTRY_TYPE_CHOICES = [('debit', 'Debit'), ('credit', 'Credit')]
     SOURCE_TYPE_CHOICES = [
@@ -600,6 +645,10 @@ class LedgerEntry(models.Model):
         # today (the void/edit date), never the original transaction date.
         ('void_memo',  'Void Memo (reversal)'),
         ('edit_memo',  'Edit Memo (reversal + repost)'),
+        # Un-void: the document is brought back. Every row currently attached to
+        # it is reversed (netting its posted state to zero) and the original
+        # entry is re-posted, all dated the restore day.
+        ('restore_memo', 'Restore Memo (un-void repost)'),
         # Phase 3 — operating expense accrual/payment postings.
         ('expense',    'Expense'),
     ]

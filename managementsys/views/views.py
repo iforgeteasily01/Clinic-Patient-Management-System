@@ -100,6 +100,7 @@ from .accounting_page import (
     PurchaseInvoiceListCreateView,
     PurchaseInvoiceDetailView,
     PurchaseInvoicePayView,
+    PurchaseInvoiceRestoreView,
     PurchaseLastPriceView,
     CashAccountListView,
     ExpenseListCreateView,

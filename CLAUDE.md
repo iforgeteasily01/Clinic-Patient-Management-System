@@ -138,6 +138,7 @@ All models are in a single file. Search carefully.
 |---|---|---|
 | `Invoice` | `invoice_number` (unique, auto INV-YYYYMMDD-N), `patient_no` (FK), `payment_method` (FK→COA asset), `discount`, `tax`, `additional_charges`, `grand_total`, `cashier` (FK), `warehouse` (FK), `promotion` (FK) | invoice_number auto-generated |
 | `InvoiceItem` | `invoice` (FK cascade), `item` (FK), `item_name`, `quantity`, `price`, `discount_pct` | item_name allows null (custom items) |
+| `InvoicePayment` | `invoice` (FK cascade, `related_name='payments'`), `payment_method` (FK), `payment_account` (FK→COA asset), `amount`, `sort_order` | Split payments only — one row per tender, must sum to `grand_total`. Empty for a single-method invoice, which is still described by `Invoice.payment_method`/`payment_account` alone. POST/PATCH `/api/invoices/` accept it as `payments: [{payment_method_id, amount}]` |
 | `PatientPackage` | `patient` (FK), `package` (FK), `purchased_invoice` (FK), `status` (active/exhausted) | Purchase record for a treatment package. Methods: `remaining_for(treatment_id)`, `total_remaining()`, `refresh_status()` |
 | `PatientPackageRedemption` | `patient_package` (FK cascade), `treatment` (FK), `invoice` (FK), `redeemed_at` | One per session that uses a package |
 | `ChartOfAccounts` | `account_number` (unique), `name`, `account_type` (choice), `balance`, `is_head`, `parent` (self-FK) | GL accounts. Types: asset/liability/equity/revenue/cogs/expense/other_income/other_expense |

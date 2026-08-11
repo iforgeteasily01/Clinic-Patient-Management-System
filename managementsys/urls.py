@@ -209,6 +209,7 @@ urlpatterns = [
     path('api/accounting/purchases/last-price/',        views.PurchaseLastPriceView.as_view(),          name='accounting-purchase-last-price'),
     path('api/accounting/purchases/<int:pk>/',          views.PurchaseInvoiceDetailView.as_view(),      name='accounting-purchase-detail'),
     path('api/accounting/purchases/<int:pk>/pay/',      views.PurchaseInvoicePayView.as_view(),         name='accounting-purchase-pay'),
+    path('api/accounting/purchases/<int:pk>/restore/',  views.PurchaseInvoiceRestoreView.as_view(),     name='accounting-purchase-restore'),
     path('api/accounting/cash-accounts/',               views.CashAccountListView.as_view(),            name='accounting-cash-accounts'),
     path('api/accounting/expenses/',                    views.ExpenseListCreateView.as_view(),          name='accounting-expenses'),
     path('api/accounting/expenses/<int:pk>/',           views.ExpenseDetailView.as_view(),              name='accounting-expense-detail'),
