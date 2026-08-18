@@ -404,6 +404,39 @@ class StockInView(APIView):
 
 # ── Stock Out (FIFO) ───────────────────────────────────────────────────────
 
+VALID_STOCK_OUT_REASONS = {code for code, _label in StockOutLog.REASON_CHOICES}
+
+
+def _resolve_stock_out_reason(raw):
+    """Validate the caller's reason code. Returns (reason, error_message).
+
+    A stock issue with no reason cannot be journalled — the reason is the only
+    thing that decides which account absorbs the cost — so an unknown or missing
+    value is rejected rather than silently defaulting. Callers written before
+    Phase 5 send nothing at all; they get ``REASON_OTHER``, which charges
+    5000900 and is the safest place for an unexplained write-off to land.
+    """
+    if raw in (None, ''):
+        return StockOutLog.REASON_OTHER, None
+    reason = str(raw).strip()
+    if reason not in VALID_STOCK_OUT_REASONS:
+        allowed = ', '.join(sorted(VALID_STOCK_OUT_REASONS))
+        return None, f'Unknown reason "{reason}". Expected one of: {allowed}.'
+    return reason, None
+
+
+def _stock_out_posting_status(reason, value):
+    """A row with no journal to write is born 'posted'.
+
+    A warehouse transfer has no P&L effect and a zero-cost draw has nothing to
+    charge, so neither will ever produce legs. Marking them posted up front
+    keeps them out of ``_gather_events`` instead of having every future journal
+    preview pick them up and stage nothing.
+    """
+    journalable = bool(StockOutLog.REASON_ACCOUNTS.get(reason)) and value > 0
+    return 'unposted' if journalable else 'posted'
+
+
 class StockOutView(APIView):
     def post(self, request):
         data = request.data
@@ -423,6 +456,11 @@ class StockOutView(APIView):
             qty_small = _to_small(item, qty_raw, unit)
         except (InventoryItem.DoesNotExist, Warehouse.DoesNotExist, KeyError, ValueError) as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        reason, reason_error = _resolve_stock_out_reason(data.get('reason'))
+        if reason_error:
+            return Response({'error': reason_error}, status=status.HTTP_400_BAD_REQUEST)
+
         if item.is_service:
             return Response({'error': 'Service items have no physical stock.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -445,7 +483,10 @@ class StockOutView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        shortfall, _cogs = _fifo_deduct(item.id, warehouse.id, qty_small)
+        # The FIFO cost is captured here and nowhere else. Once these batches are
+        # drawn down the number cannot be recomputed, and it is the entire
+        # amount of the journal entry the sweep will write.
+        shortfall, cogs = _fifo_deduct(item.id, warehouse.id, qty_small)
         if shortfall > 0:
             return Response(
                 {'error': 'Stock deduction failed due to a concurrent modification.'},
@@ -467,15 +508,24 @@ class StockOutView(APIView):
                 + (f'. Notes: {notes}' if notes else '')
             ),
         )
-        StockOutLog.objects.create(
+        log = StockOutLog.objects.create(
             item=item,
             warehouse=warehouse,
             out_date=out_date,
             quantity=qty_small,
+            reason=reason,
+            value=cogs,
             notes=notes,
             created_by=actor,
+            posting_status=_stock_out_posting_status(reason, cogs),
         )
-        return Response({'deducted': qty_small, 'unit': item.unit_small})
+        return Response({
+            'deducted': qty_small,
+            'unit': item.unit_small,
+            'reason': reason,
+            'value': str(cogs),
+            'posting_status': log.posting_status,
+        })
 
     def _handle_bulk(self, request, entries):
         actor = _actor(request)
@@ -491,6 +541,11 @@ class StockOutView(APIView):
                 qty_small = _to_small(item, qty_raw, unit)
             except (InventoryItem.DoesNotExist, Warehouse.DoesNotExist, KeyError, ValueError) as exc:
                 skipped.append({'index': i, 'reason': str(exc)})
+                continue
+
+            out_reason, reason_error = _resolve_stock_out_reason(entry.get('reason'))
+            if reason_error:
+                skipped.append({'index': i, 'reason': reason_error})
                 continue
 
             if item.is_service:
@@ -516,7 +571,7 @@ class StockOutView(APIView):
                 })
                 continue
 
-            shortfall, _cogs = _fifo_deduct(item.id, warehouse.id, qty_small)
+            shortfall, cogs = _fifo_deduct(item.id, warehouse.id, qty_small)
             if shortfall > 0:
                 skipped.append({'index': i, 'reason': f'Concurrent modification for [{item.code}]'})
                 continue
@@ -540,8 +595,11 @@ class StockOutView(APIView):
                 warehouse=warehouse,
                 out_date=out_date,
                 quantity=qty_small,
+                reason=out_reason,
+                value=cogs,
                 notes=notes,
                 created_by=actor,
+                posting_status=_stock_out_posting_status(out_reason, cogs),
             )
             deducted_count += 1
 
@@ -578,6 +636,10 @@ class StockOutBatchListView(APIView):
                 'warehouse_name': log.warehouse.name,
                 'out_date': str(log.out_date),
                 'quantity': log.quantity,
+                'reason': log.reason,
+                'reason_label': log.get_reason_display(),
+                'value': str(log.value),
+                'posting_status': log.posting_status,
                 'notes': log.notes,
                 'created_by_name': log.created_by.display_name if log.created_by else None,
                 'created_at': log.created_at.isoformat(),

@@ -670,6 +670,7 @@ class LedgerEntry(models.Model):
     purchase_invoice = models.ForeignKey('PurchaseInvoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
     transfer         = models.ForeignKey('AccountTransfer', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
     expense          = models.ForeignKey('Expense', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
+    stock_out_log    = models.ForeignKey('StockOutLog', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
     created_at       = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -1167,16 +1168,103 @@ class StockOpnameItem(models.Model):
 
 
 class StockOutLog(models.Model):
+    """One stock issue that is not a sale.
+
+    Until Phase 5 this was a bare movement log: it deducted FIFO stock and threw
+    the resulting cost away, so damaged, expired and mis-keyed inventory left the
+    balance sheet without ever reaching the P&L. The accountant's June 2026 books
+    carry 5000900 "Koreksi/Obat Rusak/ED" while CPMS carried nothing at all.
+
+    Three fields close that gap:
+
+    * ``reason`` — the operator's intent, which is what decides the GL account.
+      Free-text ``notes`` could never do that job; it is kept for detail.
+    * ``value`` — the FIFO cost consumed, captured at deduction time. It cannot
+      be recomputed later: the batches it drew on have already moved on.
+    * ``posting_status`` — makes the row a first-class journal document, swept
+      by the same preview → review → commit run as invoices and expenses.
+
+    ``REASON_ACCOUNTS`` maps reason to the account the cost is charged to. A
+    reason mapped to ``None`` moves stock without touching the P&L (a warehouse
+    transfer is one asset account to itself) and is never swept.
+    """
+
+    # Reason codes, chosen from the free-text notes staff already wrote
+    # ('Pindah Gudang', 'Expired', 'Salah input', 'Kirim ke Kirana', …) so the
+    # backfill in migration 0105 can classify existing rows instead of guessing.
+    REASON_TRANSFER   = 'transfer'
+    REASON_EXPIRED    = 'expired'
+    REASON_DAMAGED    = 'damaged'
+    REASON_LOST       = 'lost'
+    REASON_DATA_ENTRY = 'data_entry'
+    REASON_INTERNAL   = 'internal_use'
+    REASON_KIRANA     = 'kirana'
+    REASON_SAMPLE     = 'sample'
+    REASON_OTHER      = 'other'
+
+    REASON_CHOICES = [
+        (REASON_TRANSFER,   'Pindah Gudang'),
+        (REASON_EXPIRED,    'Kedaluwarsa (ED)'),
+        (REASON_DAMAGED,    'Rusak'),
+        (REASON_LOST,       'Hilang/Selisih'),
+        (REASON_DATA_ENTRY, 'Koreksi Salah Input'),
+        (REASON_INTERNAL,   'Pemakaian Internal Klinik'),
+        (REASON_KIRANA,     'Kirim ke Kirana'),
+        (REASON_SAMPLE,     'Sampel/Tester'),
+        (REASON_OTHER,      'Lain-lain'),
+    ]
+
+    # reason -> ChartOfAccounts.account_number the cost is debited to.
+    # None means "no journal at all": the stock moved but the clinic still owns
+    # it, so debiting an expense would understate inventory twice over.
+    #
+    # Numbers are the client's own COA, seeded by migration 0094 — not system
+    # accounts, so staff may rename them and this mapping still resolves.
+    REASON_ACCOUNTS = {
+        REASON_TRANSFER:   None,
+        REASON_EXPIRED:    5000900,   # Koreksi/Obat Rusak/ED/dr. Melia
+        REASON_DAMAGED:    5000900,
+        REASON_LOST:       5000900,
+        REASON_DATA_ENTRY: 5000900,
+        REASON_INTERNAL:   6100005,   # Barang Habis Pakai Ruang Facial (Obat)
+        REASON_KIRANA:     6100030,   # Obat Kirana
+        REASON_SAMPLE:     6300010,   # Biaya Promosi/Iklan
+        REASON_OTHER:      5000900,
+    }
+
     item = models.ForeignKey(InventoryItem, on_delete=models.PROTECT, related_name='stock_out_logs')
     warehouse = models.ForeignKey(Warehouse, on_delete=models.PROTECT, related_name='stock_out_logs')
     out_date = models.DateField()
     quantity = models.DecimalField(max_digits=14, decimal_places=4)
+    reason = models.CharField(max_length=20, choices=REASON_CHOICES, default=REASON_OTHER)
+    # FIFO cost consumed by this issue, in rupiah. Written once, at deduction
+    # time, by StockOutView — never derived afterwards.
+    value = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     notes = models.TextField(blank=True, default='')
+    posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
     created_by = models.ForeignKey(AppUser, null=True, blank=True, on_delete=models.SET_NULL, related_name='stock_out_logs')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.out_date} | {self.get_reason_display()} {self.quantity} × {self.item_id}'
+
+    @property
+    def expense_account_number(self):
+        """The COA number this issue is charged to, or None when it is not a P&L event."""
+        return self.REASON_ACCOUNTS.get(self.reason)
+
+    @property
+    def is_journalable(self):
+        """True when the sweep should build a journal entry for this row.
+
+        A zero-value issue is skipped as well as an untracked reason: FIFO found
+        no batch to draw on, so there is no cost to move and a zero-amount entry
+        would be noise in the journal.
+        """
+        return bool(self.expense_account_number) and self.value > 0
 
 
 class StockOpnameTemplate(models.Model):
@@ -1825,6 +1913,7 @@ class JournalEntry(models.Model):
     purchase_invoice = models.ForeignKey('PurchaseInvoice', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
     transfer         = models.ForeignKey('AccountTransfer', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
     expense          = models.ForeignKey('Expense',         on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
+    stock_out_log    = models.ForeignKey('StockOutLog',     on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
 
     batch = models.ForeignKey('JournalBatch', on_delete=models.SET_NULL, null=True, blank=True, related_name='entries')
 
@@ -1865,6 +1954,8 @@ class JournalEntry(models.Model):
             return self.purchase_invoice.internal_id
         if self.expense_id:
             return f'Beban #{self.expense_id}'
+        if self.stock_out_log_id:
+            return f'Koreksi stok #{self.stock_out_log_id}'
         if self.transfer_id:
             return f'Transfer #{self.transfer_id}'
         return ''

@@ -64,9 +64,9 @@ from ..services.journal_engine import (
     _apply_purchase_balance as _apply_balance,
     _ensure_price_variance_account, _post_expense_accrual, _post_expense_le, _post_le,
     _post_purchase_accrual, _post_purchase_price_variance, _unpost_expense,
-    _unpost_purchase, expense_credit_account, expense_credit_memo, expense_leg_memo,
-    is_date_posted, legset_from_entry, post_account_transfer, reserve_entry_numbers,
-    reverse_legset, write_legs,
+    _unpost_purchase, build_stock_correction_legs, expense_credit_account,
+    expense_credit_memo, expense_leg_memo, is_date_posted, legset_from_entry,
+    post_account_transfer, reserve_entry_numbers, reverse_legset, write_legs,
 )
 from .reports_page import payment_method_breakdown
 
@@ -2161,6 +2161,21 @@ def _post_transfer_for_run(transfer):
     transfer.save(update_fields=['posting_status'])
 
 
+def _post_stock_correction_for_run(log):
+    """Post a stock correction and flip it to 'posted'.
+
+    Charges the FIFO cost captured at deduction time to the account its reason
+    maps to, crediting Inventory. ``build_stock_correction_legs`` returns an
+    empty LegSet for anything with no P&L effect, and ``write_legs`` treats that
+    as nothing to post — the row is still marked 'posted' so the sweep stops
+    reconsidering it.
+    """
+    legset = build_stock_correction_legs(log)
+    write_legs(legset, date=log.out_date, source_type='stock', document=log)
+    log.posting_status = 'posted'
+    log.save(update_fields=['posting_status'])
+
+
 # kind -> poster, injected into run_journal_sweep so the service module does not
 # need to import this views module (which would be a cycle).
 _RUN_POSTERS = {
@@ -2168,6 +2183,7 @@ _RUN_POSTERS = {
     'purchase': _post_purchase_for_run,
     'expense': _post_expense_for_run,
     'transfer': _post_transfer_for_run,
+    'stock': _post_stock_correction_for_run,
 }
 
 
@@ -2265,7 +2281,8 @@ class JournalRunView(APIView):
         # operator previewed. This endpoint previews and commits back to back,
         # so it can never be meaningfully populated, and callers of the legacy
         # contract must not suddenly receive a key they never had.
-        payload = {k: v for k, v in final.items() if k not in ('type', 'variances')}
+        payload = {k: v for k, v in final.items()
+                   if k not in ('type', 'variances', 'skipped')}
         return Response(payload, status=status.HTTP_200_OK)
 
 

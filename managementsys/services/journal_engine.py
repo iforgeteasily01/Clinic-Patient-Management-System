@@ -127,6 +127,7 @@ DOCUMENT_FIELDS = {
     'PurchaseInvoice': 'purchase_invoice',
     'AccountTransfer': 'transfer',
     'Expense':         'expense',
+    'StockOutLog':     'stock_out_log',
 }
 
 
@@ -887,3 +888,86 @@ def _unpost_expense(expense):
         opp = 'credit' if e.entry_type == 'debit' else 'debit'
         _apply_purchase_balance(e.account_id, e.account.account_type, opp, e.amount)
     entries.delete()
+
+
+# ── Stock corrections (Phase 5) ───────────────────────────────────────────────
+# A StockOutLog is stock leaving the building for a reason that is not a sale:
+# it expired, it broke, it was mis-keyed, it went to Kirana, it was used in the
+# facial room. Until Phase 5 the FIFO cost of those issues was computed and
+# discarded, so inventory fell off the balance sheet with no matching charge in
+# the P&L — the single largest reason CPMS reported Rp 1,55 jt of June 2026 cost
+# of sales against the accountant's Rp 130,85 jt.
+#
+# The entry is the simplest one in the engine:
+#
+#     Dr  <account for the reason>   FIFO cost consumed
+#         Cr  1300000 Inventory – Products
+#
+# There is no cash leg. Nothing was bought or sold; value moved from an asset to
+# an expense. ``StockOutLog.REASON_ACCOUNTS`` owns the reason → account mapping,
+# because the operator's stated reason is the only thing that can distinguish a
+# write-off from a warehouse transfer after the fact.
+
+def stock_correction_account(log, *, create_accounts=True):
+    """The COA a stock issue is charged to, or None when it is not a P&L event.
+
+    ``create_accounts`` is accepted for symmetry with the other builders and is
+    deliberately ignored: every account this can return is seeded by migration
+    0094/0105, so unlike a supplier's AP sub-account there is never anything to
+    create lazily. A missing account means someone deleted a seeded row, which
+    should surface as a pending leg rather than be silently conjured back.
+    """
+    number = log.expense_account_number
+    if not number:
+        return None
+    return ChartOfAccounts.objects.filter(account_number=number).first()
+
+
+def stock_correction_memo(log):
+    item = getattr(log, 'item', None)
+    label = f'[{item.code}] {item.name}' if item is not None else f'Item #{log.item_id}'
+    memo = f'Koreksi stok ({log.get_reason_display()}) – {label}'
+    if log.notes:
+        memo = f'{memo} – {log.notes.strip()}'
+    return memo[:255]
+
+
+def build_stock_correction_legs(log, *, create_accounts=True):
+    """Double-entry for one stock correction, computed and not written.
+
+    Returns an empty LegSet — which ``write_legs`` treats as "nothing to post" —
+    for a warehouse transfer, or for any issue whose FIFO draw produced no cost.
+    Both are real outcomes, not errors: the sweep still flips the row to
+    'posted' so it stops being reconsidered every run.
+
+    The amount is ``log.value``, captured when the stock was actually deducted.
+    It is never recomputed from current batches, because those batches have
+    moved on — which is also why these legs are NOT marked ``is_estimated``:
+    unlike invoice COGS, the number cannot drift between preview and commit.
+    """
+    legset = LegSet(memo=stock_correction_memo(log))
+    amount = Decimal(log.value or 0).quantize(CENT)
+    if amount <= 0:
+        return legset
+
+    account = stock_correction_account(log, create_accounts=create_accounts)
+    inventory = _sysacct(ACC_INVENTORY)
+    if account is None:
+        if log.expense_account_number:
+            # Seeded account was deleted — surface it instead of dropping the cost.
+            legset.add(None, 'debit', amount, legset.memo,
+                       pending_account_label=f'Akun {log.expense_account_number}')
+            legset.warnings.append(
+                f'Akun beban {log.expense_account_number} tidak ditemukan di Chart of Accounts.'
+            )
+        else:
+            return legset      # warehouse transfer — no P&L effect by design
+    else:
+        legset.add(account, 'debit', amount, legset.memo)
+
+    if inventory is not None:
+        legset.add(inventory, 'credit', amount, legset.memo)
+    else:
+        legset.add(None, 'credit', amount, legset.memo,
+                   pending_account_label='Inventory – Products')
+    return legset

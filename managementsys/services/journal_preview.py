@@ -59,11 +59,11 @@ from django.utils import timezone
 from ..models import (
     AccountTransfer, ChartOfAccounts, Expense, Invoice, JournalBatch,
     JournalDayLog, JournalStagingBatch, PurchaseInvoice, StagedJournalEntry,
-    StagedJournalLine,
+    StagedJournalLine, StockOutLog,
 )
 from .journal_engine import (
-    build_expense_legs, build_purchase_legs, build_transfer_legs,
-    reserve_entry_numbers, write_legs,
+    build_expense_legs, build_purchase_legs, build_stock_correction_legs,
+    build_transfer_legs, reserve_entry_numbers, write_legs,
 )
 from .journal_sweep import _calendar_days, _gather_events
 
@@ -126,6 +126,14 @@ def fingerprint_document(kind, obj) -> str:
         return _fingerprint([
             'transfer', obj.pk, obj.transfer_date, obj.amount,
             obj.from_account_id, obj.to_account_id, obj.description,
+        ])
+    if kind == 'stock':
+        # ``value`` is the whole amount and ``reason`` picks the account, so a
+        # change to either must invalidate a staged entry. ``quantity`` rides
+        # along because it is what an operator would edit first.
+        return _fingerprint([
+            'stock', obj.pk, obj.out_date, obj.reason, obj.value,
+            obj.quantity, obj.item_id, obj.warehouse_id, obj.notes,
         ])
     return _fingerprint([kind, obj.pk])
 
@@ -194,6 +202,11 @@ def build_legs_for(kind, obj, *, deduct, sim=None):
         return build_expense_legs(obj, items, create_accounts=deduct)
     if kind == 'transfer':
         return build_transfer_legs(obj)
+    if kind == 'stock':
+        # Not FIFO-dependent: the cost was captured when the stock was deducted,
+        # so preview and commit read the same stored number and the legs are
+        # never flagged as estimates.
+        return build_stock_correction_legs(obj, create_accounts=deduct)
     raise ValueError(f'Unknown document kind: {kind}')
 
 
@@ -202,6 +215,7 @@ SOURCE_TYPE_BY_KIND = {
     'purchase': 'purchase',
     'transfer': 'transfer',
     'expense':  'expense',
+    'stock':    'stock',
 }
 
 MODEL_BY_KIND = {
@@ -209,6 +223,7 @@ MODEL_BY_KIND = {
     'purchase': PurchaseInvoice,
     'transfer': AccountTransfer,
     'expense':  Expense,
+    'stock':    StockOutLog,
 }
 
 
@@ -219,6 +234,8 @@ def document_label(kind, obj):
         return obj.internal_id or f'Pembelian #{obj.pk}'
     if kind == 'expense':
         return f'Beban #{obj.pk}'
+    if kind == 'stock':
+        return f'Koreksi stok #{obj.pk}'
     return f'Transfer #{obj.pk}'
 
 

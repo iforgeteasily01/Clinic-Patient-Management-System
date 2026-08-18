@@ -469,6 +469,81 @@ def _reverse_packages(invoice):
         pp.refresh_status()
 
 
+def resolve_line_item_ids(lines):
+    """Fill in ``item_id`` for lines that named a treatment but did not link it.
+
+    POSPage's "transfer from billing queue" and package-redemption paths build
+    their lines from a Treatment, send ``treatment_id`` faithfully, and then set
+    ``item_id`` to null — so the line arrived with everything needed to link it
+    and no link. 767 InvoiceItem rows were written that way, 673 of them in June
+    and July 2026 alone, and every single one of their treatments had a
+    ``catalog_item`` sitting there available.
+
+    An unlinked line is not cosmetic. It has no FK to route revenue by, so
+    ``journal_engine._line_revenue_account`` falls back to matching the free-text
+    name against Treatment — which works, but silently fails on a typo (see
+    migration 0077) — and no ``TreatmentMaterial`` is consumed, so the treatment
+    costs nothing.
+
+    Resolution order, first hit wins:
+
+    1. ``treatment_id`` → that Treatment's ``catalog_item``. Authoritative: the
+       client told us exactly which treatment this is.
+    2. ``item_name`` → a Treatment of that name (case- and space-insensitive)
+       → its ``catalog_item``. Covers clients that only send a name, including
+       the Medya-Cashier POS.
+
+    Mutates ``lines`` in place and returns the number of lines linked. Lines that
+    already carry an ``item_id``, and names that match nothing, are left exactly
+    as they are — a genuine ad-hoc line must stay ad-hoc.
+    """
+    pending = [
+        line for line in lines
+        if not line.get('item_id') and (line.get('treatment_id') or line.get('item_name'))
+    ]
+    if not pending:
+        return 0
+
+    treatment_ids = {line['treatment_id'] for line in pending if line.get('treatment_id')}
+    by_id = {}
+    if treatment_ids:
+        by_id = dict(
+            Treatment.objects
+            .filter(id__in=treatment_ids, catalog_item__isnull=False)
+            .values_list('id', 'catalog_item_id')
+        )
+
+    names = {
+        (line.get('item_name') or '').strip().lower()
+        for line in pending
+        if not line.get('treatment_id') and line.get('item_name')
+    }
+    names.discard('')
+    by_name = {}
+    if names:
+        # Name matching is done in Python, not with a case-insensitive IN
+        # lookup, so that trailing spaces and mixed case both normalise the same
+        # way they do in journal_engine._line_revenue_account.
+        by_name = {
+            t.name.strip().lower(): t.catalog_item_id
+            for t in Treatment.objects.filter(catalog_item__isnull=False).only(
+                'id', 'name', 'catalog_item_id')
+            if t.name.strip().lower() in names
+        }
+
+    linked = 0
+    for line in pending:
+        catalog_item_id = None
+        if line.get('treatment_id'):
+            catalog_item_id = by_id.get(line['treatment_id'])
+        if catalog_item_id is None and line.get('item_name'):
+            catalog_item_id = by_name.get(line['item_name'].strip().lower())
+        if catalog_item_id is not None:
+            line['item_id'] = catalog_item_id
+            linked += 1
+    return linked
+
+
 class InvoiceCreateView(APIView):
     permission_classes = [AllowAny]
 
@@ -563,6 +638,11 @@ class InvoiceCreateView(APIView):
             first = tenders[0]
             payment_method_obj  = payment_method_obj or first.payment_method
             payment_account_obj = payment_account_obj or first.payment_account
+
+        # ── Link treatment lines the client sent unlinked ─────────────────────
+        # Must run before item_ids is collected: a line linked here has to be
+        # validated, stock-checked and material-consumed like any other.
+        resolve_line_item_ids(data['items'])
 
         # ── Validate all inventory items exist before writing anything ────────
 
@@ -790,6 +870,7 @@ class InvoiceDetailView(APIView):
         new_items_by_id: dict = {}
 
         if replacing_items:
+            resolve_line_item_ids(data['items'])
             item_ids = [i['item_id'] for i in data['items'] if i.get('item_id')]
             new_items_by_id = {
                 obj.id: obj

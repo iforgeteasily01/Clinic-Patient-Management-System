@@ -31,18 +31,31 @@ from django.utils import timezone
 
 from ..models import (
     AccountTransfer, Expense, Invoice, JournalBatch, JournalDayLog,
-    PurchaseInvoice,
+    PurchaseInvoice, StockOutLog,
 )
+
+# Reasons whose cost reaches the P&L. Derived from the model's own mapping so
+# the two can never drift: a reason mapped to None (a warehouse transfer) moves
+# stock between locations the clinic still owns and has no journal at all.
+JOURNALABLE_STOCK_REASONS = [
+    reason for reason, account in StockOutLog.REASON_ACCOUNTS.items() if account
+]
 
 
 def _gather_events(date_to):
     """Every unposted document dated on or before ``date_to``.
 
     Returns ``{date: [(kind, obj), ...]}``. Same four querysets the original
-    view used — unchanged, including the ``is_voided`` exclusions. Same-day
-    void/edit memo entries are never selected here: they carry
-    source_type='void_memo'/'edit_memo' and are written already-posted by the
-    void/edit endpoints.
+    view used — unchanged, including the ``is_voided`` exclusions — plus stock
+    corrections from Phase 5. Same-day void/edit memo entries are never selected
+    here: they carry source_type='void_memo'/'edit_memo' and are written
+    already-posted by the void/edit endpoints.
+
+    Only stock corrections that will actually produce legs are gathered — a
+    warehouse transfer moves no value and a zero-cost issue has nothing to
+    charge. Those rows are stamped 'posted' the moment they are written (see
+    ``StockOutView``), so filtering here keeps the preview pure: it never has to
+    mutate a row just to stop reconsidering it.
     """
     by_date = {}
 
@@ -68,6 +81,12 @@ def _gather_events(date_to):
         posting_status='unposted', expense_date__lte=date_to,
     ):
         add(e.expense_date, 'expense', e)
+
+    for s in StockOutLog.objects.filter(
+        posting_status='unposted', out_date__lte=date_to,
+        value__gt=0, reason__in=JOURNALABLE_STOCK_REASONS,
+    ).select_related('item'):
+        add(s.out_date, 'stock', s)
 
     return by_date
 
