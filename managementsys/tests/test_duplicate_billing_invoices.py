@@ -48,7 +48,7 @@ class TestVoidDuplicateBillingInvoices:
     def test_voids_a_phantom_that_duplicates_a_paid_invoice(
             self, patient, gl_accounts):
         paid = _invoice('INV-20260620-1', patient, payment=gl_accounts['cash_method'])
-        phantom = _invoice('INV-20260620-2', patient, payment=gl_accounts['undeposited_method'])
+        phantom = _invoice('INV-20260620-2', patient, payment=gl_accounts['legacy_clearing_method'])
 
         _run(apply=True)
         paid.refresh_from_db()
@@ -74,7 +74,7 @@ class TestVoidDuplicateBillingInvoices:
     def test_never_voids_ipos_imports(self, patient, gl_accounts):
         paid = _invoice('INV-20260620-1', patient, payment=gl_accounts['cash_method'])
         imported = _invoice('IPOS-4045/KSR/GD/0626', patient,
-                            payment=gl_accounts['undeposited_method'])
+                            payment=gl_accounts['legacy_clearing_method'])
 
         _run(apply=True)
         imported.refresh_from_db()
@@ -84,8 +84,8 @@ class TestVoidDuplicateBillingInvoices:
     def test_one_payment_absorbs_only_one_duplicate(self, patient, gl_accounts):
         """Two phantoms against a single payment: the second needs a human."""
         _invoice('INV-20260620-1', patient, payment=gl_accounts['cash_method'])
-        first = _invoice('INV-20260620-2', patient, payment=gl_accounts['undeposited_method'])
-        second = _invoice('INV-20260620-3', patient, payment=gl_accounts['undeposited_method'])
+        first = _invoice('INV-20260620-2', patient, payment=gl_accounts['legacy_clearing_method'])
+        second = _invoice('INV-20260620-3', patient, payment=gl_accounts['legacy_clearing_method'])
 
         _run(apply=True)
         first.refresh_from_db()
@@ -95,7 +95,7 @@ class TestVoidDuplicateBillingInvoices:
 
     def test_keeps_a_phantom_with_no_counterpart(self, patient, gl_accounts):
         """Treatment given but never rung up — real uncollected revenue."""
-        orphan = _invoice('INV-20260620-2', patient, payment=gl_accounts['undeposited_method'])
+        orphan = _invoice('INV-20260620-2', patient, payment=gl_accounts['legacy_clearing_method'])
 
         output = _run(apply=True)
         orphan.refresh_from_db()
@@ -105,7 +105,7 @@ class TestVoidDuplicateBillingInvoices:
     def test_keeps_a_partial_overlap(self, patient, gl_accounts):
         _invoice('INV-20260620-1', patient, payment=gl_accounts['cash_method'])
         partial = _invoice(
-            'INV-20260620-2', patient, payment=gl_accounts['undeposited_method'],
+            'INV-20260620-2', patient, payment=gl_accounts['legacy_clearing_method'],
             lines=(('Light Peel', '1', '300000'), ('Dermapen', '1', '400000')),
             total='700000')
 
@@ -117,7 +117,7 @@ class TestVoidDuplicateBillingInvoices:
     def test_does_not_match_across_different_days(self, patient, gl_accounts):
         _invoice('INV-20260620-1', patient, payment=gl_accounts['cash_method'])
         next_day = _invoice(
-            'INV-20260621-1', patient, payment=gl_accounts['undeposited_method'],
+            'INV-20260621-1', patient, payment=gl_accounts['legacy_clearing_method'],
             when=datetime(2026, 6, 21, 3, 0, tzinfo=dt_timezone.utc))
 
         _run(apply=True)
@@ -126,7 +126,7 @@ class TestVoidDuplicateBillingInvoices:
 
     def test_dry_run_writes_nothing(self, patient, gl_accounts):
         _invoice('INV-20260620-1', patient, payment=gl_accounts['cash_method'])
-        phantom = _invoice('INV-20260620-2', patient, payment=gl_accounts['undeposited_method'])
+        phantom = _invoice('INV-20260620-2', patient, payment=gl_accounts['legacy_clearing_method'])
 
         output = _run()
         phantom.refresh_from_db()

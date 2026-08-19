@@ -128,7 +128,6 @@ class BillingCompleteView(APIView):
             active_patient.treatmentsession_set
             .prefetch_related(
                 'treatments__catalog_item__item_category__revenue_account',
-                'treatments__materials__item',
             )
             .all()
         )

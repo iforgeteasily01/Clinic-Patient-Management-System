@@ -14,7 +14,7 @@ from django.core.management import call_command
 from django.urls import reverse
 
 from managementsys.models import (
-    InventoryItem, Invoice, Treatment, TreatmentCategory, TreatmentMaterial,
+    InventoryItem, Invoice, LedgerEntry, Treatment, TreatmentCategory,
 )
 
 from .factories import InventoryBatchFactory, InventoryItemFactory
@@ -82,29 +82,26 @@ class TestTreatmentCategoryLinkage:
 class TestPosRoutesToCategoryAccounts:
     @pytest.fixture
     def laser(self, stock, gl_accounts):
-        """A 'Laser' treatment consuming 5 units of a 5000/unit material."""
-        material = InventoryItemFactory(selling_price=0)
-        InventoryBatchFactory(
-            item=material, warehouse=stock["warehouse"],
-            quantity_initial=Decimal("100"), quantity_remaining=Decimal("100"),
-            value=Decimal("500000"),  # 5000 / unit
-        )
+        """A 'Laser' treatment, sold as a service line."""
         treatment = Treatment.objects.create(
             code="LASER", name="Laser", category="Laser", price=Decimal("50000"),
-        )
-        TreatmentMaterial.objects.create(
-            treatment=treatment, item=material, quantity_small=Decimal("5"),
         )
         treatment.refresh_from_db()
         return treatment
 
-    def test_revenue_hits_category_account_cogs_hits_fallback(
+    def test_revenue_hits_category_account_and_no_cogs_is_posted(
         self, auth_api, stock, gl_accounts, laser
     ):
-        """As of Phase 3, revenue still routes per-category but COGS always
-        posts to the shared fallback account (5100000) — per-category COGS
-        accounts were removed; COGS/expense now come exclusively from the
-        Expense model."""
+        """Revenue routes per category; a treatment posts no cost of sales.
+
+        Both halves matter. The first is the point of per-category accounts. The
+        second is what migration 0107 established when it dropped
+        ``TreatmentMaterial``: a fixed per-treatment recipe produced a cost that
+        was precise, automatic and wrong, so treatment COGS is now entered by
+        hand against 5000200. This asserts the absence deliberately — a
+        reintroduced bill-of-materials would show up here as a non-zero balance
+        rather than as a quietly changed gross margin.
+        """
         cat = TreatmentCategory.objects.get(name="Laser")
 
         res = _sell(auth_api, stock, gl_accounts, laser.catalog_item.id,
@@ -120,8 +117,25 @@ class TestPosRoutesToCategoryAccounts:
         assert cat.revenue_account.balance == Decimal("50000")
         assert gl_accounts["revenue"].balance == Decimal("0")
 
-        # 5 units * 5000 material COGS to the shared fallback COGS account.
-        assert gl_accounts["cogs"].balance == Decimal("25000")
+        # No recipe, so no COGS leg at all — not merely a zero balance.
+        assert gl_accounts["cogs"].balance == Decimal("0")
+        assert not LedgerEntry.objects.filter(account=gl_accounts["cogs"]).exists()
+
+    def test_service_line_consumes_no_stock(
+        self, auth_api, stock, gl_accounts, laser
+    ):
+        """The stock half of the same rule.
+
+        Service lines stopped drawing on inventory with 0107. Batches now move
+        only on product sales, purchases and stock corrections.
+        """
+        before = stock["batch"].quantity_remaining
+
+        _sell(auth_api, stock, gl_accounts, laser.catalog_item.id,
+              price=50000, grand_total=50000)
+
+        stock["batch"].refresh_from_db()
+        assert stock["batch"].quantity_remaining == before
 
 
 @pytest.mark.django_db

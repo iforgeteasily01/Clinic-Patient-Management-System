@@ -27,6 +27,13 @@ class Patient(models.Model):
     birth_date = models.DateField(null=True, blank=True)
     GENDER_CHOICES = [('F', 'Perempuan'), ('M', 'Laki-laki')]
     gender = models.CharField(max_length=1, choices=GENDER_CHOICES, blank=True, default='')
+    # WhatsApp marketing consent. Defaults to False for everyone, including the
+    # patients already on file: consent the patient never gave is not consent,
+    # and defaulting this to True would silently enrol the entire book in a
+    # broadcast list. Reception turns it on as patients agree, so the blast
+    # audiences start small on purpose.
+    wa_opt_in = models.BooleanField(default=False)
+    wa_opt_in_at = models.DateTimeField(null=True, blank=True)
     # Resolved from the SatuSehat Master Patient Index (by NIK). Unused until the sync phase.
     ihs_id = models.CharField(max_length=64, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -2677,6 +2684,169 @@ class MessageTemplate(models.Model):
 
     def __str__(self):
         return self.name
+
+
+
+# -- WhatsApp gateway (OpenWA) ---------------------------------------------
+# The gateway itself is a separate Node service (github.com/rmyndharis/OpenWA)
+# running alongside Django. Nothing here talks to WhatsApp directly; these
+# models hold the connection settings and the record of what was sent.
+
+
+class WhatsAppSettings(models.Model):
+    """Singleton row (always pk=1) describing the OpenWA gateway to talk to.
+
+    Same ``get_solo()`` shape as SiteConfig/ReportSettings.
+
+    ``api_key`` is stored in plain text because the gateway needs the literal
+    value on every request -- it is a shared secret, not a password to verify,
+    so hashing it would make it useless. It is never serialized back to the
+    browser in full; the API returns ``api_key_set``/``api_key_hint`` instead.
+    """
+
+    enabled     = models.BooleanField(default=False)
+    base_url    = models.URLField(max_length=255, blank=True, default='http://127.0.0.1:2785')
+    api_key     = models.CharField(max_length=255, blank=True, default='')
+    # OpenWA identifies a session by UUID; the name is what the operator typed
+    # when creating it. Both are kept so the settings page can show a human
+    # label without a lookup, and so a re-created session is visibly different.
+    session_id   = models.CharField(max_length=64, blank=True, default='')
+    session_name = models.CharField(max_length=50, blank=True, default='cpms-clinic')
+
+    # -- Send pacing --
+    # OpenWA's own guidance is "a few messages per minute per session". These
+    # are passed straight through as the batch options; the floor of 1000 ms and
+    # ceiling of 60000 ms are the gateway's, mirrored here so the form cannot
+    # submit a value the gateway will reject.
+    delay_between_messages_ms = models.PositiveIntegerField(default=8000)
+    randomize_delay           = models.BooleanField(default=True)
+
+    # -- Guard rails --
+    # A daily cap and a per-patient cooldown, both enforced in Django before a
+    # single message reaches the gateway. WhatsApp restricts accounts that
+    # broadcast; these exist so one mis-clicked blast cannot cost the clinic its
+    # number.
+    daily_send_cap            = models.PositiveIntegerField(default=200)
+    per_patient_cooldown_days = models.PositiveIntegerField(default=7)
+    # Outside these hours a blast is refused. Stored as plain hours in Jakarta
+    # local time -- a message at 03:00 is what gets a number reported as spam.
+    quiet_hours_start = models.PositiveSmallIntegerField(default=21)  # 21:00
+    quiet_hours_end   = models.PositiveSmallIntegerField(default=8)   # 08:00
+
+    # Where "send a test message" goes. Kept on the settings row so the operator
+    # does not retype their own number every time they re-pair the session.
+    test_recipient = models.CharField(max_length=25, blank=True, default='')
+
+    updated_at = models.DateTimeField(auto_now=True)
+    updated_by = models.ForeignKey(
+        AppUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='whatsapp_settings_updates',
+    )
+
+    class Meta:
+        verbose_name = 'WhatsApp Settings'
+
+    @classmethod
+    def get_solo(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    def __str__(self):
+        return f'WhatsApp @ {self.base_url or "(unconfigured)"}'
+
+
+class WhatsAppBlast(models.Model):
+    """One broadcast: an audience, a message, and what happened to each recipient.
+
+    Written before anything is sent, so a blast that dies mid-flight still
+    leaves a record of who was already contacted. That record is what
+    ``per_patient_cooldown_days`` is checked against, so it has to exist even
+    for a run that fails.
+    """
+
+    STATUS_CHOICES = [
+        ('pending',    'Menunggu'),
+        ('processing', 'Berjalan'),
+        ('completed',  'Selesai'),
+        ('cancelled',  'Dibatalkan'),
+        ('failed',     'Gagal'),
+    ]
+
+    name        = models.CharField(max_length=120, blank=True, default='')
+    segment     = models.CharField(max_length=40)
+    # The audience definition as submitted, so a blast can be explained months
+    # later even after the segment catalog changes shape.
+    segment_params = models.JSONField(default=dict, blank=True)
+    template    = models.ForeignKey(
+        'MessageTemplate', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='blasts',
+    )
+    # The body as it was at send time. A template edited afterwards must not
+    # rewrite history -- this is the record of what patients actually received.
+    body_snapshot = models.TextField()
+
+    status       = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    batch_id     = models.CharField(max_length=100, blank=True, default='')
+    total        = models.PositiveIntegerField(default=0)
+    sent_count   = models.PositiveIntegerField(default=0)
+    failed_count = models.PositiveIntegerField(default=0)
+    error        = models.TextField(blank=True, default='')
+
+    created_by  = models.ForeignKey(
+        AppUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='whatsapp_blasts',
+    )
+    created_at  = models.DateTimeField(auto_now_add=True)
+    updated_at  = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['-created_at'], name='idx_wablast_created')]
+
+    def __str__(self):
+        return f'{self.name or self.segment} -> {self.total} ({self.status})'
+
+
+class WhatsAppBlastRecipient(models.Model):
+    STATUS_CHOICES = [
+        ('pending',   'Menunggu'),
+        ('sent',      'Terkirim'),
+        ('failed',    'Gagal'),
+        ('cancelled', 'Dibatalkan'),
+    ]
+
+    blast   = models.ForeignKey(WhatsAppBlast, on_delete=models.CASCADE, related_name='recipients')
+    patient = models.ForeignKey(
+        Patient, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='whatsapp_messages',
+    )
+    # Denormalised: a patient can be deleted or change number, and this row is
+    # the evidence of what was sent where.
+    patient_name = models.CharField(max_length=100, blank=True, default='')
+    chat_id      = models.CharField(max_length=40)
+    phone        = models.CharField(max_length=25, blank=True, default='')
+    body         = models.TextField()
+
+    status     = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    # Which gateway batch carried this row. A blast larger than
+    # whatsapp_gateway.BULK_MAX is dispatched as consecutive batches, so a
+    # recipient with an empty batch_id is one not handed to the gateway yet.
+    batch_id   = models.CharField(max_length=100, blank=True, default='')
+    message_id = models.CharField(max_length=120, blank=True, default='')
+    error_code = models.CharField(max_length=60, blank=True, default='')
+    error      = models.CharField(max_length=255, blank=True, default='')
+    sent_at    = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['id']
+        indexes = [
+            # The cooldown check is "has this patient been sent anything since
+            # date X", which is exactly this index.
+            models.Index(fields=['patient', 'sent_at'], name='idx_warecipient_patient'),
+        ]
+
+    def __str__(self):
+        return f'{self.chat_id} ({self.status})'
 
 
 #####

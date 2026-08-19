@@ -553,6 +553,8 @@ class CRMPatientProfileView(APIView):
                     if patient.birth_date else None
                 ),
                 'gender': patient.gender,
+                'wa_opt_in': patient.wa_opt_in,
+                'wa_opt_in_at': patient.wa_opt_in_at.isoformat() if patient.wa_opt_in_at else None,
                 'tier': ({'name': crm.tier.name, 'color_hex': crm.tier.color_hex}
                          if crm and crm.tier_id else None),
             },

@@ -158,7 +158,14 @@ class TestInvoicePostingBalances:
 
     def test_missing_payment_method_goes_to_the_clearing_account(
             self, auth_api, stock, gl_accounts):
-        """Unidentified receipts must not silently inflate Cash."""
+        """Unidentified receipts must not silently inflate Cash.
+
+        The destination is 1100011, the account migration 0076 created as
+        "Undeposited Funds" and 0100 retired out of the selectable cash set. It
+        is deliberately still the fallback: an invoice with neither
+        ``payment_account`` nor ``payment_method`` has to balance somewhere, and
+        a retired account nobody can pick is the honest place for it.
+        """
         res = auth_api.post(reverse("invoice-create"), {
             "warehouse_id": stock["warehouse"].id,
             "discount": 0, "tax": 0, "additional_charges": 0,
@@ -171,7 +178,7 @@ class TestInvoicePostingBalances:
         debit, credit = _sides(invoice)
         assert debit == credit
         assert LedgerEntry.objects.filter(
-            invoice=invoice, account=gl_accounts["undeposited"], entry_type="debit",
+            invoice=invoice, account=gl_accounts["legacy_clearing"], entry_type="debit",
         ).exists()
         assert not LedgerEntry.objects.filter(
             invoice=invoice, account=gl_accounts["cash"],

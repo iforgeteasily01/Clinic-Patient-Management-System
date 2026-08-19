@@ -71,6 +71,18 @@ from .assessment_codes_page import (
 )
 from .promotion_page import PromotionListCreateView, PromotionDetailView, PromotionValidateView
 from .crm_page import PatientCRMListView, PatientCRMDetailView, PatientTierListCreateView, PatientTierDetailView
+from .whatsapp_page import (
+    PatientWhatsAppOptInView,
+    WhatsAppBlastCancelView,
+    WhatsAppBlastDetailView,
+    WhatsAppBlastListCreateView,
+    WhatsAppBlastPreviewView,
+    WhatsAppSegmentsView,
+    WhatsAppSessionView,
+    WhatsAppSettingsView,
+    WhatsAppStatusView,
+    WhatsAppTestMessageView,
+)
 from .crm_dashboard import (
     CRMDashboardView,
     CRMPatientProfileView,

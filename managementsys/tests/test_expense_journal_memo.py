@@ -468,7 +468,7 @@ class TestPaymentAccountBackfillMigration:
         already_set = Expense.objects.create(
             expense_date=datetime.date(2026, 7, 30),
             payment_method=gl_accounts['cash_method'],
-            payment_account=gl_accounts['undeposited'],
+            payment_account=gl_accounts['bank'],
             total_amount=Decimal('15000'),
         )
         no_method = Expense.objects.create(
@@ -483,7 +483,7 @@ class TestPaymentAccountBackfillMigration:
         already_set.refresh_from_db()
         no_method.refresh_from_db()
         assert legacy.payment_account_id == gl_accounts['cash'].id
-        assert already_set.payment_account_id == gl_accounts['undeposited'].id   # untouched
+        assert already_set.payment_account_id == gl_accounts['bank'].id   # untouched
         assert no_method.payment_account_id is None
 
         migration.clear_backfilled_payment_account(global_apps, None)
@@ -492,7 +492,7 @@ class TestPaymentAccountBackfillMigration:
         already_set.refresh_from_db()
         assert legacy.payment_account_id is None
         # pointed at a different account than its method's -> left alone
-        assert already_set.payment_account_id == gl_accounts['undeposited'].id
+        assert already_set.payment_account_id == gl_accounts['bank'].id
 
     def test_backfill_touches_no_ledger_entry(self, gl_accounts, expense_account):
         expense = Expense.objects.create(

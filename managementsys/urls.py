@@ -197,6 +197,22 @@ urlpatterns = [
     path('api/crm/message-templates/<int:pk>/', views.MessageTemplateDetailView.as_view(), name='crm-message-template-detail'),
     path('api/crm/message-templates/<int:pk>/render/', views.MessageTemplateRenderView.as_view(), name='crm-message-template-render'),
 
+    # WhatsApp (OpenWA gateway — a separate Node service, see
+    # services/whatsapp_gateway.py). Settings and pairing live under
+    # /api/whatsapp/; the blast pages are CRM surfaces but share this prefix
+    # because they are all one integration.
+    path('api/whatsapp/settings/', views.WhatsAppSettingsView.as_view(), name='whatsapp-settings'),
+    path('api/whatsapp/status/', views.WhatsAppStatusView.as_view(), name='whatsapp-status'),
+    path('api/whatsapp/session/<str:action>/', views.WhatsAppSessionView.as_view(), name='whatsapp-session-action'),
+    path('api/whatsapp/test-message/', views.WhatsAppTestMessageView.as_view(), name='whatsapp-test-message'),
+    path('api/whatsapp/segments/', views.WhatsAppSegmentsView.as_view(), name='whatsapp-segments'),
+    # 'preview' before the <int:pk> detail route so it is never read as an id.
+    path('api/whatsapp/blasts/preview/', views.WhatsAppBlastPreviewView.as_view(), name='whatsapp-blast-preview'),
+    path('api/whatsapp/blasts/', views.WhatsAppBlastListCreateView.as_view(), name='whatsapp-blasts'),
+    path('api/whatsapp/blasts/<int:pk>/', views.WhatsAppBlastDetailView.as_view(), name='whatsapp-blast-detail'),
+    path('api/whatsapp/blasts/<int:pk>/cancel/', views.WhatsAppBlastCancelView.as_view(), name='whatsapp-blast-cancel'),
+    path('api/patients/<str:patient_no>/wa-opt-in/', views.PatientWhatsAppOptInView.as_view(), name='patient-wa-opt-in'),
+
     # Tiers
     path('api/admin/tiers/', views.PatientTierListCreateView.as_view(), name='admin-tiers'),
     path('api/admin/tiers/<int:pk>/', views.PatientTierDetailView.as_view(), name='admin-tier-detail'),

@@ -181,7 +181,6 @@ def _invoice_lines(invoice):
     items = list(
         invoice.items
         .select_related('item__item_category__revenue_account')
-        .prefetch_related('item__treatment__materials__item')
         .all()
     )
     items_by_id = {it.item_id: it.item for it in items if it.item_id}

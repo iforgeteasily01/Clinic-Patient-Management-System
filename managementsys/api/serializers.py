@@ -26,7 +26,11 @@ class PatientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Patient
         fields = ["patient_no", "name", "address", "phone_number", "NIK",
-                  "birth_date", "gender"]
+                  "birth_date", "gender", "wa_opt_in", "wa_opt_in_at"]
+        # wa_opt_in is read-only here on purpose: consent is changed through
+        # /api/patients/<no>/wa-opt-in/, which logs it. A stale admin form
+        # PUT-ing the whole patient must not be able to flip it back.
+        read_only_fields = ["wa_opt_in", "wa_opt_in_at"]
         extra_kwargs = {
             # name is nullable in DB but must be provided on input — the model's
             # save() method needs it to generate patient_no.

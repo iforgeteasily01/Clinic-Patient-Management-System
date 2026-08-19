@@ -9,8 +9,11 @@ Proves:
     (atomic pre-check), and
   * service items are rejected as output and as ingredient.
 
-Run:  cd Clinic-Patient-Management-System && python manage.py test managementsys
-(Requires a reachable test database.)
+Written as a Django ``TestCase`` before the suite moved to pytest, and it lived
+at ``managementsys/tests_production.py`` — outside the ``testpaths`` in
+pytest.ini, so nothing collected it and these five tests sat dormant. Moved in
+rather than rewritten: pytest runs TestCase subclasses natively, and the
+assertions were still correct.
 
 All money/quantity arithmetic uses Decimal — never float.
 """

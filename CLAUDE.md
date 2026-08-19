@@ -242,8 +242,10 @@ All models are in a single file. Search carefully.
 | GET/POST | `/api/inventory/warehouses/` | Warehouse CRUD |
 | GET | `/api/inventory/stock/` | Current stock levels |
 | GET | `/api/inventory/batches/` | All FIFO batches |
-| POST | `/api/inventory/stock-in/` | Receive stock |
-| POST | `/api/inventory/stock-out/` | Issue stock |
+| GET | `/api/inventory/dashboard/` | Low-stock counts + alert rows for the module hub |
+| POST | `/api/inventory/stock-in/` | Receive stock — **always zero-value**, ignores any `value` sent |
+| POST | `/api/inventory/stock-out/` | Issue stock (FIFO); `reason` picks the GL account |
+| GET | `/api/inventory/stock-out/reasons/` | Reason → account catalog, with live COA names |
 | GET | `/api/inventory/sync/items/` | Paginated export for mobile |
 | GET/POST | `/api/stock-opname/` | Physical count sessions |
 | GET/PUT | `/api/stock-opname/<id>/` | Session detail |
@@ -298,10 +300,59 @@ Three constraints in `crm_dashboard.py` worth reading before editing it:
 - **`/api/crm/dashboard/` must stay declared before `/api/crm/patients/<str:patient_no>/`**
   in `urls.py` or 'dashboard' is read as a patient number.
 
-Message templates **send nothing** — no messaging API is wired up. A template is
-text with `{token}` placeholders substituted by `services/message_templates.py`;
-an unknown token is left intact rather than blanked, so a typo is visible in the
-preview instead of silently deleting a word.
+A template is text with `{token}` placeholders substituted by
+`services/message_templates.py`; an unknown token is left intact rather than
+blanked, so a typo is visible in the preview instead of silently deleting a word.
+Copying a rendered template by hand needs no consent flag — only the **blast**
+path below does.
+
+### WhatsApp (OpenWA gateway)
+
+The gateway is **a separate Node service**, not part of Django: OpenWA
+(github.com/rmyndharis/OpenWA), default port 2785, `X-API-Key` auth. Django
+holds the key, decides who gets a message, and records what was sent. It never
+speaks to WhatsApp itself. `services/whatsapp_gateway.py` carries the full route
+map and is dependency-free `urllib`, so a gateway that is down or misconfigured
+can never break `manage.py migrate`.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET/PUT | `/api/whatsapp/settings/` | Gateway URL, key, pacing, guard rails. The key is **never** returned — only `api_key_set`/`api_key_hint` |
+| GET | `/api/whatsapp/status/` | Gateway health + session state. Never raises; unreachable is a normal pre-setup state |
+| POST | `/api/whatsapp/session/<action>/` | `create` \| `start` \| `stop` \| `logout` \| `qr` |
+| POST | `/api/whatsapp/test-message/` | One message to a typed number. Skips opt-in by design — it is not a patient |
+| GET | `/api/whatsapp/segments/` | Audience catalog with live eligible counts |
+| POST | `/api/whatsapp/blasts/preview/` | Resolve audience + render a sample. Writes nothing |
+| GET/POST | `/api/whatsapp/blasts/` | History / send |
+| GET | `/api/whatsapp/blasts/<id>/` | **Syncs from the gateway, then returns** — see below |
+| POST | `/api/whatsapp/blasts/<id>/cancel/` | Stop the remaining messages |
+| PATCH | `/api/patients/<no>/wa-opt-in/` | Consent toggle. Audit-logged |
+
+**A blast has no background worker.** OpenWA's `send-bulk` is asynchronous — it
+takes ≤100 messages, returns a `batchId`, and delivers them with a delay. So
+POSTing a blast writes every recipient row and dispatches the first chunk; the
+**detail endpoint is what advances it**, reconciling the current batch and
+dispatching the next chunk when it drains. The page polls, so a blast survives a
+Django restart: all state is in the two tables plus the gateway. Do not add
+Celery for this.
+
+**Four guard rails, all server-side and none overridable from the UI:**
+- `Patient.wa_opt_in` — False for everyone by default, and deliberately *not*
+  backfilled. Consent the patient never gave is not consent.
+- a usable Indonesian mobile (`normalize_phone`); a landline or typo is dropped,
+  never guessed at
+- `per_patient_cooldown_days` — overlapping segments are normal, two messages in
+  one day is how a number gets reported
+- `daily_send_cap` and Jakarta-local quiet hours
+
+`services/wa_audience.py` owns the segments and reports the whole funnel
+(`matched → opted_in → unusable_number → in_cooldown → eligible`) so the UI can
+explain why a 1.115-patient segment sends 6 messages.
+
+⚠️ OpenWA is an **unofficial** gateway built on reverse-engineered clients. Its
+own README states it is not approved for regulated-compliance use (healthcare
+included) and carries a non-zero risk of WhatsApp restricting the account. The
+conservative pacing defaults exist because of that.
 
 ### HR
 | Method | Path | Purpose |
@@ -388,6 +439,29 @@ All under `/api/admin/` — require `superuser` or `manager` role:
 
 ### Treatment ↔ InventoryItem Mirror
 When a `Treatment` or `TreatmentPackage` is saved, a mirror `InventoryItem` (is_service=True) is auto-created/updated via `save()`. Use `TreatmentQuerySet.delete()` to ensure cascade deletion.
+
+### Inventory ↔ GL boundary
+Only **one door** puts value into inventory: `PurchaseInvoice`. It creates batches
+directly (`views/accounting_page.py`), sets `value`, stamps `purchase_invoice`, and
+posts Dr Persediaan / Kr Hutang-vendor.
+
+`StockInView` is the other way in and it is **quantity-only** — it ignores any
+`value` in the payload and writes `value=0`. It posts no journal, so a value here
+would inflate the balance sheet with no credit and then surface later as FIFO COGS
+on the way out. A zero-value batch costs nothing to issue, which is correct: the
+clinic never recorded paying for it.
+
+`StockOutView` captures the FIFO cost at deduction time (it cannot be recomputed —
+the batches have moved on) and stores the operator's `reason`.
+`StockOutLog.REASON_ACCOUNTS` maps reason → account; `_stock_out_posting_status`
+marks a row `posted` up front when it has nothing to journal (a transfer, or a
+zero-cost draw) so the sweep stops reconsidering it every run.
+
+`InventoryDashboardView` classifies stock **per item across warehouses**, not per
+warehouse row — `min_stock` belongs to the item. `LOW_STOCK_WARN_RATIO = 1.2`
+defines the amber band and is mirrored in the frontend's `inventoryTypes.ts`.
+
+Covered by `tests/test_inventory_module.py`.
 
 ### FIFO Inventory
 `InventoryBatch` tracks stock by batch. Stock-out deducts from oldest batch first (ordered by `input_date`).
