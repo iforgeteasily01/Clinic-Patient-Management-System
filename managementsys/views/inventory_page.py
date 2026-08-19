@@ -22,7 +22,10 @@ from ..api.serializers import (
     ItemSyncSerializer,
     WarehouseSerializer,
 )
-from ..models import AppUser, AuditLog, InventoryBatch, InventoryItem, PencacahanRecord, StockOutLog, Warehouse
+from ..models import (
+    AppUser, AuditLog, ChartOfAccounts, InventoryBatch, InventoryItem,
+    PencacahanRecord, StockOutLog, Warehouse,
+)
 
 
 def _actor(request):
@@ -269,6 +272,90 @@ class StockLevelView(APIView):
         return Response(result)
 
 
+# ── Dashboard ──────────────────────────────────────────────────────────────
+
+# How close to `min_stock` counts as "approaching". 1.2 means an item sitting at
+# or below 120% of its minimum is amber; below the minimum itself it is red.
+# A ratio rather than a per-item reorder point on purpose: nobody would fill a
+# second threshold in for ~900 items, and an unfilled one warns about nothing.
+LOW_STOCK_WARN_RATIO = Decimal('1.2')
+
+
+def _stock_status(qty: Decimal, min_stock: Decimal) -> str:
+    """'below' | 'approaching' | 'ok' for one item's total on-hand.
+
+    An item with ``min_stock = 0`` has no threshold to breach, so it is never
+    flagged — including at zero stock, where flagging every discontinued item
+    would bury the ones that matter.
+    """
+    if min_stock <= 0:
+        return 'ok'
+    if qty < min_stock:
+        return 'below'
+    if qty <= min_stock * LOW_STOCK_WARN_RATIO:
+        return 'approaching'
+    return 'ok'
+
+
+class InventoryDashboardView(APIView):
+    """Summary for the inventory module landing page.
+
+    Stock is judged **per item across every warehouse**, not per warehouse row.
+    ``min_stock`` is a property of the item, so an item split 3/3 across two
+    warehouses against a minimum of 5 is fine — the per-warehouse view that the
+    stock overview table renders would call both rows low.
+    """
+
+    def get(self, request):
+        items = list(
+            InventoryItem.objects
+            .filter(is_active=True, is_service=False)
+            .values('id', 'code', 'name', 'unit_small', 'min_stock')
+        )
+        valuation = stock_valuation_by_item([i['id'] for i in items])
+
+        rows = []
+        counts = {'below': 0, 'approaching': 0, 'ok': 0}
+        total_value = Decimal('0')
+        for i in items:
+            v = valuation.get(i['id'], {})
+            qty = Decimal(v.get('qty_on_hand') or 0)
+            min_stock = Decimal(i['min_stock'] or 0)
+            state = _stock_status(qty, min_stock)
+            counts[state] += 1
+            total_value += Decimal(v.get('stock_value') or 0)
+            if state != 'ok':
+                rows.append({
+                    'item_id': i['id'],
+                    'item_code': i['code'],
+                    'item_name': i['name'],
+                    'unit_small': i['unit_small'],
+                    'quantity': str(qty),
+                    'min_stock': str(min_stock),
+                    # How far under (negative) or over the minimum, so the page
+                    # can rank "3 short" above "1 short" without re-deriving it.
+                    'gap': str(qty - min_stock),
+                    'status': state,
+                })
+
+        # Worst first: everything below the minimum, then the deepest shortfall.
+        rows.sort(key=lambda r: (r['status'] != 'below', Decimal(r['gap'])))
+
+        return Response({
+            'warn_ratio': str(LOW_STOCK_WARN_RATIO),
+            'counts': {
+                'below_minimum': counts['below'],
+                'approaching_minimum': counts['approaching'],
+                'ok': counts['ok'],
+                'total_items': len(items),
+            },
+            'stock_value': str(total_value.quantize(Decimal('0.01'))),
+            'unposted_stock_out': StockOutLog.objects.filter(posting_status='unposted').count(),
+            'alerts': rows,
+        })
+
+
+
 # ── Batches (stock-in history) ─────────────────────────────────────────────
 
 class InventoryBatchListView(APIView):
@@ -283,6 +370,20 @@ class InventoryBatchListView(APIView):
 
 # ── Stock In ───────────────────────────────────────────────────────────────
 
+# Stock-in through the inventory menu is a *quantity* movement, never a
+# valuation. Batches it creates carry ``value=0``, and the endpoint ignores any
+# ``value`` the caller sends.
+#
+# The reason is that this view writes no journal. Before this, a stock-in here
+# could set a batch value out of thin air: inventory on the balance sheet grew
+# with no credit anywhere, and the number then leaked into the P&L later as FIFO
+# COGS on the way out. Purchasing is the one door priced stock comes through —
+# ``PurchaseInvoice`` posts Dr Inventory / Cr AP-vendor and stamps
+# ``InventoryBatch.purchase_invoice`` — so a batch with a value and a batch with
+# a journal are now the same set of rows.
+#
+# A zero-value batch consumes FIFO at zero cost, so issuing it later charges
+# nothing. That is correct: the clinic never recorded paying for it.
 class StockInView(APIView):
     def post(self, request):
         data = request.data
@@ -307,7 +408,6 @@ class StockInView(APIView):
             qty_raw = Decimal(str(data['quantity']))
             unit = data.get('unit', 'small')
             qty_small = _to_small(item, qty_raw, unit)
-            value = Decimal(str(data['value']))
             input_date = data['input_date']
         except (KeyError, ValueError) as exc:
             return Response({'error': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -321,7 +421,7 @@ class StockInView(APIView):
             input_date=input_date,
             quantity_initial=qty_small,
             quantity_remaining=qty_small,
-            value=value,
+            value=Decimal('0'),
             created_by=_actor(request),
         )
         AuditLog.objects.create(
@@ -357,7 +457,6 @@ class StockInView(APIView):
                 qty_raw = Decimal(str(entry['quantity']))
                 unit = entry.get('unit', 'small')
                 qty_small = _to_small(item, qty_raw, unit)
-                value = Decimal(str(entry['value']))
                 input_date = entry['input_date']
             except (KeyError, ValueError) as exc:
                 skipped.append({'index': i, 'reason': str(exc)})
@@ -373,7 +472,7 @@ class StockInView(APIView):
                 input_date=input_date,
                 quantity_initial=qty_small,
                 quantity_remaining=qty_small,
-                value=value,
+                value=Decimal('0'),
                 created_by=actor,
             )
             AuditLog.objects.create(
@@ -435,6 +534,37 @@ def _stock_out_posting_status(reason, value):
     """
     journalable = bool(StockOutLog.REASON_ACCOUNTS.get(reason)) and value > 0
     return 'unposted' if journalable else 'posted'
+
+
+class StockOutReasonsView(APIView):
+    """The reason catalog with the account each one charges.
+
+    The stock-out form needs to show the operator *where the cost lands* before
+    they submit — that is the whole point of picking a reason. Serving it from
+    ``REASON_ACCOUNTS`` rather than duplicating the mapping in TypeScript means
+    the form and the journal engine cannot drift, and a renamed COA row shows
+    its new name here without a frontend deploy.
+    """
+
+    def get(self, request):
+        numbers = {n for n in StockOutLog.REASON_ACCOUNTS.values() if n}
+        names = dict(
+            ChartOfAccounts.objects
+            .filter(account_number__in=numbers)
+            .values_list('account_number', 'name')
+        )
+        return Response([
+            {
+                'code': code,
+                'label': label,
+                'account_number': StockOutLog.REASON_ACCOUNTS.get(code),
+                'account_name': names.get(StockOutLog.REASON_ACCOUNTS.get(code)),
+                # False for Pindah Gudang: stock moves, the clinic still owns
+                # it, so there is nothing to charge and no entry to write.
+                'posts_journal': bool(StockOutLog.REASON_ACCOUNTS.get(code)),
+            }
+            for code, label in StockOutLog.REASON_CHOICES
+        ])
 
 
 class StockOutView(APIView):

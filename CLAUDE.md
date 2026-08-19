@@ -274,12 +274,34 @@ All models are in a single file. Search carefully.
 | GET/PUT/DELETE | `/api/promotions/<id>/` | Detail |
 
 ### CRM
+Two things behind one prefix. `crm_page.py` is the **patient directory** (the
+`/patients` page); `crm_dashboard.py` is the **relationship view** (the `/crm`
+page). Both read the same `PatientCRMProfile`, so visit counts can't disagree.
+
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/crm/patients/` | Patient CRM list (`?q=`, `?tier=`, `?page=`) |
 | GET | `/api/crm/patients/<patient_no>/` | CRM detail |
+| GET | `/api/crm/dashboard/` | Dashboard: 30-day summary + deltas, activity buckets, demographics, top treatments/products, upcoming birthdays, 7-day unique visitor list |
+| GET | `/api/crm/patients/<patient_no>/profile/` | Relationship profile — visits collapsed to treatments + products, favourites, birthday, message context |
+| GET/POST | `/api/crm/message-templates/` | WhatsApp template CRUD (+ `placeholders` legend) |
+| GET/PUT/DELETE | `/api/crm/message-templates/<id>/` | Template detail |
+| POST | `/api/crm/message-templates/<id>/render/` | Fill `{placeholder}` tokens for one patient |
 | GET/POST | `/api/admin/tiers/` | Tier CRUD |
 | GET/PUT/DELETE | `/api/admin/tiers/<id>/` | Tier detail |
+
+Three constraints in `crm_dashboard.py` worth reading before editing it:
+- **Days are cut in `Asia/Jakarta`**, not `timezone.now().date()` — this is
+  clinic-facing, so a 22:30 WIB checkout belongs to that day.
+- **A visit is a non-voided invoice.** Patients still in the queue have none
+  yet, so today's list unions in open `ActivePatient` rows flagged `in_clinic`.
+- **`/api/crm/dashboard/` must stay declared before `/api/crm/patients/<str:patient_no>/`**
+  in `urls.py` or 'dashboard' is read as a patient number.
+
+Message templates **send nothing** — no messaging API is wired up. A template is
+text with `{token}` placeholders substituted by `services/message_templates.py`;
+an unknown token is left intact rather than blanked, so a typo is visible in the
+preview instead of silently deleting a word.
 
 ### HR
 | Method | Path | Purpose |

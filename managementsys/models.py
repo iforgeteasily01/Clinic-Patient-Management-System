@@ -20,9 +20,23 @@ class Patient(models.Model):
     address = models.CharField(max_length=100, null=True, blank=True)
     phone_number = models.CharField(max_length=15, null=True, blank=True)
     NIK = models.CharField(max_length=16, null=True, blank=True)
+    # Both nullable and both new in 0110: every patient registered before that
+    # migration has neither, and reception can only fill them in on the next
+    # visit. Any CRM statistic that segments on them therefore has to report
+    # its own coverage rather than treat "unknown" as a third category.
+    birth_date = models.DateField(null=True, blank=True)
+    GENDER_CHOICES = [('F', 'Perempuan'), ('M', 'Laki-laki')]
+    gender = models.CharField(max_length=1, choices=GENDER_CHOICES, blank=True, default='')
     # Resolved from the SatuSehat Master Patient Index (by NIK). Unused until the sync phase.
     ihs_id = models.CharField(max_length=64, null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    def age_on(self, as_of):
+        """Age in whole years on ``as_of``, or None when birth_date is unset."""
+        if not self.birth_date:
+            return None
+        b = self.birth_date
+        return as_of.year - b.year - ((as_of.month, as_of.day) < (b.month, b.day))
 
     def __str__(self):
         return self.name
@@ -2623,6 +2637,46 @@ class OperationalInputEntry(models.Model):
 
     def __str__(self):
         return f'{self.template.name} {self.period_key}: {self.amount}'
+
+
+
+# ── CRM message templates ──────────────────────────────────────────────────
+# Canned WhatsApp follow-up text the operator copies by hand. Deliberately not
+# wired to any messaging API: nothing here sends, schedules or records a send.
+# The model exists so the wording is shared between staff and survives a
+# browser reset, which a localStorage draft would not.
+
+
+class MessageTemplate(models.Model):
+    CATEGORY_CHOICES = [
+        ('followup',  'Follow-up Kunjungan'),
+        ('birthday',  'Ulang Tahun'),
+        ('reminder',  'Pengingat Jadwal'),
+        ('promo',     'Promosi'),
+        ('other',     'Lainnya'),
+    ]
+
+    name       = models.CharField(max_length=100)
+    category   = models.CharField(max_length=20, choices=CATEGORY_CHOICES, default='followup')
+    # Free text with {placeholder} tokens. The set of tokens the server will
+    # substitute lives in services/message_templates.py, not here — a body may
+    # legitimately contain a token that is unknown, and it is rendered as-is so
+    # the operator can see and fix it rather than losing the text silently.
+    body       = models.TextField()
+    is_active  = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=0)
+    created_by = models.ForeignKey(
+        AppUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='message_templates',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['sort_order', 'name']
+
+    def __str__(self):
+        return self.name
 
 
 #####

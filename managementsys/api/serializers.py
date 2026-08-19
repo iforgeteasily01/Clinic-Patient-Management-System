@@ -25,7 +25,8 @@ from ..models import (
 class PatientSerializer(serializers.ModelSerializer):
     class Meta:
         model = Patient
-        fields = ["patient_no", "name", "address", "phone_number", "NIK"]
+        fields = ["patient_no", "name", "address", "phone_number", "NIK",
+                  "birth_date", "gender"]
         extra_kwargs = {
             # name is nullable in DB but must be provided on input — the model's
             # save() method needs it to generate patient_no.
@@ -375,7 +376,8 @@ class InventoryItemSerializer(serializers.ModelSerializer):
 class PatientSyncSerializer(serializers.ModelSerializer):
     class Meta:
         model = Patient
-        fields = ['patient_no', 'name', 'address', 'phone_number', 'NIK', 'updated_at']
+        fields = ['patient_no', 'name', 'address', 'phone_number', 'NIK',
+                  'birth_date', 'gender', 'updated_at']
         read_only_fields = fields
 
 
@@ -409,6 +411,12 @@ class InventoryBatchSerializer(serializers.ModelSerializer):
     item_unit_small = serializers.CharField(source='item.unit_small', read_only=True)
     warehouse_name = serializers.CharField(source='warehouse.name', read_only=True)
     created_by_name = serializers.SerializerMethodField()
+    # A batch's value comes from exactly one place: the purchase invoice that
+    # received it. Batches created by the inventory stock-in form carry no
+    # invoice and no value, and the movement page says so rather than showing a
+    # bare "Rp 0" the operator would read as a bug.
+    purchase_invoice_no = serializers.CharField(
+        source='purchase_invoice.internal_id', read_only=True, default=None)
 
     class Meta:
         model = InventoryBatch
@@ -416,6 +424,7 @@ class InventoryBatchSerializer(serializers.ModelSerializer):
             'id', 'item_id', 'item_code', 'item_name', 'item_unit_small',
             'warehouse_id', 'warehouse_name',
             'input_date', 'quantity_initial', 'quantity_remaining', 'value',
+            'purchase_invoice', 'purchase_invoice_no',
             'created_by_name', 'created_at',
         ]
         read_only_fields = [

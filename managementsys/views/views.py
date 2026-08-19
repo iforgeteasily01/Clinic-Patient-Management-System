@@ -11,8 +11,8 @@ from .soap_templates_page import SoapTemplateListCreateView, SoapTemplateDetailV
 from .inventory_page import (
     InventoryItemListCreateView, InventoryItemDetailView,
     WarehouseListCreateView, WarehouseDetailView,
-    StockLevelView, InventoryBatchListView,
-    StockInView, StockOutView, StockOutBatchListView,
+    StockLevelView, InventoryDashboardView, InventoryBatchListView,
+    StockInView, StockOutView, StockOutBatchListView, StockOutReasonsView,
     ItemSyncView,
     InventoryItemImportPreviewView,
     InventoryItemImportView,
@@ -71,6 +71,13 @@ from .assessment_codes_page import (
 )
 from .promotion_page import PromotionListCreateView, PromotionDetailView, PromotionValidateView
 from .crm_page import PatientCRMListView, PatientCRMDetailView, PatientTierListCreateView, PatientTierDetailView
+from .crm_dashboard import (
+    CRMDashboardView,
+    CRMPatientProfileView,
+    MessageTemplateDetailView,
+    MessageTemplateListCreateView,
+    MessageTemplateRenderView,
+)
 from .hr_attendance_page import (
     ClockInView, ClockOutView,
     AttendanceListView, AttendanceSummaryView,

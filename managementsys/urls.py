@@ -132,10 +132,12 @@ urlpatterns = [
     path('api/inventory/warehouses/', views.WarehouseListCreateView.as_view(), name='inventory-warehouses'),
     path('api/inventory/warehouses/<int:pk>/', views.WarehouseDetailView.as_view(), name='inventory-warehouse-detail'),
     path('api/inventory/stock/', views.StockLevelView.as_view(), name='inventory-stock'),
+    path('api/inventory/dashboard/', views.InventoryDashboardView.as_view(), name='inventory-dashboard'),
     path('api/inventory/batches/', views.InventoryBatchListView.as_view(), name='inventory-batches'),
     path('api/inventory/stock-in/', views.StockInView.as_view(), name='inventory-stock-in'),
     path('api/inventory/stock-out/', views.StockOutView.as_view(), name='inventory-stock-out'),
     path('api/inventory/stock-out/batches/', views.StockOutBatchListView.as_view(), name='inventory-stock-out-batches'),
+    path('api/inventory/stock-out/reasons/', views.StockOutReasonsView.as_view(), name='inventory-stock-out-reasons'),
     path('api/inventory/sync/items/', views.ItemSyncView.as_view(), name='inventory-sync-items'),
     path('api/inventory/production/recipes/', views.RecipeListCreateView.as_view(), name='production-recipes'),
     path('api/inventory/production/recipes/export/', views.RecipeExportView.as_view(), name='production-recipes-export'),
@@ -186,7 +188,14 @@ urlpatterns = [
 
     # CRM
     path('api/crm/patients/', views.PatientCRMListView.as_view(), name='crm-patients'),
+    # Declared before the <patient_no> catch-all: 'dashboard' would otherwise be
+    # read as a patient number and 404 on every request.
+    path('api/crm/dashboard/', views.CRMDashboardView.as_view(), name='crm-dashboard'),
+    path('api/crm/patients/<str:patient_no>/profile/', views.CRMPatientProfileView.as_view(), name='crm-patient-profile'),
     path('api/crm/patients/<str:patient_no>/', views.PatientCRMDetailView.as_view(), name='crm-patient-detail'),
+    path('api/crm/message-templates/', views.MessageTemplateListCreateView.as_view(), name='crm-message-templates'),
+    path('api/crm/message-templates/<int:pk>/', views.MessageTemplateDetailView.as_view(), name='crm-message-template-detail'),
+    path('api/crm/message-templates/<int:pk>/render/', views.MessageTemplateRenderView.as_view(), name='crm-message-template-render'),
 
     # Tiers
     path('api/admin/tiers/', views.PatientTierListCreateView.as_view(), name='admin-tiers'),
