@@ -29,7 +29,6 @@ from .admin_views import (
     DoctorListCreateAdminView, DoctorDetailAdminView,
     PatientListCreateAdminView, PatientDetailAdminView,
     TreatmentListCreateAdminView, TreatmentDetailAdminView,
-    TreatmentMaterialListCreateView, TreatmentMaterialDetailView,
     TreatmentImportView, TreatmentTemplateView,
     TreatmentPackageListCreateAdminView, TreatmentPackageDetailAdminView, TreatmentPackageSyncView,
     BeauticianListCreateAdminView, BeauticianDetailAdminView, BeauticianReleaseView,
@@ -123,12 +122,36 @@ from .accounting_page import (
     JournalEntryCorrectionDraftView,
     JournalEntryCorrectView,
 )
+from .manual_journal_page import (
+    ManualJournalMetaView,
+    ManualJournalClassifyView,
+    ManualJournalCreateView,
+)
 from .financial_reports_page import (
     TrialBalanceView,
     ProfitLossView,
     BalanceSheetView,
     GeneralLedgerView,
     CashFlowView,
+)
+from .tax_page import (
+    TaxMetaView,
+    TaxRuleListCreateView,
+    TaxRuleDetailView,
+    TaxComputeView,
+)
+from .admin_quick_expense_page import (
+    QuickExpenseAliasListView,
+    QuickExpenseListCreateView,
+)
+from .admin_operations_page import (
+    AdminDashboardView,
+    OperationalCostReportView,
+    OperationalEntryDetailView,
+    OperationalEntryListCreateView,
+    OperationalTasksView,
+    OperationalTemplateDetailView,
+    OperationalTemplateListCreateView,
 )
 
 # Create your views here.

@@ -33,14 +33,17 @@ from managementsys.models import JournalEntry, LedgerEntry
 
 # Source types a document produces exactly once. Memo types are excluded: an
 # edit or void legitimately adds more rows to a document that was already posted.
-SOURCE_TYPES = ('invoice', 'purchase', 'transfer', 'expense')
+SOURCE_TYPES = ('invoice', 'purchase', 'transfer', 'expense', 'stock')
 
-# LedgerEntry FK -> how to label the document it points at.
+# JournalEntry FK -> how to label the document it points at. Mirrors
+# journal_engine.DOCUMENT_FIELDS; a document kind missing here is simply not
+# checked, so keep the two in step when a new kind is added.
 DOCUMENT_FIELDS = {
     'invoice':          'Invoice',
     'purchase_invoice': 'Purchase',
     'transfer':         'Transfer',
     'expense':          'Expense',
+    'stock_out_log':    'Stock out',
 }
 
 

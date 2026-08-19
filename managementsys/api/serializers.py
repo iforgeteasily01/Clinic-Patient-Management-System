@@ -10,14 +10,14 @@ from ..models import (
     AssessmentCode, AttendanceRecord, Beauticians,
     ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseAlias, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem, InvoicePayment,
     IssueTicket, IssueTicketImage, JournalEntry, JournalStagingBatch, LedgerEntry,
-    MedRec, Patient, PatientCRMProfile,
+    MedRec, OperationalInputEntry, OperationalInputTemplate, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
     PaymentMethod,
     ProductionRecipe, ProductionRecipeIngredient, ProductionRun, ProductionRunIngredient,
     Promotion, PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem,
     PurchasePayment, ReportSettings, SiteConfig,
     SoapTemplate, StagedJournalEntry, StagedJournalLine, StaffSchedule, Supplier,
-    Treatment, TreatmentCategory, TreatmentMaterial,
+    Treatment, TreatmentCategory,
     TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift, patientStatus,
 )
 
@@ -222,17 +222,6 @@ class TreatmentSerializer(serializers.ModelSerializer):
         model = Treatment
         fields = ["id", "code", "name", "category", "price", "active", "sort_order", "catalog_item_id"]
         read_only_fields = ["catalog_item_id"]
-
-
-class TreatmentMaterialSerializer(serializers.ModelSerializer):
-    item_name = serializers.CharField(source='item.name', read_only=True)
-    item_code = serializers.CharField(source='item.code', read_only=True)
-    unit_small = serializers.CharField(source='item.unit_small', read_only=True)
-
-    class Meta:
-        model = TreatmentMaterial
-        fields = ['id', 'treatment', 'item', 'item_name', 'item_code', 'unit_small', 'quantity_small']
-        read_only_fields = ['id', 'item_name', 'item_code', 'unit_small']
 
 
 class AppUserPublicSerializer(serializers.ModelSerializer):
@@ -1962,3 +1951,108 @@ class AppointmentSerializer(serializers.ModelSerializer):
         if errors:
             raise serializers.ValidationError(errors)
         return attrs
+
+
+# ── Operational inputs (planning only — never posts to the GL) ───────────────
+
+
+class OperationalInputTemplateSerializer(serializers.ModelSerializer):
+    """One recurring cost the operator is expected to record each period."""
+
+    account_name   = serializers.CharField(source='account.name', read_only=True, allow_null=True)
+    account_number = serializers.IntegerField(source='account.account_number', read_only=True, allow_null=True)
+    # A method field, not IntegerField(read_only=True): the create/update views
+    # serialise the instance they just saved, which carries no `entry_count`
+    # annotation, and a plain field would raise AttributeError on it.
+    entry_count    = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OperationalInputTemplate
+        fields = [
+            'id', 'name', 'category', 'account', 'account_name', 'account_number',
+            'frequency', 'due_day', 'expected_amount', 'is_active', 'sort_order',
+            'notes', 'entry_count',
+        ]
+
+    def get_entry_count(self, obj):
+        # Prefer the list view's annotation; fall back to a count for the
+        # single-instance responses.
+        annotated = getattr(obj, 'entry_count', None)
+        return annotated if annotated is not None else obj.entries.count()
+
+    def validate_name(self, value):
+        # The uniqueness rule is a Meta.constraints UniqueConstraint rather than
+        # unique=True on the field, so it is checked here explicitly: without
+        # this, a duplicate name reaches the database and surfaces as a 500
+        # IntegrityError instead of a field error the form can show.
+        name = (value or '').strip()
+        clash = OperationalInputTemplate.objects.filter(name__iexact=name)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError('Nama template sudah dipakai.')
+        return name
+
+    def validate(self, attrs):
+        # due_day means two different things depending on frequency, so the
+        # range it must fall in is validated together with it rather than as a
+        # field-level rule that cannot see the other value. On PATCH, fall back
+        # to the instance for whichever half was not sent.
+        frequency = attrs.get('frequency') or getattr(self.instance, 'frequency', None) or 'monthly'
+        due_day = attrs.get('due_day', getattr(self.instance, 'due_day', 1))
+        if due_day is not None:
+            upper = 7 if frequency == 'weekly' else 31
+            if not 1 <= int(due_day) <= upper:
+                raise serializers.ValidationError({
+                    'due_day': (
+                        'Hari 1–7 (Senin–Minggu) untuk template mingguan.'
+                        if frequency == 'weekly'
+                        else 'Tanggal 1–31 untuk template bulanan.'
+                    ),
+                })
+        return attrs
+
+    def validate_account(self, value):
+        if value is not None and value.account_type not in ('expense', 'cogs'):
+            raise serializers.ValidationError('Pilih akun beban atau HPP.')
+        return value
+
+
+class OperationalInputEntrySerializer(serializers.ModelSerializer):
+    """A recorded period figure. Read-only shape; writes go through the view.
+
+    ``period_key``/``period_start`` are derived server-side from the template's
+    frequency (see ``services.operational_inputs``), so they are read-only here
+    even though a client sends a period on create — the view resolves it.
+    """
+
+    template_name = serializers.CharField(source='template.name', read_only=True)
+    category      = serializers.CharField(source='template.category', read_only=True)
+    frequency     = serializers.CharField(source='template.frequency', read_only=True)
+    recorded_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OperationalInputEntry
+        fields = [
+            'id', 'template', 'template_name', 'category', 'frequency',
+            'period_key', 'period_start', 'amount', 'notes',
+            'recorded_by_name', 'recorded_at', 'updated_at',
+        ]
+        read_only_fields = ['period_key', 'period_start', 'recorded_at', 'updated_at']
+
+    def get_recorded_by_name(self, obj):
+        return obj.recorded_by.display_name if obj.recorded_by_id else None
+
+
+class OperationalInputEntryWriteSerializer(serializers.Serializer):
+    """Create/replace one period's figure.
+
+    ``period`` is a period *key* ('2026-08' / '2026-W34'), validated against the
+    template's frequency by the view rather than here — the template has to be
+    fetched to know the frequency at all, and doing it twice invites drift.
+    """
+
+    template = serializers.IntegerField()
+    period   = serializers.CharField(max_length=10)
+    amount   = serializers.DecimalField(max_digits=18, decimal_places=2, min_value=Decimal('0'))
+    notes    = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')

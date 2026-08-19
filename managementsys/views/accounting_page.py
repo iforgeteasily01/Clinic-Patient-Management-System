@@ -1980,59 +1980,32 @@ class AccountTransferDetailView(APIView):
 
 class JournalAdjustmentView(APIView):
     """
-    POST /api/accounting/adjustments/
-    Body: { account, entry_type (debit|credit), amount, date, description }
+    POST /api/accounting/adjustments/  — **retired**, always 410.
 
-    Creates a LedgerEntry and updates the account balance.
+    This wrote a single LedgerEntry row with no counterpart. It was wrong twice
+    over: one row cannot balance, so every adjustment pushed the trial balance
+    out by its own amount permanently; and it moved the cached balance by
+    ``+amount`` for a debit and ``-amount`` for a credit regardless of the
+    account's normal balance, so a credit to a revenue or liability account moved
+    that account the wrong way.
+
+    Manual entries now go to ``POST /api/accounting/manual-journal/``, which
+    requires both sides, names the transaction, and posts through ``write_legs``
+    like every other journal document. The URL is kept (rather than deleted) so
+    an older client gets this explanation instead of a 404.
     """
 
+    RETIRED_MESSAGE = (
+        'Penyesuaian satu sisi sudah tidak digunakan karena membuat jurnal tidak '
+        'seimbang. Gunakan Entri Jurnal Manual (/accounting/journal/manual), yang '
+        'mewajibkan sisi debit dan kredit.'
+    )
+
     def post(self, request):
-        data       = request.data
-        entry_type = data.get('entry_type', '').strip().lower()
-        if entry_type not in ('debit', 'credit'):
-            return Response({'error': 'entry_type must be debit or credit.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        amount = _safe_decimal(data.get('amount', 0))
-        if amount <= 0:
-            return Response({'error': 'Jumlah harus lebih dari nol.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        description = (data.get('description') or '').strip()
-        if not description:
-            return Response({'error': 'Keterangan wajib diisi.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        adj_date = data.get('date')
-        if not adj_date:
-            return Response({'error': 'Tanggal wajib diisi.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            account = ChartOfAccounts.objects.get(pk=data['account'])
-        except (ChartOfAccounts.DoesNotExist, KeyError):
-            return Response({'error': 'Invalid account.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        with transaction.atomic():
-            if entry_type == 'debit':
-                ChartOfAccounts.objects.filter(pk=account.pk).update(balance=account.balance + amount)
-            else:
-                ChartOfAccounts.objects.filter(pk=account.pk).update(balance=account.balance - amount)
-
-            entry = LedgerEntry.objects.create(
-                account=account,
-                date=adj_date,
-                description=description,
-                entry_type=entry_type,
-                amount=amount,
-                source_type='adjustment',
-            )
-
-            AuditLog.objects.create(
-                performed_by=_actor(request),
-                action='CREATE',
-                entity_type='LedgerEntry',
-                entity_id=str(entry.id),
-                description=f'Manual adjustment: {entry_type.upper()} Rp{amount:,.0f} on {account}',
-            )
-
-        return Response(LedgerEntrySerializer(entry).data, status=status.HTTP_201_CREATED)
+        return Response(
+            {'error': self.RETIRED_MESSAGE},
+            status=status.HTTP_410_GONE,
+        )
 
 
 # ── Journal Run (Phase 2 batch posting) ────────────────────────────────────────
@@ -3291,9 +3264,11 @@ class DailySalesView(APIView):
                                       tzinfo=WIB)
         day_end   = day_start + datetime.timedelta(days=1)
 
+        # Voided invoices are out: this figure is counted against the physical
+        # drawer, and a voided sale put nothing in it.
         invoices = (
             Invoice.objects
-            .filter(datetime__gte=day_start, datetime__lt=day_end)
+            .filter(datetime__gte=day_start, datetime__lt=day_end, is_voided=False)
             .select_related('payment_method', 'payment_method__linked_account')
         )
 

@@ -27,10 +27,13 @@ from rest_framework.views import APIView
 
 from ..models import ChartOfAccounts, LedgerEntry
 from .financial_reports_utils import (
-    CASH_ACCOUNT_NUMBERS,
+    ACTIVITY_LABELS,
+    ACTIVITY_ORDER,
     ZERO,
     account_movements,
     accounts_by_id,
+    cash_report_account_ids,
+    classify_activity,
     earliest_ledger_date,
     earnings_through,
     opening_balances,
@@ -137,6 +140,55 @@ def _s(val):
     """Serialize a money Decimal as a string fixed to 2 decimal places, so the
     representation is identical regardless of DB backend / aggregate path."""
     return str((val if val is not None else ZERO).quantize(_CENTS))
+
+
+def _bump(mapping, key, delta):
+    """Add a signed money delta into ``mapping[key]``'s inflow/outflow pair,
+    creating the slot on first use. Every bucket in the cash-flow statement
+    keeps gross inflow and outflow separately, so a single signed number can
+    never be split by hand at each call site."""
+    slot = mapping.setdefault(key, {'inflow': ZERO, 'outflow': ZERO})
+    if delta > 0:
+        slot['inflow'] += delta
+    else:
+        slot['outflow'] += -delta
+
+
+def _attribute(cash_delta, counterparts):
+    """Attribute one journal entry's net cash movement to its counterpart accounts.
+
+    ``cash_delta`` is the entry's net cash change (debit positive).
+    ``counterparts`` are its non-cash lines.
+
+    Attribution is by *signed* side, not raw amount. In a balanced entry the
+    counterparts sum to exactly ``-cash_delta``, so each account's share is
+    simply the negation of its own signed amount — which is the only way a
+    contra account lands on the correct side. A cash sale posting
+    ``Dr Cash 100 / Dr Sales Discount 10 / Cr Revenue 110`` must report revenue
+    as a 110 inflow and the discount as a 10 outflow; weighting by raw amount
+    would instead show the discount as an 8.33 *inflow*.
+
+    When the entry does not balance the shares are scaled to foot to
+    ``cash_delta`` anyway, so the statement always ties to the cash accounts.
+
+    Yields ``(account_id, share)``, share positive for inflow.
+    """
+    signed = {}
+    for line in counterparts:
+        delta = line.amount if line.entry_type == 'debit' else -line.amount
+        signed[line.account_id] = signed.get(line.account_id, ZERO) - delta
+
+    total = sum(signed.values(), ZERO)
+    if total == cash_delta or total == ZERO:
+        shares = {k: v.quantize(_CENTS) for k, v in signed.items()}
+    else:
+        shares = {k: (v * cash_delta / total).quantize(_CENTS) for k, v in signed.items()}
+
+    drift = cash_delta - sum(shares.values(), ZERO)
+    if drift and shares:
+        biggest = max(shares, key=lambda k: abs(shares[k]))
+        shares[biggest] += drift
+    return list(shares.items())
 
 
 def _wants_xlsx(request):
@@ -629,10 +681,36 @@ class GeneralLedgerView(APIView):
         return _xlsx_response(wb, f"buku-besar-{p['date_from']}_{p['date_to']}.xlsx")
 
 
-# ── Arus Kas (simplified direct-method Cash Flow) ────────────────────────────
+# ── Arus Kas (direct-method Cash Flow) ───────────────────────────────────────
 
 class CashFlowView(APIView):
-    """GET /api/accounting/reports/cash-flow/?date_from=&date_to="""
+    """GET /api/accounting/reports/cash-flow/?date_from=&date_to=
+
+    Direct-method cash flow built from the cash side of the journal.
+
+    Three things make this more than a ``GROUP BY source_type`` over cash lines:
+
+    * **Scope.** "Cash" is ``cash_report_account_ids()`` — every real cash/bank
+      account including ones retired from the payment pickers, excluding the
+      iPos history clearing account. Reporting on the ``1100000`` *head* instead
+      (as this view used to) yields nothing at all: heads never carry entries.
+
+    * **Internal transfers are netted out.** Moving money from Bank BCA to Cash
+      is not an inflow and not an outflow; counting both legs inflates gross
+      cash movement without changing the net. Those legs are reported separately
+      as a memo line.
+
+    * **Activity classification.** Each cash line is attributed through the
+      *counterpart* accounts in its own journal entry, by signed side so a
+      contra account lands as a reduction. That is what separates operating
+      from investing and financing — ``source_type`` cannot, since a purchase
+      of stock and a purchase of equipment are both ``purchase``.
+
+    Anything that cannot be attributed (a journal entry whose only line is the
+    cash line — i.e. an unbalanced entry) is reported in its own bucket rather
+    than folded into operating, so a posting bug shows up on the report instead
+    of hiding inside a subtotal.
+    """
 
     def get(self, request):
         d_from, d_to, err = _parse_range(request)
@@ -643,49 +721,179 @@ class CashFlowView(APIView):
         if gate:
             return gate
 
-        cash_accounts = list(
-            ChartOfAccounts.objects.filter(account_number__in=CASH_ACCOUNT_NUMBERS)
+        cash_ids = cash_report_account_ids()
+        accts = accounts_by_id()
+        cash_accounts = sorted(
+            (accts[i] for i in cash_ids if i in accts),
+            key=lambda a: a.account_number,
         )
-        cash_ids = [a.id for a in cash_accounts]
 
         opening_map = opening_balances(d_from, account_ids=cash_ids)
         opening_cash = sum((opening_map.get(i, ZERO) for i in cash_ids), ZERO)
 
-        # Movements on cash accounts within the range, grouped by source_type.
-        entries = (
+        cash_lines = list(
             LedgerEntry.objects
             .filter(date__gte=d_from, date__lte=d_to, account_id__in=cash_ids)
+            .only('id', 'account_id', 'amount', 'entry_type', 'source_type', 'journal_entry')
         )
-        groups = {}
-        for e in entries:
-            g = groups.setdefault(e.source_type, {'inflow': ZERO, 'outflow': ZERO})
+
+        # One extra query pulls every line of every journal entry that touched
+        # cash, so counterparts are resolved in memory rather than per row.
+        je_ids = {e.journal_entry_id for e in cash_lines if e.journal_entry_id}
+        siblings = {}
+        if je_ids:
+            for line in LedgerEntry.objects.filter(journal_entry_id__in=je_ids).only(
+                'id', 'account_id', 'amount', 'entry_type', 'journal_entry'
+            ):
+                siblings.setdefault(line.journal_entry_id, []).append(line)
+
+        # activity -> counterpart account_id -> {'inflow', 'outflow'}
+        buckets = {a: {} for a in ACTIVITY_ORDER}
+        by_source = {}
+        internal_in = internal_out = ZERO
+        unclassified = {}
+        per_account = {
+            i: {'inflow': ZERO, 'outflow': ZERO, 'opening': opening_map.get(i, ZERO)}
+            for i in cash_ids
+        }
+        net_change = ZERO
+
+        # Per-line first: net change and the per-account reconciliation are
+        # purely mechanical and must include internal transfers, since those do
+        # move an individual account's balance.
+        cash_by_je = {}
+        for e in cash_lines:
+            delta = e.amount if e.entry_type == 'debit' else -e.amount
+            net_change += delta
+
+            pa = per_account[e.account_id]
             if e.entry_type == 'debit':
-                g['inflow'] += e.amount
+                pa['inflow'] += e.amount
             else:
-                g['outflow'] += e.amount
+                pa['outflow'] += e.amount
+
+            cash_by_je.setdefault(e.journal_entry_id, []).append((e, delta))
+
+        # Then per journal entry: attribution is only meaningful against a whole
+        # entry, because that is where a cash line's counterparts live.
+        for je_id, members in cash_by_je.items():
+            group = siblings.get(je_id, [])
+            counterparts = [line for line in group if line.account_id not in cash_ids]
+            je_delta = sum((d for _, d in members), ZERO)
+
+            if not counterparts:
+                # Only cash lines in this entry: a genuine internal transfer if
+                # there is more than one, otherwise the entry is one-sided and
+                # cannot be attributed at all. je_id None is the pre-migration-0098
+                # backfill gap — those lines share no header, so they are never
+                # each other's transfer counterpart no matter how many there are.
+                internal = je_id is not None and len(members) > 1
+                for e, delta in members:
+                    if internal:
+                        if delta > 0:
+                            internal_in += delta
+                        else:
+                            internal_out += -delta
+                    else:
+                        _bump(unclassified, e.source_type, delta)
+                continue
+
+            for e, delta in members:
+                _bump(by_source, e.source_type, delta)
+
+            source_type = members[0][0].source_type
+            for cp_id, share in _attribute(je_delta, counterparts):
+                cp = accts.get(cp_id)
+                activity = classify_activity(cp) if cp else None
+                if activity:
+                    _bump(buckets[activity], cp_id, share)
+                else:
+                    _bump(unclassified, source_type, share)
+
+        closing_cash = opening_cash + net_change
+
+        activities = []
+        for name in ACTIVITY_ORDER:
+            rows = []
+            a_in = a_out = ZERO
+            for acc_id, v in buckets[name].items():
+                acc = accts.get(acc_id)
+                a_in += v['inflow']
+                a_out += v['outflow']
+                rows.append({
+                    'account_number': acc.account_number if acc else None,
+                    'account_name':   acc.name if acc else 'Akun tidak dikenal',
+                    'inflow':         _s(v['inflow']),
+                    'outflow':        _s(v['outflow']),
+                    'net':            _s(v['inflow'] - v['outflow']),
+                })
+            rows.sort(key=lambda r: (r['account_number'] is None, r['account_number'] or 0))
+            activities.append({
+                'activity': name,
+                'label':    ACTIVITY_LABELS[name],
+                'lines':    rows,
+                'inflow':   _s(a_in),
+                'outflow':  _s(a_out),
+                'net':      _s(a_in - a_out),
+            })
 
         flows = []
-        net_change = ZERO
-        for source, g in sorted(groups.items(), key=lambda kv: kv[0]):
-            net = g['inflow'] - g['outflow']
-            net_change += net
+        for source, g in sorted(by_source.items(), key=lambda kv: str(kv[0])):
             flows.append({
                 'source_type': source,
                 'label':       SOURCE_LABELS.get(source, source or 'Lainnya'),
                 'inflow':      _s(g['inflow']),
                 'outflow':     _s(g['outflow']),
-                'net':         _s(net),
+                'net':         _s(g['inflow'] - g['outflow']),
             })
 
-        closing_cash = opening_cash + net_change
+        unclassified_rows = []
+        u_in = u_out = ZERO
+        for source, g in sorted(unclassified.items(), key=lambda kv: str(kv[0])):
+            u_in += g['inflow']
+            u_out += g['outflow']
+            unclassified_rows.append({
+                'source_type': source,
+                'label':       SOURCE_LABELS.get(source, source or 'Lainnya'),
+                'inflow':      _s(g['inflow']),
+                'outflow':     _s(g['outflow']),
+                'net':         _s(g['inflow'] - g['outflow']),
+            })
+
         payload = {
             'date_from':    d_from.isoformat(),
             'date_to':      d_to.isoformat(),
             'opening_cash': _s(opening_cash),
+            'activities':   activities,
             'flows':        flows,
+            'internal_transfers': {
+                'inflow':  _s(internal_in),
+                'outflow': _s(internal_out),
+                'net':     _s(internal_in - internal_out),
+            },
+            'unclassified': {
+                'lines':   unclassified_rows,
+                'inflow':  _s(u_in),
+                'outflow': _s(u_out),
+                'net':     _s(u_in - u_out),
+            },
             'net_change':   _s(net_change),
             'closing_cash': _s(closing_cash),
-            'accounts':     [{'account_number': a.account_number, 'name': a.name} for a in cash_accounts],
+            'accounts': [
+                {
+                    'account_number': a.account_number,
+                    'name':           a.name,
+                    'opening':        _s(per_account[a.id]['opening']),
+                    'inflow':         _s(per_account[a.id]['inflow']),
+                    'outflow':        _s(per_account[a.id]['outflow']),
+                    'closing':        _s(
+                        per_account[a.id]['opening']
+                        + per_account[a.id]['inflow']
+                        - per_account[a.id]['outflow']
+                    ),
+                }
+                for a in cash_accounts
+            ],
         }
 
         if _wants_xlsx(request):
@@ -696,7 +904,7 @@ class CashFlowView(APIView):
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = 'Arus Kas'
-        for col, w in zip('ABCD', [30, 18, 18, 18]):
+        for col, w in zip('ABCDE', [46, 18, 18, 18, 18]):
             ws.column_dimensions[col].width = w
         r = _title_row(ws, 'Laporan Arus Kas (Metode Langsung)', 4,
                        f"Periode {p['date_from']} s/d {p['date_to']}")
@@ -707,15 +915,39 @@ class CashFlowView(APIView):
         obv.font = _f_bold; obv.number_format = ACCT_FMT; obv.alignment = _right
         r += 2
 
-        for idx, label in enumerate(['Sumber', 'Kas Masuk', 'Kas Keluar', 'Bersih']):
+        for idx, label in enumerate(['Keterangan', 'Kas Masuk', 'Kas Keluar', 'Bersih']):
             c = ws.cell(row=r, column=idx + 1, value=label)
             c.font = _f_bold; c.fill = _header_fill; c.border = _all_thin
         r += 1
-        for f in p['flows']:
-            ws.cell(row=r, column=1, value=f['label'])
+
+        def _money_row(row, label, block, bold=False, indent=0):
+            c = ws.cell(row=row, column=1, value=('    ' * indent) + label)
+            if bold:
+                c.font = _f_bold
             for col, key in ((2, 'inflow'), (3, 'outflow'), (4, 'net')):
-                cell = ws.cell(row=r, column=col, value=float(f[key]))
+                cell = ws.cell(row=row, column=col, value=float(block[key]))
                 cell.number_format = ACCT_FMT; cell.alignment = _right
+                if bold:
+                    cell.font = _f_bold
+            return row + 1
+
+        for act in p['activities']:
+            sec = ws.cell(row=r, column=1, value=act['label'])
+            sec.font = _f_section; sec.fill = _section_fill
+            r += 1
+            for line in act['lines']:
+                r = _money_row(
+                    r, f"{line['account_number']} — {line['account_name']}", line, indent=1)
+            r = _money_row(r, f"Jumlah — {act['label']}", act, bold=True)
+            r += 1
+
+        if p['unclassified']['lines']:
+            sec = ws.cell(row=r, column=1, value='Belum Terklasifikasi (jurnal tidak seimbang)')
+            sec.font = _f_section; sec.fill = _section_fill
+            r += 1
+            for line in p['unclassified']['lines']:
+                r = _money_row(r, line['label'], line, indent=1)
+            r = _money_row(r, 'Jumlah — Belum Terklasifikasi', p['unclassified'], bold=True)
             r += 1
 
         nl = ws.cell(row=r, column=1, value='Perubahan Kas Bersih')
@@ -727,4 +959,31 @@ class CashFlowView(APIView):
         cl.font = _f_bold
         cv = ws.cell(row=r, column=4, value=float(p['closing_cash']))
         cv.font = _f_bold; cv.number_format = ACCT_FMT; cv.alignment = _right
+        r += 2
+
+        it = p['internal_transfers']
+        if float(it['inflow']) or float(it['outflow']):
+            memo = ws.cell(
+                row=r, column=1,
+                value='Memo — mutasi antar rekening kas '
+                      f"(tidak memengaruhi kas bersih): {float(it['inflow']):,.0f}")
+            memo.font = _f_normal
+            r += 2
+
+        # Per-account reconciliation, so the operator can tie each cash/bank
+        # account's closing balance back to the statement total.
+        sec = ws.cell(row=r, column=1, value='Rincian per Rekening Kas')
+        sec.font = _f_section; sec.fill = _section_fill
+        r += 1
+        for idx, label in enumerate(['Rekening', 'Saldo Awal', 'Masuk', 'Keluar', 'Saldo Akhir']):
+            c = ws.cell(row=r, column=idx + 1, value=label)
+            c.font = _f_bold; c.fill = _header_fill; c.border = _all_thin
+        r += 1
+        for a in p['accounts']:
+            ws.cell(row=r, column=1, value=f"{a['account_number']} — {a['name']}")
+            for col, key in ((2, 'opening'), (3, 'inflow'), (4, 'outflow'), (5, 'closing')):
+                cell = ws.cell(row=r, column=col, value=float(a[key]))
+                cell.number_format = ACCT_FMT; cell.alignment = _right
+            r += 1
+
         return _xlsx_response(wb, f"arus-kas-{p['date_from']}_{p['date_to']}.xlsx")

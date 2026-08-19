@@ -14,7 +14,7 @@ from django.utils import timezone
 
 from managementsys.models import (
     ChartOfAccounts, InventoryBatch, Invoice, InvoiceItem, Patient,
-    PatientPackage, PatientPackageRedemption, Treatment, TreatmentMaterial,
+    PatientPackage, PatientPackageRedemption, Treatment,
     TreatmentPackage, TreatmentPackageItem,
 )
 
@@ -273,76 +273,3 @@ class TestPackageReversal:
         assert PatientPackageRedemption.objects.count() == 1
         invoice.refresh_from_db()
         assert invoice.grand_total == Decimal("450000.00")
-
-
-@pytest.mark.django_db
-class TestServiceMaterialReversal:
-    """A service line consumes its treatment's materials; reversing must give
-    them back. Before the fix, materials were deducted on sale but never
-    restocked on edit or void."""
-
-    @pytest.fixture
-    def facial(self, stock, gl_accounts):
-        material_item = InventoryItemFactory(selling_price=0)
-        material_batch = InventoryBatchFactory(
-            item=material_item, warehouse=stock["warehouse"],
-            quantity_initial=Decimal("100"), quantity_remaining=Decimal("100"),
-            value=Decimal("500000"),
-        )
-        treatment = Treatment.objects.create(
-            code="FACIAL", name="Facial", category="Skin", price=Decimal("50000"),
-        )
-        TreatmentMaterial.objects.create(
-            treatment=treatment, item=material_item, quantity_small=Decimal("5"),
-        )
-        # Treatment.save() mirrors a service InventoryItem into the catalog.
-        treatment.refresh_from_db()
-        return {"treatment": treatment, "batch": material_batch}
-
-    def test_void_restocks_treatment_materials(self, auth_api, stock, gl_accounts, facial):
-        service_item = facial["treatment"].catalog_item
-        assert service_item is not None and service_item.is_service
-
-        res = auth_api.post(
-            reverse("invoice-create"),
-            _create_payload(stock, gl_accounts, item_id=service_item.id,
-                            quantity=1, price=50000, grand_total=50000),
-            format="json",
-        )
-        assert res.status_code in (200, 201), res.content
-        invoice = Invoice.objects.latest("id")
-        _run_journal(auth_api)
-
-        # 5 units of material consumed by the service.
-        assert InventoryBatch.objects.get(pk=facial["batch"].pk).quantity_remaining == Decimal("95.0000")
-
-        res = auth_api.delete(reverse("invoice-detail", args=[invoice.pk]))
-        assert res.status_code == 200, res.content
-
-        assert InventoryBatch.objects.get(pk=facial["batch"].pk).quantity_remaining == Decimal("100.0000")
-
-    def test_edit_off_a_service_line_restocks_materials(self, auth_api, stock, gl_accounts, facial):
-        service_item = facial["treatment"].catalog_item
-
-        res = auth_api.post(
-            reverse("invoice-create"),
-            _create_payload(stock, gl_accounts, item_id=service_item.id,
-                            quantity=1, price=50000, grand_total=50000),
-            format="json",
-        )
-        assert res.status_code in (200, 201), res.content
-        invoice = Invoice.objects.latest("id")
-        _run_journal(auth_api)
-        assert InventoryBatch.objects.get(pk=facial["batch"].pk).quantity_remaining == Decimal("95.0000")
-
-        # Swap the service for a plain product: the material must come back.
-        res = auth_api.put(
-            reverse("invoice-detail", args=[invoice.pk]),
-            {"grand_total": 10000, "items": [
-                {"item_id": stock["item"].id, "quantity": 1, "price": 10000},
-            ]},
-            format="json",
-        )
-        assert res.status_code == 200, res.content
-
-        assert InventoryBatch.objects.get(pk=facial["batch"].pk).quantity_remaining == Decimal("100.0000")

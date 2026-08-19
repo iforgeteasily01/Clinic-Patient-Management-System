@@ -26,7 +26,7 @@ from ..services.cash_accounts import cash_bank_account_ids
 from ..services.journal_engine import LegSet, _apply_balance, _le, _post_legs, _revenue_legs
 from .crm_page import refresh_crm_profile
 from .inventory_page import (
-    FifoSimulation, _fifo_deduct, _fifo_deduct_global, _fifo_restock, _fifo_restock_global,
+    FifoSimulation, _fifo_deduct, _fifo_restock,
 )
 from .promotion_page import validate_promotion
 
@@ -195,23 +195,13 @@ def build_invoice_legs(invoice, line_items, items_by_id, *, deduct=True, sim=Non
                               f'Invoice {inv_no} – FIFO deduction: {item.name}',
                               f'Invoice {inv_no} – COGS: {item.name}')
 
-        if item.is_service:
-            treatment = getattr(item, 'treatment', None)
-            if treatment:
-                deduct_fn = (
-                    (lambda mid, qty: _fifo_deduct(mid, invoice.warehouse_id, qty,
-                                                   commit=deduct, sim=sim))
-                    if invoice.warehouse_id
-                    else (lambda mid, qty: _fifo_deduct_global(mid, qty,
-                                                               commit=deduct, sim=sim))
-                )
-                for material in treatment.materials.all():
-                    _shortfall, mat_cogs = deduct_fn(material.item_id, material.quantity_small)
-                    if mat_cogs <= 0:
-                        continue
-                    cogs_pair(mat_cogs,
-                              f'Invoice {inv_no} – material: {material.item.name} for {item.name}',
-                              f'Invoice {inv_no} – material COGS: {material.item.name} for {item.name}')
+        # Service lines post no cost. A treatment used to consume a fixed
+        # bill-of-materials (TreatmentMaterial) and book the FIFO result as
+        # COGS; that model was removed because a fixed recipe does not survive
+        # contact with real usage — the actual quantity of cleanser, anaesthetic
+        # or filler used varies per patient and per operator, so the posted cost
+        # was precise and wrong. Cost of sales for treatments is now entered by
+        # hand as a periodic journal (see migration 0107).
 
     return legset
 
@@ -341,35 +331,11 @@ def _reverse_accounting_instances(payment_method_id, grand_total, item_instances
                                 f'Invoice {inv_no} – COGS correction: {item.name}',
                                 date=memo_date, source_type=source_type)
 
-        # Mirror of the material deduction _post_accounting does for services.
-        if item.is_service:
-            treatment = getattr(item, 'treatment', None)
-            if treatment:
-                restock_fn = (
-                    (lambda mid, qty: _fifo_restock(mid, warehouse_id, qty))
-                    if warehouse_id
-                    else (lambda mid, qty: _fifo_restock_global(mid, qty))
-                )
-                for material in treatment.materials.all():
-                    mat_cogs = restock_fn(material.item_id, material.quantity_small)
-                    if mat_cogs <= 0:
-                        continue
-                    if inventory_asset:
-                        ChartOfAccounts.objects.filter(pk=inventory_asset.pk).update(
-                            balance=F('balance') + mat_cogs
-                        )
-                        if invoice:
-                            _le(inventory_asset, 'debit', mat_cogs, invoice,
-                                f'Invoice {inv_no} – material restock: {material.item.name} for {item.name}',
-                                date=memo_date, source_type=source_type)
-                    if cogs_acct:
-                        ChartOfAccounts.objects.filter(pk=cogs_acct.pk).update(
-                            balance=F('balance') - mat_cogs
-                        )
-                        if invoice:
-                            _le(cogs_acct, 'credit', mat_cogs, invoice,
-                                f'Invoice {inv_no} – material COGS correction: {material.item.name} for {item.name}',
-                                date=memo_date, source_type=source_type)
+        # Service lines consume nothing, so there is nothing to give back.
+        # The TreatmentMaterial bill-of-materials this used to mirror was removed
+        # (migration 0107) — see the matching note in build_invoice_legs. Keeping
+        # a reversal for a deduction that no longer happens would credit stock
+        # the sale never took.
 
 
 def _handle_packages(invoice, patient, line_items, items_by_id):
@@ -651,7 +617,7 @@ class InvoiceCreateView(APIView):
             obj.id: obj
             for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
                 'item_category__revenue_account',
-            ).prefetch_related('treatment__materials__item')
+            ).prefetch_related('treatment')
         }
         missing = [iid for iid in item_ids if iid not in items_by_id]
         if missing:
@@ -876,7 +842,7 @@ class InvoiceDetailView(APIView):
                 obj.id: obj
                 for obj in InventoryItem.objects.filter(id__in=item_ids).select_related(
                     'item_category__revenue_account',
-                ).prefetch_related('treatment__materials__item')
+                ).prefetch_related('treatment')
             }
             missing = [iid for iid in item_ids if iid not in new_items_by_id]
             if missing:
@@ -908,6 +874,12 @@ class InvoiceDetailView(APIView):
         new_split_rows = new_tenders if len(new_tenders) > 1 else []
 
         # ── Capture old state before any modifications ────────────────────────
+        # The GL fingerprint is taken here, against the rows still in the
+        # database, and again after every mutation below. Equal fingerprints mean
+        # the edit touched nothing the posting is derived from, so the edit-memo
+        # reversal + repost is skipped — see the accounting block.
+        from ..services.journal_preview import invoice_gl_fingerprint  # local: cycle
+        gl_before             = invoice_gl_fingerprint(invoice)
         old_scalars           = _snapshot_scalars(invoice)
         old_grand_total       = invoice.grand_total
         old_payment_method_id = invoice.payment_method_id
@@ -918,7 +890,7 @@ class InvoiceDetailView(APIView):
             .select_related(
                 'item__item_category__revenue_account',
             )
-            .prefetch_related('item__treatment__materials__item')
+            .prefetch_related('item__treatment')
             .all()
         )
 
@@ -1030,7 +1002,22 @@ class InvoiceDetailView(APIView):
         # posted values plus a fresh posting of the NEW values, both dated
         # today and tagged source_type='edit_memo'. The original transaction
         # date's LedgerEntry rows and JournalDayLog are left untouched.
-        was_posted = invoice.posting_status == 'posted'
+        #
+        # The memo pair is written only when the edit actually moved something
+        # the posting reads. Without this check every PATCH appended a full
+        # reversal + repost — eight-odd rows that net to zero but pile up on the
+        # invoice's journal view, so a handful of re-saves made one sale look
+        # like it had been journalled half a dozen times. `payments` is compared
+        # against the rows about to replace it rather than the ones still in the
+        # table, since the swap below deliberately happens after the reversal.
+        after_splits = (
+            [(r.payment_account_id, r.payment_method_id, r.amount, r.sort_order)
+             for r in new_split_rows]
+            if replacing_payments else None
+        )
+        gl_changed = invoice_gl_fingerprint(invoice, splits=after_splits) != gl_before
+
+        was_posted = invoice.posting_status == 'posted' and gl_changed
         memo_date = timezone.now().date() if was_posted else None
         memo_source = 'edit_memo' if was_posted else 'invoice'
 
@@ -1121,7 +1108,7 @@ class InvoiceDetailView(APIView):
             .select_related(
                 'item__item_category__revenue_account',
             )
-            .prefetch_related('item__treatment__materials__item')
+            .prefetch_related('item__treatment')
             .all()
         )
 

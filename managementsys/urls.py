@@ -18,8 +18,6 @@ urlpatterns = [
     path('api/admin/treatments/template/', views.TreatmentTemplateView.as_view(), name='admin-treatments-template'),
     path('api/admin/treatments/import/', views.TreatmentImportView.as_view(), name='admin-treatments-import'),
     path('api/admin/treatments/<int:pk>/', views.TreatmentDetailAdminView.as_view(), name='admin-treatment-detail'),
-    path('api/admin/treatments/<int:pk>/materials/', views.TreatmentMaterialListCreateView.as_view(), name='admin-treatment-materials'),
-    path('api/admin/treatments/<int:pk>/materials/<int:mid>/', views.TreatmentMaterialDetailView.as_view(), name='admin-treatment-material-detail'),
     path('api/admin/treatment-packages/', views.TreatmentPackageListCreateAdminView.as_view(), name='admin-treatment-packages'),
     path('api/admin/treatment-packages/<int:pk>/', views.TreatmentPackageDetailAdminView.as_view(), name='admin-treatment-package-detail'),
     path('api/treatment-packages/', views.TreatmentPackageSyncView.as_view(), name='treatment-packages-sync'),
@@ -45,6 +43,20 @@ urlpatterns = [
     path('api/admin/report-settings/', views.ReportSettingsView.as_view(), name='admin-report-settings'),
     path('api/admin/expense-aliases/', views.ExpenseAliasListCreateView.as_view(), name='admin-expense-aliases'),
     path('api/admin/expense-aliases/<int:pk>/', views.ExpenseAliasDetailView.as_view(), name='admin-expense-alias-detail'),
+
+    # Admin module: operator dashboard + operational-cost inputs.
+    # These inputs are planning records only — see views/admin_operations_page.py.
+    path('api/admin/dashboard/', views.AdminDashboardView.as_view(), name='admin-dashboard'),
+    path('api/admin/operations/templates/', views.OperationalTemplateListCreateView.as_view(), name='admin-operations-templates'),
+    path('api/admin/operations/templates/<int:pk>/', views.OperationalTemplateDetailView.as_view(), name='admin-operations-template-detail'),
+    path('api/admin/operations/entries/', views.OperationalEntryListCreateView.as_view(), name='admin-operations-entries'),
+    path('api/admin/operations/entries/<int:pk>/', views.OperationalEntryDetailView.as_view(), name='admin-operations-entry-detail'),
+    path('api/admin/operations/tasks/', views.OperationalTasksView.as_view(), name='admin-operations-tasks'),
+    path('api/admin/operations/report/', views.OperationalCostReportView.as_view(), name='admin-operations-report'),
+
+    # Simplified purchasing: alias-picked expenses, scope='general'.
+    path('api/admin/quick-expenses/aliases/', views.QuickExpenseAliasListView.as_view(), name='admin-quick-expense-aliases'),
+    path('api/admin/quick-expenses/', views.QuickExpenseListCreateView.as_view(), name='admin-quick-expenses'),
 
     # Beautician petty-cash expenses (design doc §4)
     path('api/beautician/expense-aliases/', views.BeauticianExpenseAliasListView.as_view(), name='beautician-expense-aliases'),
@@ -216,7 +228,12 @@ urlpatterns = [
     path('api/accounting/expenses/<int:pk>/pay/',       views.ExpensePayView.as_view(),                 name='accounting-expense-pay'),
     path('api/accounting/transfers/',              views.AccountTransferListCreateView.as_view(), name='accounting-transfers'),
     path('api/accounting/transfers/<int:pk>/',     views.AccountTransferDetailView.as_view(),    name='accounting-transfer-detail'),
+    # Retired: single-sided adjustments unbalanced the ledger. Kept so an older
+    # client gets a 410 with an explanation rather than a 404.
     path('api/accounting/adjustments/',            views.JournalAdjustmentView.as_view(),        name='accounting-adjustments'),
+    path('api/accounting/manual-journal/',          views.ManualJournalCreateView.as_view(),      name='accounting-manual-journal'),
+    path('api/accounting/manual-journal/meta/',     views.ManualJournalMetaView.as_view(),        name='accounting-manual-journal-meta'),
+    path('api/accounting/manual-journal/classify/', views.ManualJournalClassifyView.as_view(),    name='accounting-manual-journal-classify'),
     path('api/accounting/journal/',                views.JournalHistoryView.as_view(),           name='accounting-journal'),
     path('api/accounting/journal/run/',            views.JournalRunView.as_view(),               name='accounting-journal-run'),
     path('api/accounting/journal/run/stream/',     views.JournalRunStreamView.as_view(),         name='accounting-journal-run-stream'),
@@ -237,6 +254,12 @@ urlpatterns = [
     path('api/accounting/payment-plan/export/',    views.PaymentPlanExportView.as_view(),        name='accounting-payment-plan-export'),
 
     # Financial Reports (Laporan Keuangan)
+    # ── Perpajakan ──────────────────────────────────────────────────────────
+    path('api/accounting/tax/meta/',        views.TaxMetaView.as_view(),           name='tax-meta'),
+    path('api/accounting/tax/rules/',       views.TaxRuleListCreateView.as_view(), name='tax-rules'),
+    path('api/accounting/tax/rules/<int:pk>/', views.TaxRuleDetailView.as_view(),  name='tax-rule-detail'),
+    path('api/accounting/tax/compute/',     views.TaxComputeView.as_view(),        name='tax-compute'),
+
     path('api/accounting/reports/trial-balance/',  views.TrialBalanceView.as_view(),   name='reports-trial-balance'),
     path('api/accounting/reports/profit-loss/',    views.ProfitLossView.as_view(),     name='reports-profit-loss'),
     path('api/accounting/reports/balance-sheet/',  views.BalanceSheetView.as_view(),   name='reports-balance-sheet'),

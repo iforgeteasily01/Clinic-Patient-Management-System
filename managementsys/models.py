@@ -1,5 +1,6 @@
 import secrets
 from datetime import date
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 from django.contrib.auth.hashers import check_password, make_password
@@ -226,29 +227,6 @@ class Treatment(models.Model):
         super().delete(*args, **kwargs)
         if catalog_item_id:
             InventoryItem.objects.filter(pk=catalog_item_id, is_service=True).delete()
-
-
-class TreatmentMaterial(models.Model):
-    """Stock items consumed during a treatment (e.g. 5 ml of cleanser per facial)."""
-    treatment = models.ForeignKey(
-        Treatment,
-        on_delete=models.CASCADE,
-        related_name='materials',
-    )
-    item = models.ForeignKey(
-        'InventoryItem',
-        on_delete=models.PROTECT,
-        related_name='treatment_materials',
-        limit_choices_to={'is_service': False},
-    )
-    quantity_small = models.DecimalField(max_digits=10, decimal_places=4)
-
-    class Meta:
-        unique_together = ('treatment', 'item')
-        ordering = ['id']
-
-    def __str__(self):
-        return f'{self.treatment.name} — {self.quantity_small} {self.item.unit_small} of {self.item.name}'
 
 
 # TreatmentSession
@@ -2356,6 +2334,295 @@ class Appointment(models.Model):
                 self.start_at or timezone.now(), JAKARTA_TZ).year
             self.appointment_no = Appointment.next_number(year)
         super().save(*args, **kwargs)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Taxation
+#
+# A tax rule is *data*, not code: the operator builds it on /accounting/tax by
+# picking the accounts that form the base and choosing how a rate applies. The
+# engine in services/tax_engine.py evaluates it against the LedgerEntry journal
+# for a requested period, exactly like the financial reports do.
+#
+# Nothing here writes to the ledger — rules are a reporting overlay.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TaxRule(models.Model):
+    """One computed tax line, e.g. 'PPN Keluaran' or 'PPh Badan'.
+
+    ``rate_mode`` decides how the base (Dasar Pengenaan Pajak) becomes a tax
+    amount. Four modes exist because Indonesian rates genuinely take four
+    shapes and no single percentage field covers them:
+
+    ``flat``      base x rate_percent. PPN, PPh Final UMKM.
+    ``bracket``   progressive layers, see TaxRuleBracket. PPh 21.
+    ``facility``  the Pasal 31E shape: income attributable to the first
+                  ``facility_turnover_cap`` of turnover is taxed at
+                  rate x ``facility_factor``, the remainder at the full rate.
+    ``none``      no rate at all — the base *is* the answer. Used by netting
+                  rules such as PPN Kurang Bayar (keluaran - masukan).
+
+    Every threshold and rate is a field rather than a constant, so a change in
+    the law is an edit on the page, not a deployment.
+    """
+
+    BASIS_CHOICES = [
+        ('period', 'Periode Terpilih'),
+        ('ytd',    'Akumulasi Tahun Berjalan'),
+    ]
+    RATE_MODE_CHOICES = [
+        ('flat',     'Tarif Tunggal'),
+        ('bracket',  'Tarif Progresif'),
+        ('facility', 'Tarif Fasilitas (Pasal 31E)'),
+        ('none',     'Tanpa Tarif'),
+    ]
+    ROUNDING_CHOICES = [
+        ('none',     'Tanpa Pembulatan'),
+        ('rupiah',   'Bulat Rupiah (ke bawah)'),
+        ('thousand', 'Bulat Ribuan (ke bawah)'),
+    ]
+
+    code        = models.SlugField(max_length=40, unique=True)
+    name        = models.CharField(max_length=120)
+    description = models.CharField(max_length=300, blank=True, default='')
+
+    # 'ytd' widens the window to 1 January of date_to's year regardless of the
+    # requested date_from. Annual tests (the Rp 4,8bn omzet ceiling) are
+    # meaningless against a single month.
+    basis     = models.CharField(max_length=10, choices=BASIS_CHOICES, default='period')
+    rate_mode = models.CharField(max_length=10, choices=RATE_MODE_CHOICES, default='flat')
+
+    # flat / facility modes. Percent, not fraction: 11 means 11%.
+    rate_percent = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+
+    # Subtracted from the base before any rate applies (PTKP, and any other
+    # allowance that is a flat figure rather than a ledger balance).
+    deduction_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    # ── facility mode (Pasal 31E) ────────────────────────────────────────────
+    # The turnover tested against the caps comes from another rule, not from
+    # this rule's own base: 31E tests *peredaran bruto* while taxing
+    # *penghasilan kena pajak*.
+    facility_turnover_rule = models.ForeignKey(
+        'self', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='facility_dependents',
+        help_text='Aturan yang menyediakan angka peredaran bruto untuk diuji.',
+    )
+    facility_turnover_cap = models.DecimalField(
+        max_digits=18, decimal_places=2, default=0,
+        help_text='Batas peredaran bruto yang mendapat fasilitas (Rp 4,8 M).',
+    )
+    facility_full_rate_cap = models.DecimalField(
+        max_digits=18, decimal_places=2, default=0,
+        help_text='Di atas batas ini fasilitas hilang sepenuhnya (Rp 50 M).',
+    )
+    facility_factor = models.DecimalField(
+        max_digits=5, decimal_places=4, default=Decimal('0.5'),
+        help_text='Pengali tarif untuk bagian yang mendapat fasilitas.',
+    )
+
+    rounding      = models.CharField(max_length=10, choices=ROUNDING_CHOICES, default='rupiah')
+    display_order = models.IntegerField(default=0)
+    is_active     = models.BooleanField(default=True)
+
+    # A rule outside its effective window is skipped, so a rate change is
+    # modelled as two rules rather than by editing history.
+    effective_from = models.DateField(null=True, blank=True)
+    effective_to   = models.DateField(null=True, blank=True)
+
+    notes      = models.CharField(max_length=500, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['display_order', 'code']
+        verbose_name = 'Tax Rule'
+        verbose_name_plural = 'Tax Rules'
+
+    def __str__(self):
+        return f'{self.code} – {self.name}'
+
+    def applies_on(self, day):
+        """True when `day` falls inside the rule's effective window."""
+        if self.effective_from and day < self.effective_from:
+            return False
+        if self.effective_to and day > self.effective_to:
+            return False
+        return True
+
+
+class TaxRuleComponent(models.Model):
+    """One signed term of a rule's base.
+
+    The base is the sum of its components, each multiplied by ``sign``. That is
+    the whole of the "formula" a user builds on the page: a netting rule such
+    as PPN Kurang Bayar is a +keluaran and a -masukan component, and a DPP is
+    one or more account selections.
+    """
+
+    SOURCE_CHOICES = [
+        ('account', 'Akun'),
+        ('subtree', 'Akun & Turunannya'),
+        ('type',    'Jenis Akun'),
+        ('rule',    'Hasil Aturan Lain'),
+        ('fixed',   'Nilai Tetap'),
+    ]
+
+    rule   = models.ForeignKey(TaxRule, on_delete=models.CASCADE, related_name='components')
+    source = models.CharField(max_length=10, choices=SOURCE_CHOICES, default='account')
+    # +1 adds the term to the base, -1 subtracts it.
+    sign   = models.SmallIntegerField(default=1)
+
+    # source='account' | 'subtree'
+    account = models.ForeignKey(
+        'ChartOfAccounts', null=True, blank=True,
+        on_delete=models.PROTECT, related_name='tax_components',
+    )
+    # source='type'
+    account_type = models.CharField(max_length=20, blank=True, default='')
+    # source='rule' — reads the referenced rule's *result*.
+    source_rule = models.ForeignKey(
+        TaxRule, null=True, blank=True,
+        on_delete=models.PROTECT, related_name='referenced_by',
+    )
+    # source='fixed'
+    fixed_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    label         = models.CharField(max_length=120, blank=True, default='')
+    display_order = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['display_order', 'id']
+
+    def __str__(self):
+        return f'{self.rule.code}: {self.sign:+d} {self.source}'
+
+
+class TaxRuleBracket(models.Model):
+    """One progressive layer of a ``rate_mode='bracket'`` rule (PPh 21).
+
+    ``upper_bound`` is the top of the layer, inclusive; NULL means the layer
+    runs to infinity. Layers are applied in ``upper_bound`` order and only the
+    portion of the base falling inside a layer is taxed at that layer's rate.
+    """
+
+    rule = models.ForeignKey(TaxRule, on_delete=models.CASCADE, related_name='brackets')
+    upper_bound = models.DecimalField(
+        max_digits=18, decimal_places=2, null=True, blank=True,
+        help_text='Batas atas lapisan; kosongkan untuk lapisan terakhir.',
+    )
+    rate_percent  = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    display_order = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['display_order', 'id']
+
+    def __str__(self):
+        cap = self.upper_bound if self.upper_bound is not None else '∞'
+        return f'{self.rule.code}: <={cap} @ {self.rate_percent}%'
+
+
+# ── Monthly / weekly operational inputs (planning only) ──────────────────────
+
+
+class OperationalInputTemplate(models.Model):
+    """A recurring operational cost the manager is expected to record each period.
+
+    Deliberately **planning-only**: recording a period's figure writes an
+    ``OperationalInputEntry`` and nothing else. No ``Expense``, no
+    ``LedgerEntry``, no ``posting_status`` — the journal engine never sees this
+    model. That is a product decision, not an oversight: these rows exist so
+    the operator can see the shape of monthly operating cost (and be nagged
+    about the months they have not filled in) without a second, competing path
+    into the general ledger. The books stay the books.
+
+    ``account`` is therefore advisory. It records *which* expense account the
+    real spend is expected to land in, so the operational-cost report can be
+    read next to the P&L, but nothing reconciles the two automatically.
+    """
+
+    FREQ_MONTHLY = 'monthly'
+    FREQ_WEEKLY = 'weekly'
+    FREQUENCY_CHOICES = [(FREQ_MONTHLY, 'Bulanan'), (FREQ_WEEKLY, 'Mingguan')]
+
+    name     = models.CharField(max_length=120)
+    # Free-text grouping for the report's subtotals (e.g. 'Sewa & Utilitas').
+    # A CharField rather than an FK because the groupings are a reporting
+    # preference the operator reshuffles, not a controlled vocabulary.
+    category = models.CharField(max_length=80, blank=True, default='')
+    account  = models.ForeignKey(
+        'ChartOfAccounts', on_delete=models.SET_NULL, null=True, blank=True,
+        limit_choices_to={'account_type__in': ['expense', 'cogs']},
+        related_name='operational_input_templates',
+        help_text='Akun beban yang diharapkan menampung biaya ini. Hanya untuk pelaporan.',
+    )
+    frequency = models.CharField(max_length=10, choices=FREQUENCY_CHOICES, default=FREQ_MONTHLY)
+    # Monthly: day of month, clamped to the month's length so 31 still resolves
+    # in February. Weekly: ISO weekday, 1=Monday .. 7=Sunday.
+    due_day   = models.PositiveSmallIntegerField(
+        default=1,
+        help_text='Bulanan: tanggal 1–31. Mingguan: hari 1 (Senin) – 7 (Minggu).',
+    )
+    expected_amount = models.DecimalField(
+        max_digits=18, decimal_places=2, default=0,
+        help_text='Perkiraan nominal; dipakai sebagai nilai awal saat input.',
+    )
+    is_active  = models.BooleanField(default=True)
+    sort_order = models.IntegerField(default=0)
+    notes      = models.CharField(max_length=255, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['sort_order', 'name']
+        constraints = [
+            models.UniqueConstraint(fields=['name'], name='uniq_operational_input_template_name'),
+        ]
+
+    def __str__(self):
+        return f'{self.name} ({self.get_frequency_display()})'
+
+
+class OperationalInputEntry(models.Model):
+    """One period's recorded figure for an ``OperationalInputTemplate``.
+
+    ``period_key`` is the canonical identity of a period and the thing the
+    uniqueness constraint is built on: ``'2026-08'`` for a monthly template,
+    ``'2026-W34'`` for a weekly one. ``period_start`` is derived from it (first
+    of the month / Monday of the ISO week) and stored so the reports can filter
+    and order by date without parsing strings in SQL.
+
+    Both are written by ``services.operational_inputs`` — never by hand, or the
+    two will disagree about which week a Sunday belongs to.
+    """
+
+    template     = models.ForeignKey(
+        OperationalInputTemplate, on_delete=models.CASCADE, related_name='entries',
+    )
+    period_key   = models.CharField(max_length=10)
+    period_start = models.DateField()
+    amount       = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    notes        = models.CharField(max_length=255, blank=True, default='')
+    recorded_by  = models.ForeignKey(
+        AppUser, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='operational_input_entries',
+    )
+    recorded_at  = models.DateTimeField(auto_now_add=True)
+    updated_at   = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-period_start', 'template__sort_order']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['template', 'period_key'], name='uniq_operational_input_period',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['period_start'], name='idx_opinput_period_start'),
+        ]
+
+    def __str__(self):
+        return f'{self.template.name} {self.period_key}: {self.amount}'
 
 
 #####

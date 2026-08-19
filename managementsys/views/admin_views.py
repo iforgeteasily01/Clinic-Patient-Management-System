@@ -30,14 +30,13 @@ from ..api.serializers import (
     ReportSettingsSerializer,
     SiteConfigSerializer,
     TreatmentCategorySerializer,
-    TreatmentMaterialSerializer,
     TreatmentPackageSerializer,
     TreatmentSerializer,
 )
 from ..models import (
     AppUser, AuditLog, Beauticians, ChartOfAccounts, ColorPalette, Doctors, ExpenseAlias, InventoryItem,
     LedgerEntry, Patient, PaymentMethod, ReportSettings, SiteConfig, Treatment, TreatmentCategory,
-    TreatmentMaterial, TreatmentPackage,
+    TreatmentPackage,
 )
 
 
@@ -173,85 +172,6 @@ class TreatmentDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
             description=f'Treatment deleted: {instance.name} ({instance.code})',
         )
         instance.delete()
-
-
-class TreatmentMaterialListCreateView(APIView):
-    """GET/POST treatment materials for a given treatment (admin only)."""
-
-    def get(self, request, pk):
-        try:
-            treatment = Treatment.objects.get(pk=pk)
-        except Treatment.DoesNotExist:
-            return Response({'error': 'Treatment not found.'}, status=status.HTTP_404_NOT_FOUND)
-        materials = TreatmentMaterial.objects.filter(treatment=treatment).select_related('item')
-        return Response(TreatmentMaterialSerializer(materials, many=True).data)
-
-    def post(self, request, pk):
-        try:
-            treatment = Treatment.objects.get(pk=pk)
-        except Treatment.DoesNotExist:
-            return Response({'error': 'Treatment not found.'}, status=status.HTTP_404_NOT_FOUND)
-        data = {**request.data, 'treatment': treatment.id}
-        serializer = TreatmentMaterialSerializer(data=data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        item_id = serializer.validated_data['item'].id
-        if InventoryItem.objects.filter(pk=item_id, is_service=True).exists():
-            return Response(
-                {'error': 'Cannot use a service item as a treatment material.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        instance = serializer.save()
-        AuditLog.objects.create(
-            performed_by=_actor(request),
-            action='CREATE',
-            entity_type='TreatmentMaterial',
-            entity_id=str(instance.id),
-            description=f'Material added to {treatment.name}: {instance.quantity_small} {instance.item.unit_small} of {instance.item.name}',
-        )
-        return Response(TreatmentMaterialSerializer(instance).data, status=status.HTTP_201_CREATED)
-
-
-class TreatmentMaterialDetailView(APIView):
-    """PUT/DELETE a single treatment material (admin only)."""
-
-    def _get(self, pk, mid):
-        try:
-            return TreatmentMaterial.objects.select_related('item').get(pk=mid, treatment_id=pk)
-        except TreatmentMaterial.DoesNotExist:
-            return None
-
-    def put(self, request, pk, mid):
-        instance = self._get(pk, mid)
-        if instance is None:
-            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
-        data = {**request.data, 'treatment': pk, 'item': instance.item_id}
-        serializer = TreatmentMaterialSerializer(instance, data=data)
-        if not serializer.is_valid():
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        updated = serializer.save()
-        AuditLog.objects.create(
-            performed_by=_actor(request),
-            action='UPDATE',
-            entity_type='TreatmentMaterial',
-            entity_id=str(updated.id),
-            description=f'Material updated: {updated.quantity_small} {updated.item.unit_small} of {updated.item.name}',
-        )
-        return Response(TreatmentMaterialSerializer(updated).data)
-
-    def delete(self, request, pk, mid):
-        instance = self._get(pk, mid)
-        if instance is None:
-            return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
-        AuditLog.objects.create(
-            performed_by=_actor(request),
-            action='DELETE',
-            entity_type='TreatmentMaterial',
-            entity_id=str(instance.id),
-            description=f'Material removed: {instance.quantity_small} {instance.item.unit_small} of {instance.item.name}',
-        )
-        instance.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class BeauticianListCreateAdminView(generics.ListCreateAPIView):

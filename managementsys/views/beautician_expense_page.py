@@ -2,21 +2,20 @@
 
 A beautician never picks a GL account: they pick a friendly ``ExpenseAlias``
 name, and this view resolves it to the real account behind the scenes. The
-actual write goes through ``services.expense_create.create_expense`` — the
-exact function the manager-facing expense form uses — so there is exactly one
-way an ``Expense`` gets written in this system, not two that could drift
-apart.
+actual write goes through ``services.alias_expense.create_alias_expense`` and
+from there ``services.expense_create.create_expense`` — the exact function the
+manager-facing expense form uses — so there is exactly one way an ``Expense``
+gets written in this system, not two that could drift apart. The admin
+quick-purchase form (``views/admin_quick_expense_page.py``) shares the same
+service with scope='general'.
 """
-from decimal import Decimal
-
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from ..api.serializers import BeauticianExpenseCreateSerializer, ExpenseAliasSerializer, ExpenseSerializer
-from ..models import AppUser, ChartOfAccounts, Expense, ExpenseAlias
-from ..services.cash_accounts import cash_bank_account_ids
-from ..services.expense_create import create_expense
+from ..models import AppUser, Expense, ExpenseAlias
+from ..services.alias_expense import AliasExpenseError, create_alias_expense
 
 
 def _actor(request):
@@ -92,66 +91,15 @@ class BeauticianExpenseListCreateView(APIView):
         serializer = BeauticianExpenseCreateSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        data = serializer.validated_data
-
-        payment_account_id = data['payment_account_id']
-        if payment_account_id not in cash_bank_account_ids():
-            return Response(
-                {'payment_account_id': ['Not a cash/bank account.']},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
         try:
-            payment_account = ChartOfAccounts.objects.get(pk=payment_account_id)
-        except ChartOfAccounts.DoesNotExist:
-            return Response(
-                {'payment_account_id': ['Not a cash/bank account.']},
-                status=status.HTTP_400_BAD_REQUEST,
+            expense = create_alias_expense(
+                data=serializer.validated_data,
+                scope='beautician',
+                source='beautician',
+                actor=_actor(request),
             )
-
-        alias_ids = [row['alias_id'] for row in data['items']]
-        aliases = {
-            a.id: a for a in ExpenseAlias.objects.filter(
-                id__in=alias_ids, scope='beautician', is_active=True,
-            ).select_related('account')
-        }
-        missing = [aid for aid in alias_ids if aid not in aliases]
-        if missing:
-            return Response(
-                {'items': f'Alias tidak ditemukan atau tidak aktif: {missing}'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        items = []
-        for row in data['items']:
-            alias = aliases[row['alias_id']]
-            # Each item resolves account = alias.account, description =
-            # description or alias.name — so the journal memo reads "Beli
-            # kapas" and the accountant can still see which GL account it hit,
-            # even though the beautician never saw the account number.
-            items.append({
-                'account': alias.account_id,
-                'description': (row.get('description') or '').strip() or alias.name,
-                'amount': row['amount'],
-                'alias': alias,
-            })
-
-        total_paid = sum((row['amount'] for row in items), Decimal('0'))
-
-        expense = create_expense(
-            expense_date=data['expense_date'],
-            payment_method=None,
-            payment_account=payment_account,
-            payment_memo=data.get('payment_memo', ''),
-            notes=data.get('notes', ''),
-            amount_paid=total_paid,
-            items=items,
-            actor=_actor(request),
-            source='beautician',
-            # Paid immediately: a beautician spending petty cash has already
-            # spent it, there is no payable to track.
-            status_override='paid',
-        )
-
+        except AliasExpenseError as exc:
+            return Response(exc.errors, status=status.HTTP_400_BAD_REQUEST)
         return Response(ExpenseSerializer(expense).data, status=status.HTTP_201_CREATED)
 
 

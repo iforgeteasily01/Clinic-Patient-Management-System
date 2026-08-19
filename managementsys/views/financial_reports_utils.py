@@ -36,8 +36,91 @@ NORMAL_BALANCE = {
 # Account types that make up the Income Statement (used to derive earnings)
 PL_TYPES = ('revenue', 'cogs', 'expense', 'other_income', 'other_expense')
 
-# Cash / bank asset accounts for the simplified cash-flow statement.
-CASH_ACCOUNT_NUMBERS = (1100000, 1110000)
+# ── Cash-flow scope & activity classification ────────────────────────────────
+#
+# The cash-flow statement needs a *reporting* definition of "cash", which is
+# deliberately not the same set as ``services.cash_accounts.cash_bank_account_ids``:
+# that one answers "where may an operator pay from?" and so drops accounts that
+# were retired from the pickers. A report must still show the money that moved
+# through a retired account while it was live, or opening + net change no longer
+# reconciles to the closing balance.
+#
+# So the report scope is: every non-head account in the 11xxxxx band (retired
+# ``(nonaktif)`` instrument accounts included), plus anything referenced as a
+# payment destination, minus the iPos history clearing account. That last
+# exclusion is the same decision migration 0100 recorded — 1100011 holds the
+# imported iPos sales history and nothing else, and its Rp 11.6bn balance is an
+# artifact of that import, not cash the clinic can spend.
+
+CASH_HEAD_NUMBER = 1100000
+CASH_BAND_END = CASH_HEAD_NUMBER + 100000
+IPOS_CLEARING_NUMBER = 1100011
+
+ACTIVITY_OPERATING = 'operating'
+ACTIVITY_INVESTING = 'investing'
+ACTIVITY_FINANCING = 'financing'
+ACTIVITY_ORDER = (ACTIVITY_OPERATING, ACTIVITY_INVESTING, ACTIVITY_FINANCING)
+
+ACTIVITY_LABELS = {
+    ACTIVITY_OPERATING: 'Arus Kas dari Aktivitas Operasi',
+    ACTIVITY_INVESTING: 'Arus Kas dari Aktivitas Investasi',
+    ACTIVITY_FINANCING: 'Arus Kas dari Aktivitas Pendanaan',
+}
+
+# Where the balance-sheet bands split current from non-current. The COA numbers
+# assets 1000000+ (cash 11xxxxx, inventory 1300000) and liabilities 2000000+
+# (accounts payable 21xxxxx, tax payable 2200000). Anything numbered at or above
+# these cut-offs is treated as non-current, which is what makes a fixed-asset
+# purchase investing and a bank loan financing once such accounts are added.
+NON_CURRENT_ASSET_FROM = 1500000
+LONG_TERM_LIABILITY_FROM = 2500000
+
+
+def cash_report_account_ids():
+    """The COA ids the cash-flow statement treats as cash — see the note above.
+
+    Returns a set. Imported lazily inside the function because
+    ``services.cash_accounts`` imports models that in turn pull view helpers."""
+    from ..services.cash_accounts import cash_bank_account_ids
+
+    ids = set(
+        ChartOfAccounts.objects
+        .filter(
+            account_type='asset',
+            is_head=False,
+            account_number__gt=CASH_HEAD_NUMBER,
+            account_number__lt=CASH_BAND_END,
+        )
+        .values_list('id', flat=True)
+    )
+    ids |= set(cash_bank_account_ids())
+    ids -= set(
+        ChartOfAccounts.objects
+        .filter(account_number=IPOS_CLEARING_NUMBER)
+        .values_list('id', flat=True)
+    )
+    return ids
+
+
+def classify_activity(account):
+    """Which cash-flow activity a *counterpart* account attributes its cash
+    movement to. `account` is the non-cash side of the journal entry.
+
+    P&L accounts are operating by definition. Working-capital accounts —
+    receivables, inventory, payables, tax payable — are operating too, because
+    the cash they move is trading cash. Equity and long-term debt are financing;
+    non-current assets are investing. Returns None for an account this cannot
+    place, so the caller can surface it rather than guess."""
+    t = account.account_type
+    if t in PL_TYPES:
+        return ACTIVITY_OPERATING
+    if t == 'asset':
+        return ACTIVITY_INVESTING if account.account_number >= NON_CURRENT_ASSET_FROM else ACTIVITY_OPERATING
+    if t == 'liability':
+        return ACTIVITY_FINANCING if account.account_number >= LONG_TERM_LIABILITY_FROM else ACTIVITY_OPERATING
+    if t == 'equity':
+        return ACTIVITY_FINANCING
+    return None
 
 
 def signed_balance(account_type, net):

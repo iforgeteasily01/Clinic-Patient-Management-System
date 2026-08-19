@@ -84,6 +84,48 @@ def _fingerprint(parts) -> str:
     return hashlib.sha256(joined.encode('utf-8')).hexdigest()
 
 
+def invoice_gl_parts(obj, *, splits=None) -> list:
+    """Everything an invoice's journal *legs* are derived from.
+
+    Deliberately excludes ``datetime``: it selects which day the sweep posts the
+    invoice on, but changes no leg. ``fingerprint_document`` adds it back,
+    because a preview staged for one day must go stale if the invoice moves to
+    another. The edit path (``InvoiceDetailView.put``) wants the narrower set —
+    see ``invoice_gl_fingerprint``.
+
+    Anything the posting reads must appear here. An omission means an edit that
+    changes the GL is mistaken for a no-op; a spurious inclusion only costs a
+    redundant reversal/repost pair, so err on the side of including.
+
+    ``splits`` overrides the persisted InvoicePayment rows. The edit path needs
+    that: it must fingerprint the invoice's *intended* final state while the old
+    split rows are still in the table, because the reversal that runs in between
+    rebuilds the old legs from them.
+    """
+    lines = list(obj.items.values_list('item_id', 'item_name', 'quantity', 'price'))
+    # Split payments are part of the entry's debit side — editing one changes
+    # which accounts get debited without touching any scalar below.
+    if splits is None:
+        splits = list(obj.payments.values_list(
+            'payment_account_id', 'payment_method_id', 'amount', 'sort_order'))
+    return [
+        'invoice', obj.pk, obj.grand_total, obj.tax,
+        obj.additional_charges, obj.discount, obj.payment_method_id,
+        # obj.payment_account_id resolves the payment leg's GL account
+        # (see journal_engine._revenue_legs) — without it here, changing
+        # an invoice's bank account would not invalidate a staged preview
+        # entry, and commit would post the stale (wrong) account.
+        obj.payment_account_id,
+        obj.warehouse_id, obj.is_voided, lines, splits,
+    ]
+
+
+def invoice_gl_fingerprint(obj, *, splits=None) -> str:
+    """Hash of ``invoice_gl_parts`` — equal before and after an edit means the
+    edit cannot have changed a single ledger leg."""
+    return _fingerprint(invoice_gl_parts(obj, splits=splits))
+
+
 def fingerprint_document(kind, obj) -> str:
     """A stable hash of everything the document's journal entry is derived from.
 
@@ -92,21 +134,11 @@ def fingerprint_document(kind, obj) -> str:
     when the posting would change, and not when an unrelated column is touched.
     """
     if kind == 'invoice':
-        lines = list(obj.items.values_list('item_id', 'item_name', 'quantity', 'price'))
-        # Split payments are part of the entry's debit side — editing one changes
-        # which accounts get debited without touching any scalar below.
-        splits = list(obj.payments.values_list(
-            'payment_account_id', 'payment_method_id', 'amount', 'sort_order'))
-        return _fingerprint([
-            'invoice', obj.pk, obj.datetime, obj.grand_total, obj.tax,
-            obj.additional_charges, obj.discount, obj.payment_method_id,
-            # obj.payment_account_id resolves the payment leg's GL account
-            # (see journal_engine._revenue_legs) — without it here, changing
-            # an invoice's bank account would not invalidate a staged preview
-            # entry, and commit would post the stale (wrong) account.
-            obj.payment_account_id,
-            obj.warehouse_id, obj.is_voided, lines, splits,
-        ])
+        parts = invoice_gl_parts(obj)
+        # datetime sits at index 2 to keep this hash byte-identical to the
+        # pre-split version, so drafts staged before this change stay valid.
+        parts.insert(2, obj.datetime)
+        return _fingerprint(parts)
     if kind == 'purchase':
         lines = list(obj.items.values_list(
             'line_type', 'item_id', 'item_name', 'quantity',
@@ -478,6 +510,21 @@ def commit_preview(actor, batch, summary_builder):
 
     One transaction per calendar day. See the module docstring.
     """
+    # Claim the draft before doing anything else. ``JournalPreviewCommitView``
+    # also checks the status, but it does so while building the response — the
+    # generator does not start until the stream is consumed, so two commits
+    # arriving together (a double-clicked button, a retried request) both pass
+    # that check and both post. A conditional UPDATE is the only check that is
+    # atomic with the transition.
+    if not JournalStagingBatch.objects.filter(pk=batch.pk, status='draft').update(
+            status='committing'):
+        current = JournalStagingBatch.objects.filter(pk=batch.pk).values_list(
+            'status', flat=True).first()
+        yield {'type': 'error', 'date': None,
+               'message': f'Draf ini berstatus "{current or "hilang"}" dan tidak bisa dicatat.',
+               'days_committed': 0}
+        return
+
     stale = check_freshness(batch)
     if stale:
         JournalStagingBatch.objects.filter(pk=batch.pk).update(status='draft')
@@ -515,7 +562,7 @@ def commit_preview(actor, batch, summary_builder):
         run_by=actor,
     )
     JournalStagingBatch.objects.filter(pk=batch.pk).update(
-        status='committing', committed_batch=journal_batch,
+        committed_batch=journal_batch,
     )
 
     entries_by_date = {}
@@ -535,19 +582,33 @@ def commit_preview(actor, batch, summary_builder):
     days_committed = 0
     documents_posted = 0
     variances = []
+    skipped = []
 
     for index, day in enumerate(calendar):
         staged = entries_by_date.get(day, [])
+        posted_today = 0
         try:
             # One transaction per day. Documents within the day are atomic
             # together; days are independent of each other. Do not hoist this.
             with transaction.atomic():
                 numbers = reserve_entry_numbers(day.year, len(staged))
                 for staged_entry, number in zip(staged, numbers):
-                    variances.extend(
-                        _commit_entry(staged_entry, number, journal_batch, actor)
-                    )
-                _upsert_day_log(day, journal_batch, actor, len(staged))
+                    try:
+                        variances.extend(
+                            _commit_entry(staged_entry, number, journal_batch, actor)
+                        )
+                    except AlreadyPostedError:
+                        # Its reserved number is simply burned. Gaps in the
+                        # sequence are cheap; posting the document twice is not.
+                        skipped.append({
+                            'staged_entry_id': staged_entry.id,
+                            'source_label': staged_entry.source_label,
+                            'date': staged_entry.date.isoformat(),
+                            'reason': 'Dokumen sudah dicatat di jurnal lain.',
+                        })
+                        continue
+                    posted_today += 1
+                _upsert_day_log(day, journal_batch, actor, posted_today)
         except Exception as exc:  # noqa: BLE001 — delivered as an event
             journal_batch.status = 'failed'
             journal_batch.save(update_fields=['status'])
@@ -561,10 +622,10 @@ def commit_preview(actor, batch, summary_builder):
             return
 
         days_committed += 1
-        documents_posted += len(staged)
+        documents_posted += posted_today
         yield {'type': 'day', 'index': index, 'date': day.isoformat(),
-               'documents': len(staged),
-               'status': 'posted' if staged else 'skipped'}
+               'documents': posted_today,
+               'status': 'posted' if posted_today else 'skipped'}
 
     summary = summary_builder(swept_start, batch.date_to)
     journal_batch.summary = summary
@@ -573,14 +634,36 @@ def commit_preview(actor, batch, summary_builder):
     JournalStagingBatch.objects.filter(pk=batch.pk).update(
         status='committed', days_committed=days_committed, variance_notes=variances,
     )
-    yield _commit_done(journal_batch, documents_posted, summary, variances)
+    yield _commit_done(journal_batch, documents_posted, summary, variances, skipped)
+
+
+class AlreadyPostedError(Exception):
+    """The document was posted by something else between preview and commit.
+
+    Not an error the operator caused, and not fatal: the entry is skipped and
+    the rest of the day still posts.
+    """
 
 
 def _commit_entry(staged_entry, entry_number, journal_batch, actor):
-    """Post one staged entry for real. Returns any variance notes."""
+    """Post one staged entry for real. Returns any variance notes.
+
+    Raises ``AlreadyPostedError`` when the document has already been journalled,
+    rather than posting it a second time.
+    """
     kind = staged_entry.source_model
     model = MODEL_BY_KIND[kind]
-    obj = model.objects.get(pk=staged_entry.source_id)
+
+    # The last line of defence against a double posting, and the only one that
+    # holds under concurrency: the row is locked for the rest of this day's
+    # transaction, so a second commit racing this one blocks here and then sees
+    # 'posted'. Everything upstream — the sweep's posting_status filter, the
+    # draft claim, the view's status check — narrows the window; this closes it.
+    # A duplicate here is not cosmetic: it double-counts revenue and consumes
+    # stock twice.
+    obj = model.objects.select_for_update().get(pk=staged_entry.source_id)
+    if obj.posting_status == 'posted':
+        raise AlreadyPostedError(staged_entry.source_label)
 
     # Rebuild rather than replay — see the module docstring. The fingerprint
     # check already proved the source is unchanged, so for deterministic
@@ -674,9 +757,11 @@ def run_and_commit(actor, date_to, summary_builder):
     yield from commit_preview(actor, batch, summary_builder)
 
 
-def _commit_done(batch, documents_posted, summary, variances):
-    """The payload shape ``JournalRunView`` has always returned, plus variances."""
+def _commit_done(batch, documents_posted, summary, variances, skipped=()):
+    """The payload shape ``JournalRunView`` has always returned, plus variances
+    and any entries skipped because their document was already posted."""
     return {
+        'skipped': list(skipped),
         'type': 'done',
         'batch_id': batch.id,
         'status': batch.status,

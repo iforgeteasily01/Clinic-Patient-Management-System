@@ -244,14 +244,14 @@ class BillingCompleteView(APIView):
             for catalog_item, name, price, _treatment in lines
         ])
 
-        # ── Accounting + material stock deduction ─────────────────────────────
+        # ── Accounting ────────────────────────────────────────────────────────
         # Phase 2: journal posting is deferred, same as the POS-created path in
         # invoice_page.py. The invoice is left posting_status='unposted' (model
         # default); a journal run (POST /api/accounting/journal/run/) rebuilds
         # its lines from these InvoiceItem rows and calls the same
-        # _post_accounting() used for POS invoices — which already knows how to
-        # walk item.treatment.materials for service lines like these — so
-        # billing-queue invoices post identically to POS ones, just later.
+        # _post_accounting() used for POS invoices, so billing-queue invoices
+        # post identically to POS ones, just later. Service lines carry no cost
+        # on either path — see build_invoice_legs.
 
         # ── CRM refresh ───────────────────────────────────────────────────────
         if active_patient.patient_no_id:

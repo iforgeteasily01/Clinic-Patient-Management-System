@@ -60,9 +60,16 @@ def payment_method_breakdown(invoices):
     ``invoice_count`` counts an invoice once per method it touched, so the counts
     across methods can exceed the number of invoices in the range.
 
+    Voided invoices are excluded here as well as by every caller. Belt and braces
+    on purpose: the two branches below must agree about what is in scope, and a
+    caller that forgot the filter would otherwise drop a voided split invoice
+    while still counting a voided single-method one.
+
     Returns ``[{'payment_method_id', 'method', 'account_number', 'total',
     'invoice_count'}]``, largest first, with ``total`` as a Decimal.
     """
+    invoices = invoices.filter(is_voided=False)
+
     split_invoice_ids = set(
         InvoicePayment.objects
         .filter(invoice__in=invoices)
@@ -125,10 +132,16 @@ class DashboardReportView(APIView):
         else:
             last_month_start = month_start.replace(month=month_start.month - 1)
 
-        inv_today = Invoice.objects.filter(datetime__gte=today_start)
-        inv_month = Invoice.objects.filter(datetime__gte=month_start)
+        # A voided invoice is not revenue and its money never reached a drawer,
+        # so it must leave these totals the moment it is voided — whether or not
+        # its transaction date has been journalled yet. The GL side of a void is
+        # handled separately (unposted invoices are skipped by the journal sweep,
+        # posted ones get a same-day reversing void memo); these aggregates read
+        # Invoice rows directly and so need the filter of their own.
+        inv_today = Invoice.objects.filter(datetime__gte=today_start, is_voided=False)
+        inv_month = Invoice.objects.filter(datetime__gte=month_start, is_voided=False)
         inv_last_month = Invoice.objects.filter(
-            datetime__gte=last_month_start, datetime__lt=month_start
+            datetime__gte=last_month_start, datetime__lt=month_start, is_voided=False
         )
 
         today_agg = inv_today.aggregate(total=Sum('grand_total'), count=Count('id'))
@@ -147,7 +160,12 @@ class DashboardReportView(APIView):
             .order_by('name')
         )
 
-        recent = Invoice.objects.select_related('patient_no', 'payment_method').order_by('-datetime')[:10]
+        recent = (
+            Invoice.objects
+            .filter(is_voided=False)
+            .select_related('patient_no', 'payment_method')
+            .order_by('-datetime')[:10]
+        )
         recent_data = [
             {
                 'invoice_number': inv.invoice_number,
@@ -224,7 +242,9 @@ class SalesRangeReportView(APIView):
         range_start = datetime.datetime(start.year, start.month, start.day, tzinfo=_JAKARTA)
         range_end = datetime.datetime(end.year, end.month, end.day, tzinfo=_JAKARTA) + datetime.timedelta(days=1)
 
-        invoices = Invoice.objects.filter(datetime__gte=range_start, datetime__lt=range_end)
+        invoices = Invoice.objects.filter(
+            datetime__gte=range_start, datetime__lt=range_end, is_voided=False
+        )
         agg = invoices.aggregate(total=Sum('grand_total'), count=Count('id'))
 
         breakdown = payment_method_breakdown(invoices)
