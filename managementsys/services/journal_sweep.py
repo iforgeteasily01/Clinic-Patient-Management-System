@@ -42,8 +42,18 @@ JOURNALABLE_STOCK_REASONS = [
 ]
 
 
-def _gather_events(date_to):
+def _since(field, date_from):
+    """``{field__gte: date_from}``, or nothing at all when there is no window."""
+    return {f'{field}__gte': date_from} if date_from else {}
+
+
+def _gather_events(date_to, date_from=None):
     """Every unposted document dated on or before ``date_to``.
+
+    ``date_from`` narrows the window from the other end: with it, documents
+    older than that date are left alone entirely — not staged, not posted, not
+    counted. Omit it (the default, and what the unattended sweep does) to catch
+    stragglers of any age.
 
     Returns ``{date: [(kind, obj), ...]}``. Same four querysets the original
     view used — unchanged, including the ``is_voided`` exclusions — plus stock
@@ -64,27 +74,32 @@ def _gather_events(date_to):
 
     for inv in Invoice.objects.filter(
         posting_status='unposted', is_voided=False, datetime__date__lte=date_to,
+        **_since('datetime__date', date_from),
     ):
         add(inv.datetime.date(), 'invoice', inv)
 
     for p in PurchaseInvoice.objects.filter(
         posting_status='unposted', is_voided=False, purchase_date__lte=date_to,
+        **_since('purchase_date', date_from),
     ).select_related('supplier'):
         add(p.purchase_date, 'purchase', p)
 
     for t in AccountTransfer.objects.filter(
         posting_status='unposted', transfer_date__lte=date_to,
+        **_since('transfer_date', date_from),
     ):
         add(t.transfer_date, 'transfer', t)
 
     for e in Expense.objects.filter(
         posting_status='unposted', expense_date__lte=date_to,
+        **_since('expense_date', date_from),
     ):
         add(e.expense_date, 'expense', e)
 
     for s in StockOutLog.objects.filter(
         posting_status='unposted', out_date__lte=date_to,
         value__gt=0, reason__in=JOURNALABLE_STOCK_REASONS,
+        **_since('out_date', date_from),
     ).select_related('item'):
         add(s.out_date, 'stock', s)
 

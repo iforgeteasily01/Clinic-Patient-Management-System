@@ -308,8 +308,13 @@ def discard_open_drafts():
 
 # ── Phase 1: preview ──────────────────────────────────────────────────────────
 
-def build_preview(actor, date_to):
+def build_preview(actor, date_to, date_from=None):
     """Materialise everything a sweep to ``date_to`` would post, into staging.
+
+    ``date_from`` is the operator's window start. Documents dated before it are
+    left untouched — they stay unposted and a later run will pick them up. With
+    no ``date_from`` the preview reaches back to the oldest unposted document,
+    which is what the unattended sweep does.
 
     Generator, same event vocabulary as ``run_journal_sweep``:
 
@@ -328,10 +333,11 @@ def build_preview(actor, date_to):
     purge_expired_drafts()
     discard_open_drafts()
 
-    by_date = _gather_events(date_to)
+    by_date = _gather_events(date_to, date_from)
     total_documents = sum(len(v) for v in by_date.values())
 
     batch = JournalStagingBatch.objects.create(
+        date_from=date_from,
         date_to=date_to,
         status='draft',
         created_by=actor,
@@ -340,11 +346,15 @@ def build_preview(actor, date_to):
 
     if not by_date:
         yield {'type': 'start', 'staging_batch_id': batch.id,
+               'date_from': date_from.isoformat() if date_from else None,
                'date_to': date_to.isoformat(), 'total': 0, 'days': []}
         yield _preview_done(batch)
         return
 
-    swept_start = min(by_date)
+    # The window the operator asked for wins over where the documents happen to
+    # start, so a day inside the window with nothing on it still gets a cell —
+    # and, at commit, still gets marked journalled.
+    swept_start = date_from or min(by_date)
     days = _calendar_days(swept_start, date_to)
 
     yield {
@@ -448,6 +458,7 @@ def _preview_done(batch):
         'type': 'done',
         'staging_batch_id': batch.id,
         'status': batch.status,
+        'date_from': batch.date_from.isoformat() if batch.date_from else None,
         'date_to': batch.date_to.isoformat(),
         'entry_count': batch.entry_count,
         'document_count': batch.document_count,
@@ -536,7 +547,8 @@ def commit_preview(actor, batch, summary_builder):
     if not days:
         # An empty draft still produces a batch, so the run shows up in history.
         journal_batch = JournalBatch.objects.create(
-            requested_range_start=batch.date_to, requested_range_end=batch.date_to,
+            requested_range_start=batch.date_from or batch.date_to,
+            requested_range_end=batch.date_to,
             status='completed', run_by=actor,
             summary={'total_revenue': '0.00', 'accounts_payable_total': '0.00',
                      'spend_by_account': [], 'account_movements': []},
@@ -549,7 +561,7 @@ def commit_preview(actor, batch, summary_builder):
         yield _commit_done(journal_batch, 0, journal_batch.summary, [])
         return
 
-    swept_start = min(days)
+    swept_start = batch.date_from or min(days)
     calendar = _calendar_days(swept_start, batch.date_to)
 
     journal_batch = JournalBatch.objects.create(
@@ -722,7 +734,7 @@ def _upsert_day_log(day, batch, actor, count):
     log.save()
 
 
-def run_and_commit(actor, date_to, summary_builder):
+def run_and_commit(actor, date_to, summary_builder, date_from=None):
     """Preview and immediately commit, yielding only the commit's events.
 
     This is what the legacy one-shot endpoints (``/journal/run/`` and
@@ -739,7 +751,7 @@ def run_and_commit(actor, date_to, summary_builder):
     this run, which would have made the draft stale anyway.
     """
     batch_id = None
-    for evt in build_preview(actor, date_to):
+    for evt in build_preview(actor, date_to, date_from):
         if evt['type'] == 'error':
             yield {'type': 'error', 'date': evt.get('date'),
                    'message': evt['message'], 'days_committed': 0}

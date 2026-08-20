@@ -56,6 +56,10 @@ logger = logging.getLogger(__name__)
 
 WINDOW_DAYS = 30
 RECENT_DAYS = 7
+# The recent-visitor list has its own page now, which offers a wider window than
+# the dashboard's default. Capped so ?recent_days= cannot be turned into a
+# request to render the entire patient book.
+RECENT_DAYS_MAX = 90
 BIRTHDAY_LOOKAHEAD_DAYS = 30
 
 # Age bands for the demographic split. Open-ended at both ends so every patient
@@ -114,6 +118,13 @@ def _pct_delta(current, previous):
     return round((float(current) - float(previous)) / float(previous) * 100, 1)
 
 
+def _clamp_int(raw, default, *, lo, hi):
+    try:
+        return max(lo, min(hi, int(raw)))
+    except (TypeError, ValueError):
+        return default
+
+
 def _empty_recent_entry(patient):
     return {
         'patient': patient,
@@ -142,7 +153,9 @@ class CRMDashboardView(APIView):
         tomorrow = today + datetime.timedelta(days=1)
         window_start = today - datetime.timedelta(days=WINDOW_DAYS - 1)
         prev_start = window_start - datetime.timedelta(days=WINDOW_DAYS)
-        recent_start = today - datetime.timedelta(days=RECENT_DAYS - 1)
+        recent_days = _clamp_int(
+            request.GET.get('recent_days'), RECENT_DAYS, lo=1, hi=RECENT_DAYS_MAX)
+        recent_start = today - datetime.timedelta(days=recent_days - 1)
 
         settings_obj = ReportSettings.get_solo()
 
@@ -242,7 +255,7 @@ class CRMDashboardView(APIView):
         return Response({
             'as_of': str(today),
             'window_days': WINDOW_DAYS,
-            'recent_days': RECENT_DAYS,
+            'recent_days': recent_days,
             'summary': {
                 'patients_last_30d':   len(cur_ids),
                 'patients_prev_30d':   len(prev_ids),
@@ -396,6 +409,12 @@ def _recent_patients(recent_start, today, settings_obj):
             'distinct_days_in_window': len(entry['visit_dates']),
             'spend_in_window': str(entry['spend']),
             'last_visit_at': entry['last_dt'].isoformat() if entry['last_dt'] else None,
+            # Whole Jakarta days between that visit and today: 0 is today, 1 is
+            # yesterday. Computed here rather than in the browser because the
+            # browser's timezone is not necessarily the clinic's, and an
+            # off-by-one would recolour the row.
+            'days_ago': ((today - entry['last_dt'].date()).days
+                         if entry['last_dt'] else None),
             'last_treatments': entry['last_treatments'],
             'last_products': entry['last_products'],
             'total_visits': crm.total_visits if crm else 0,

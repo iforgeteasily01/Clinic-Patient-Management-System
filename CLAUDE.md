@@ -284,7 +284,7 @@ page). Both read the same `PatientCRMProfile`, so visit counts can't disagree.
 |---|---|---|
 | GET | `/api/crm/patients/` | Patient CRM list (`?q=`, `?tier=`, `?page=`) |
 | GET | `/api/crm/patients/<patient_no>/` | CRM detail |
-| GET | `/api/crm/dashboard/` | Dashboard: 30-day summary + deltas, activity buckets, demographics, top treatments/products, upcoming birthdays, 7-day unique visitor list |
+| GET | `/api/crm/dashboard/` | 30-day summary + deltas, activity buckets, demographics, top treatments/products, upcoming birthdays, and the recent-visitor list. `?recent_days=` (1-90, default 7) widens **only** that list — the 30-day summary window is fixed so the headline figures stay comparable. Each recent row carries `days_ago`, computed in Jakarta, which drives the recency colours on `/crm/activity` |
 | GET | `/api/crm/patients/<patient_no>/profile/` | Relationship profile — visits collapsed to treatments + products, favourites, birthday, message context |
 | GET/POST | `/api/crm/message-templates/` | WhatsApp template CRUD (+ `placeholders` legend) |
 | GET/PUT/DELETE | `/api/crm/message-templates/<id>/` | Template detail |

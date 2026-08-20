@@ -329,3 +329,112 @@ class TestPreviewEndpoints:
         res = auth_api.post(reverse("accounting-journal-preview-commit"),
                             {"staging_batch_id": draft.id}, format="json")
         assert res.status_code == 409
+
+
+@pytest.mark.django_db
+class TestPreviewWindowStart:
+    """``date_from`` bounds the sweep's reach backwards.
+
+    Without it a preview picks up stragglers of any age — correct for the
+    unattended run, wrong for an operator who asked for one month.
+    """
+
+    def test_documents_before_date_from_are_left_alone(self, auth_api, stock, gl_accounts):
+        old = _create_invoice(auth_api, stock, gl_accounts,
+                              dt=datetime.datetime(2026, 6, 10, 10, 0))
+        inside = _create_invoice(auth_api, stock, gl_accounts,
+                                 dt=datetime.datetime(2026, 7, 5, 10, 0))
+
+        events = _drain(journal_preview.build_preview(
+            None, datetime.date(2026, 7, 31), datetime.date(2026, 7, 1),
+        ))
+        done = _terminal(events)
+        assert done["type"] == "done"
+        assert done["document_count"] == 1
+        assert done["date_from"] == "2026-07-01"
+
+        batch = JournalStagingBatch.objects.get(pk=done["staging_batch_id"])
+        staged_ids = set(batch.entries.values_list("source_id", flat=True))
+        assert staged_ids == {inside.pk}
+        assert old.pk not in staged_ids
+
+        # The excluded document is untouched, so a later run still catches it.
+        old.refresh_from_db()
+        assert old.posting_status == "unposted"
+
+    def test_the_day_grid_starts_at_date_from_not_at_the_first_document(
+        self, auth_api, stock, gl_accounts
+    ):
+        _create_invoice(auth_api, stock, gl_accounts,
+                        dt=datetime.datetime(2026, 7, 20, 10, 0))
+
+        events = _drain(journal_preview.build_preview(
+            None, datetime.date(2026, 7, 31), datetime.date(2026, 7, 1),
+        ))
+        start = events[0]
+        assert start["type"] == "start"
+        assert start["days"][0]["date"] == "2026-07-01"
+        assert start["total"] == 31
+
+    def test_commit_marks_every_day_in_the_window_journalled(
+        self, auth_api, stock, gl_accounts
+    ):
+        _create_invoice(auth_api, stock, gl_accounts,
+                        dt=datetime.datetime(2026, 7, 20, 10, 0))
+        done = _terminal(_drain(journal_preview.build_preview(
+            None, datetime.date(2026, 7, 31), datetime.date(2026, 7, 1),
+        )))
+        batch = JournalStagingBatch.objects.get(pk=done["staging_batch_id"])
+
+        _commit(None, batch)
+
+        posted = set(JournalDayLog.objects.filter(is_posted=True)
+                     .values_list("date", flat=True))
+        assert datetime.date(2026, 7, 1) in posted
+        assert datetime.date(2026, 7, 31) in posted
+        # Nothing outside the window was marked.
+        assert datetime.date(2026, 6, 30) not in posted
+
+    def test_omitting_date_from_still_reaches_back(self, auth_api, stock, gl_accounts):
+        _create_invoice(auth_api, stock, gl_accounts,
+                        dt=datetime.datetime(2026, 6, 10, 10, 0))
+        _create_invoice(auth_api, stock, gl_accounts,
+                        dt=datetime.datetime(2026, 7, 5, 10, 0))
+
+        done = _terminal(_preview(None, datetime.date(2026, 7, 31)))
+        assert done["document_count"] == 2
+        assert done["date_from"] is None
+
+
+@pytest.mark.django_db
+class TestPreviewEndpointWindow:
+    def test_post_accepts_date_from(self, auth_api, stock, gl_accounts):
+        _create_invoice(auth_api, stock, gl_accounts,
+                        dt=datetime.datetime(2026, 6, 10, 10, 0))
+        _create_invoice(auth_api, stock, gl_accounts,
+                        dt=datetime.datetime(2026, 7, 5, 10, 0))
+
+        res = auth_api.post(
+            reverse("accounting-journal-preview"),
+            {"date_to": "2026-07-31", "date_from": "2026-07-01"}, format="json",
+        )
+        assert res.status_code == 200
+        b"".join(res.streaming_content)
+
+        batch = JournalStagingBatch.objects.get(status="draft")
+        assert batch.date_from == datetime.date(2026, 7, 1)
+        assert batch.document_count == 1
+
+    def test_date_from_after_date_to_is_rejected(self, auth_api):
+        res = auth_api.post(
+            reverse("accounting-journal-preview"),
+            {"date_to": "2026-07-01", "date_from": "2026-07-31"}, format="json",
+        )
+        assert res.status_code == 400
+
+    def test_malformed_date_from_is_rejected(self, auth_api):
+        res = auth_api.post(
+            reverse("accounting-journal-preview"),
+            {"date_to": "2026-07-31", "date_from": "31/07/2026"}, format="json",
+        )
+        assert res.status_code == 400

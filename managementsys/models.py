@@ -1998,6 +1998,10 @@ class JournalStagingBatch(models.Model):
         ('failed',     'Failed'),
     ]
 
+    # date_from is the operator's window start. NULL means "everything still
+    # unposted, however old" — the behaviour every draft had before the window
+    # existed, and what an omitted date_from still means today.
+    date_from  = models.DateField(null=True, blank=True)
     date_to    = models.DateField()
     status     = models.CharField(max_length=12, choices=STATUS_CHOICES, default='draft')
     created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_staging_batches')

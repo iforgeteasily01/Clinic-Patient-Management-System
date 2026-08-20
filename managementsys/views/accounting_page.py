@@ -2181,15 +2181,41 @@ def _parse_date_to(request):
         )
 
 
+def _parse_date_from(request, date_to):
+    """Optional window start. Returns (date_or_None, None) or (None, error).
+
+    Absent or blank means the run reaches back to the oldest unposted document,
+    which is what it has always done. A value narrows both ends of the window.
+    """
+    raw = request.data.get('date_from')
+    if raw in (None, ''):
+        return None, None
+    try:
+        parsed = datetime.date.fromisoformat(str(raw))
+    except ValueError:
+        return None, Response(
+            {'error': 'Format date_from tidak valid. Gunakan YYYY-MM-DD.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if parsed > date_to:
+        return None, Response(
+            {'error': 'date_from tidak boleh setelah date_to.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return parsed, None
+
+
 class JournalRunView(APIView):
     """
     POST /api/accounting/journal/run/
-    Body: { date_to: 'YYYY-MM-DD' }
+    Body: { date_to: 'YYYY-MM-DD', date_from?: 'YYYY-MM-DD' }
 
     Finds every Invoice/PurchaseInvoice/AccountTransfer/Expense with
     posting_status='unposted' and a transaction date <= date_to — regardless
     of how old, which is what makes this a "sweep": a document from weeks ago
-    that was never posted still gets caught here, not just today's. Same-day
+    that was never posted still gets caught here, not just today's. Pass
+    date_from to bound that reach: documents older than it are left unposted
+    for a later run. Same-day
     void/edit memo entries (source_type='void_memo'/'edit_memo') are never
     touched by this query — they are written directly by the void/edit
     endpoints and are already "posted" by construction.
@@ -2221,10 +2247,13 @@ class JournalRunView(APIView):
         date_to, err = _parse_date_to(request)
         if err:
             return err
+        date_from, err = _parse_date_from(request, date_to)
+        if err:
+            return err
 
         final = None
         for evt in journal_preview.run_and_commit(
-            _actor(request), date_to, _build_journal_summary,
+            _actor(request), date_to, _build_journal_summary, date_from,
         ):
             if evt['type'] in ('done', 'error', 'stale'):
                 final = evt
@@ -2261,7 +2290,7 @@ class JournalRunView(APIView):
 class JournalRunStreamView(APIView):
     """
     POST /api/accounting/journal/run/stream/
-    Body: { date_to: 'YYYY-MM-DD' }
+    Body: { date_to: 'YYYY-MM-DD', date_from?: 'YYYY-MM-DD' }
 
     Same sweep as JournalRunView, but streams progress as Server-Sent Events so
     the web UI can animate each day as it is committed:
@@ -2285,6 +2314,9 @@ class JournalRunStreamView(APIView):
         date_to, err = _parse_date_to(request)
         if err:
             return err
+        date_from, err = _parse_date_from(request, date_to)
+        if err:
+            return err
 
         # Resolve the actor up front; the generator must not touch `request`.
         actor = _actor(request)
@@ -2292,7 +2324,7 @@ class JournalRunStreamView(APIView):
         def frames():
             try:
                 for evt in journal_preview.run_and_commit(
-                    actor, date_to, _build_journal_summary,
+                    actor, date_to, _build_journal_summary, date_from,
                 ):
                     yield _sse(evt)
             except Exception as exc:  # noqa: BLE001 — cannot become a 500 mid-stream
@@ -2354,10 +2386,12 @@ def _stream(frames):
 
 class JournalPreviewView(APIView):
     """
-    POST /api/accounting/journal/preview/   Body: { date_to: 'YYYY-MM-DD' }
+    POST /api/accounting/journal/preview/
+         Body: { date_to: 'YYYY-MM-DD', date_from?: 'YYYY-MM-DD' }
     GET  /api/accounting/journal/preview/
 
     POST builds a staging batch — every journal entry a sweep to ``date_to``
+    (from ``date_from``, if given; otherwise from the oldest unposted document)
     would post, materialised into StagedJournalEntry/StagedJournalLine rows and
     nothing else. No ledger row is written, no document's posting_status moves,
     no JournalDayLog is touched. Streams the same per-day SSE events as the run
@@ -2384,11 +2418,14 @@ class JournalPreviewView(APIView):
         date_to, err = _parse_date_to(request)
         if err:
             return err
+        date_from, err = _parse_date_from(request, date_to)
+        if err:
+            return err
         actor = _actor(request)
 
         def frames():
             try:
-                for evt in journal_preview.build_preview(actor, date_to):
+                for evt in journal_preview.build_preview(actor, date_to, date_from):
                     yield _sse(evt)
             except Exception as exc:  # noqa: BLE001 — cannot become a 500 mid-stream
                 yield _sse({'type': 'error', 'date': None,
