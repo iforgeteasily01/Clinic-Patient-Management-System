@@ -128,6 +128,7 @@ DOCUMENT_FIELDS = {
     'AccountTransfer': 'transfer',
     'Expense':         'expense',
     'StockOutLog':     'stock_out_log',
+    'SalesReturn':     'sales_return',
 }
 
 
@@ -139,8 +140,31 @@ def document_field(document):
     return DOCUMENT_FIELDS.get(type(document).__name__)
 
 
+def document_branch_id(document, reverses=None, corrects=None):
+    """Which branch a journal entry belongs to, derived — never passed in.
+
+    The source document already knows where it happened, so taking it from the
+    document rather than from the request closes the gap between the two: a
+    journal run sweeps yesterday's invoices from a session that has some other
+    branch selected, and a request-derived branch would stamp every one of them
+    wrong.
+
+    Reversals and corrections inherit from the entry they act on, so a
+    correction can never land in a different branch's books than the mistake it
+    is fixing. Manual entries with no document return None — group-wide, which
+    is the honest answer for an adjustment the operator did not scope.
+    """
+    branch_id = getattr(document, 'branch_id', None)
+    if branch_id is None and reverses is not None:
+        branch_id = getattr(reverses, 'branch_id', None)
+    if branch_id is None and corrects is not None:
+        branch_id = getattr(corrects, 'branch_id', None)
+    return branch_id
+
+
 def write_legs(legset, *, date, source_type, document=None, batch=None, actor=None,
-               memo=None, entry_number=None, reverses=None, corrects=None):
+               memo=None, entry_number=None, reverses=None, corrects=None,
+               branch_id=None):
     """Post a LegSet: create the JournalEntry header, its LedgerEntry lines, and
     roll every affected account balance. Returns the JournalEntry.
 
@@ -161,6 +185,12 @@ def write_legs(legset, *, date, source_type, document=None, batch=None, actor=No
 
     number = entry_number or reserve_entry_numbers(date.year, 1)[0]
     doc_field = document_field(document)
+    # An explicit branch_id is only for entries with no document to derive from
+    # (manual journals, which carry the operator's selection). A document always
+    # wins over it — see document_branch_id.
+    resolved_branch_id = document_branch_id(document, reverses, corrects)
+    if resolved_branch_id is None:
+        resolved_branch_id = branch_id
 
     entry = JournalEntry.objects.create(
         entry_number=number,
@@ -174,6 +204,7 @@ def write_legs(legset, *, date, source_type, document=None, batch=None, actor=No
         is_balanced=True,
         reverses=reverses,
         corrects=corrects,
+        branch_id=resolved_branch_id,
         **({doc_field: document} if doc_field else {}),
     )
 
@@ -196,6 +227,7 @@ def write_legs(legset, *, date, source_type, document=None, batch=None, actor=No
             amount=leg.amount,
             source_type=source_type,
             journal_entry=entry,
+            branch_id=resolved_branch_id,
             **({doc_field: document} if doc_field else {}),
         ))
     LedgerEntry.objects.bulk_create(rows, batch_size=500)
@@ -288,6 +320,7 @@ def _le(account, entry_type, amount, invoice, description, date=None, source_typ
         amount=amount,
         invoice=invoice,
         source_type=source_type,
+        branch_id=getattr(invoice, 'branch_id', None),
     )
 
 
@@ -493,6 +526,7 @@ def _post_le(account, entry_type, amount, invoice, description, date, source_typ
         amount=amount,
         source_type=source_type,
         purchase_invoice=invoice,
+        branch_id=getattr(invoice, 'branch_id', None),
     )
 
 
@@ -808,6 +842,7 @@ def _post_expense_le(account, entry_type, amount, expense, description, date, so
         amount=amount,
         source_type=source_type,
         expense=expense,
+        branch_id=getattr(expense, 'branch_id', None),
     )
 
 

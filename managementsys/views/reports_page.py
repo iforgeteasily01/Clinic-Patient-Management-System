@@ -43,6 +43,7 @@ from ..models import (
     SiteConfig,
     StockOutLog,
 )
+from ..services.branches import filter_by_branch
 
 _JAKARTA = ZoneInfo('Asia/Jakarta')
 
@@ -138,10 +139,14 @@ class DashboardReportView(APIView):
         # handled separately (unposted invoices are skipped by the journal sweep,
         # posted ones get a same-day reversing void memo); these aggregates read
         # Invoice rows directly and so need the filter of their own.
-        inv_today = Invoice.objects.filter(datetime__gte=today_start, is_voided=False)
-        inv_month = Invoice.objects.filter(datetime__gte=month_start, is_voided=False)
-        inv_last_month = Invoice.objects.filter(
-            datetime__gte=last_month_start, datetime__lt=month_start, is_voided=False
+        # Branch-scoped as well: the three windows must agree about what is in
+        # scope, and a month-on-month delta that silently compares one branch
+        # against the group is worse than no delta at all.
+        sales = filter_by_branch(Invoice.objects.filter(is_voided=False), request)
+        inv_today = sales.filter(datetime__gte=today_start)
+        inv_month = sales.filter(datetime__gte=month_start)
+        inv_last_month = sales.filter(
+            datetime__gte=last_month_start, datetime__lt=month_start
         )
 
         today_agg = inv_today.aggregate(total=Sum('grand_total'), count=Count('id'))
@@ -150,6 +155,12 @@ class DashboardReportView(APIView):
 
         payment_breakdown = payment_method_breakdown(inv_month)
 
+        # Deliberately NOT branch-scoped. The item catalog is shared across
+        # branches and ``min_stock`` belongs to the item, not to a location —
+        # the same reasoning InventoryDashboardView already applies when it
+        # classifies stock per item across warehouses rather than per row. A
+        # per-branch low-stock view would need a per-branch min_stock to mean
+        # anything, and that field does not exist.
         items_qs = InventoryItem.objects.filter(is_service=False, is_active=True).annotate(
             total_stock=Coalesce(Sum('batches__quantity_remaining'), Value(0, output_field=DecimalField()))
         )
@@ -161,8 +172,7 @@ class DashboardReportView(APIView):
         )
 
         recent = (
-            Invoice.objects
-            .filter(is_voided=False)
+            sales
             .select_related('patient_no', 'payment_method')
             .order_by('-datetime')[:10]
         )
@@ -242,8 +252,11 @@ class SalesRangeReportView(APIView):
         range_start = datetime.datetime(start.year, start.month, start.day, tzinfo=_JAKARTA)
         range_end = datetime.datetime(end.year, end.month, end.day, tzinfo=_JAKARTA) + datetime.timedelta(days=1)
 
-        invoices = Invoice.objects.filter(
-            datetime__gte=range_start, datetime__lt=range_end, is_voided=False
+        invoices = filter_by_branch(
+            Invoice.objects.filter(
+                datetime__gte=range_start, datetime__lt=range_end, is_voided=False,
+            ),
+            request,
         )
         agg = invoices.aggregate(total=Sum('grand_total'), count=Count('id'))
 

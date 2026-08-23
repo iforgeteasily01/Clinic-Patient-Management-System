@@ -171,6 +171,15 @@ DISCORD_ALERT_IGNORE_PATHS = env.list('DISCORD_ALERT_IGNORE_PATHS', ['/favicon.i
 CPMS_VERCEL_URL    = env.str('CPMS_VERCEL_URL', 'https://cpms-dashboard-api.vercel.app')
 CPMS_INGEST_SECRET = env.str('CPMS_INGEST_SECRET', '')
 
+# Online reservations (public booking form -> local queue).
+# The public form books a slot, not a duration, so an imported appointment gets
+# this length. Keep it equal to the slot_minutes setting on the Vercel admin
+# page, or the schedule will show gaps and overlaps that do not exist.
+CPMS_RESERVATION_DURATION_MINUTES = env.int('CPMS_RESERVATION_DURATION_MINUTES', 30)
+# Which branch an online booking is filed under. Empty means null, which stays
+# visible under every branch selection — see services/reservation_sync.py.
+CPMS_RESERVATION_BRANCH_ID = env.int('CPMS_RESERVATION_BRANCH_ID', 0) or None
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'managementsys.auth_backend.AppUserAuthentication',

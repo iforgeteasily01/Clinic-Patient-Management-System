@@ -13,6 +13,52 @@ from django.utils import timezone
 JAKARTA_TZ = ZoneInfo('Asia/Jakarta')
 
 
+class Branch(models.Model):
+    """One physical clinic location.
+
+    Every operational document is stamped with the branch it happened at, so a
+    two-clinic group can run one database, one chart of accounts and one patient
+    registry while still reading a per-location P&L.
+
+    Exactly one row carries ``is_default=True``; it is what migration 0112
+    backfilled every pre-existing document to, and what a user without a
+    ``home_branch`` falls back to. ``save()`` enforces the singleton rather than
+    a DB constraint so promoting a new default is a one-field write instead of a
+    two-step dance through an illegal state.
+    """
+    code       = models.CharField(max_length=20, unique=True)
+    name       = models.CharField(max_length=100)
+    # Receipts print per branch. Blank falls back to SiteConfig, which stays the
+    # group-wide identity (legal name, logo) — these override only the location
+    # lines. See services/branches.py::receipt_identity.
+    address_line1 = models.CharField(max_length=200, blank=True, default='')
+    address_line2 = models.CharField(max_length=200, blank=True, default='')
+    phone_fax     = models.CharField(max_length=200, blank=True, default='')
+    is_active  = models.BooleanField(default=True)
+    is_default = models.BooleanField(default=False)
+    sort_order = models.IntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['sort_order', 'code']
+        verbose_name_plural = 'Branches'
+
+    def __str__(self):
+        return f'[{self.code}] {self.name}'
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.is_default:
+            Branch.objects.exclude(pk=self.pk).filter(is_default=True).update(is_default=False)
+
+    @classmethod
+    def get_default(cls):
+        """The fallback branch. Never returns None on a migrated database."""
+        return (cls.objects.filter(is_default=True).first()
+                or cls.objects.filter(is_active=True).order_by('sort_order', 'code').first()
+                or cls.objects.order_by('pk').first())
+
+
 class Patient(models.Model):
     patient_no = models.CharField(
         max_length=10, unique=True, primary_key=True, blank=True)
@@ -82,6 +128,7 @@ class ActivePatient(models.Model):
     guest_name = models.CharField(max_length=100, null=True, blank=True)
     status = models.IntegerField()
     consult_status = models.BooleanField()
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='active_patients')
     visit_time = models.DateTimeField(auto_now_add=True)
     medrec = models.OneToOneField(
         'MedRec', on_delete=models.SET_NULL,
@@ -130,6 +177,7 @@ class MedRec(models.Model):
     doctor_id = models.ForeignKey(
         Doctors, on_delete=models.SET_NULL, null=True)
     patient_no = models.ForeignKey(Patient, on_delete=models.CASCADE)
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='medrecs')
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=FINALIZED)
     subjective = models.TextField(default="")
     objective = models.TextField(default="")
@@ -258,6 +306,7 @@ class TreatmentSession(models.Model):
     patient_no = models.ForeignKey(Patient, on_delete=models.SET_NULL, null=True, blank=True)
     beautician = models.ForeignKey(Beauticians, on_delete=models.SET_NULL, null=True)
     treatments = models.ManyToManyField(Treatment, blank=True)
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='treatment_sessions')
     session_time = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
@@ -285,6 +334,14 @@ class AppUser(models.Model):
     is_active       = models.BooleanField(default=True)
     auth_token      = models.CharField(max_length=64, blank=True, default='')
     base_salary     = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    # The location this user physically works at. POS and medical records are
+    # hard-locked to it server-side regardless of what the client asks for;
+    # accounting and admin screens default to it but may look across branches
+    # (see services/branches.py::CROSS_BRANCH_ROLES).
+    home_branch     = models.ForeignKey(
+        'Branch', on_delete=models.PROTECT,
+        null=True, blank=True, related_name='staff',
+    )
 
     def set_pin(self, raw_pin: str):
         self.pin_hash = make_password(str(raw_pin))
@@ -358,6 +415,7 @@ class InventoryItem(models.Model):
 class Warehouse(models.Model):
     code = models.CharField(max_length=20, unique=True)
     name = models.CharField(max_length=100)
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='warehouses')
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -551,6 +609,7 @@ class Invoice(models.Model):
     # /api/accounting/journal/run/) sweeps its transaction date. Void/edit of an
     # already-posted invoice is handled live via same-day memo entries instead
     # (see managementsys/services/journal_engine.py).
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
     posting_status     = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
 
     class Meta:
@@ -628,6 +687,147 @@ class InvoicePayment(models.Model):
         return f'{self.invoice.invoice_number} – {label} {self.amount}'
 
 
+class SalesReturn(models.Model):
+    """A full or partial return against a sales invoice.
+
+    Deliberately a **separate document**, not an edit of the original invoice.
+    Editing reaches back and rewrites what the books said happened on the sale
+    date; a return is a new economic event on the day the goods came back, and
+    the clinic needs both facts on the record — what was sold, and what came
+    back — for the CRM, for stock history, and for any conversation with the
+    patient. ``Invoice.is_voided`` stays False: the sale happened.
+
+    Follows the same Phase-2 lifecycle as every other journal document. A return
+    is written ``unposted`` with zero ledger rows; a journal run sweeps its date
+    and posts it, reversing the revenue and (for restocked physical lines) the
+    COGS. FIFO restock therefore happens **at posting time**, not on save —
+    exactly mirroring the invoice, whose FIFO deduction also waits for the run.
+
+    What the refund is worth is computed, never typed — see
+    ``services.sales_returns.compute_refund``. A restocking fee or a partial
+    goodwill refund is a separate expense/other-income entry, because folding
+    either into the refund total would silently misstate revenue.
+    """
+
+    REASON_CHOICES = [
+        ('customer_change', 'Pelanggan Berubah Pikiran'),
+        ('wrong_item',      'Barang Salah'),
+        ('damaged',         'Barang Rusak'),
+        ('expired',         'Kedaluwarsa'),
+        ('other',           'Lainnya'),
+    ]
+
+    # Reasons where the goods normally cannot go back on the shelf. Used only to
+    # default the per-line restock flag in the UI — the operator still decides,
+    # because a "damaged" carton can hold sellable units.
+    NON_RESTOCKABLE_REASONS = frozenset({'damaged', 'expired'})
+
+    return_number = models.CharField(max_length=30, unique=True, blank=True)
+    invoice       = models.ForeignKey(
+        'Invoice', on_delete=models.PROTECT, related_name='returns',
+        help_text='The sale being returned against. PROTECT: an invoice with a '
+                  'return on it is history that must stay resolvable.',
+    )
+    datetime      = models.DateTimeField()
+    branch        = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True,
+                                      related_name='sales_returns')
+    reason        = models.CharField(max_length=20, choices=REASON_CHOICES, default='customer_change')
+    notes         = models.CharField(max_length=500, blank=True, default='')
+
+    # Where the money goes back out. Mirrors Invoice's pair: the PaymentMethod is
+    # the human-facing label, the account is the GL row actually credited.
+    refund_method  = models.ForeignKey(
+        'PaymentMethod', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='sales_returns',
+    )
+    refund_account = models.ForeignKey(
+        'ChartOfAccounts', on_delete=models.PROTECT, null=True, blank=True,
+        limit_choices_to={'account_type': 'asset'},
+        related_name='sales_returns_paid_from',
+        help_text='Cash/bank account credited by this refund. Must be one of '
+                  'services.cash_accounts.cash_bank_account_ids().',
+    )
+
+    # Where restocked goods land. Defaults to the invoice's warehouse — goods
+    # normally go back where they came from — but is overridable, because a
+    # return received at another branch's front desk does not.
+    warehouse = models.ForeignKey('Warehouse', on_delete=models.SET_NULL, null=True, blank=True,
+                                  related_name='sales_returns')
+
+    total_refund = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+
+    processed_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True,
+                                     related_name='sales_returns_processed')
+    created_at   = models.DateTimeField(auto_now_add=True)
+
+    is_voided = models.BooleanField(default=False)
+    voided_at = models.DateTimeField(null=True, blank=True)
+    voided_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True,
+                                  related_name='voided_sales_returns')
+
+    posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
+
+    class Meta:
+        ordering = ['-datetime', '-id']
+        verbose_name = 'Sales Return'
+
+    def __str__(self):
+        return self.return_number or f'RTN-{self.pk}'
+
+    def save(self, *args, **kwargs):
+        if not self.return_number:
+            today = timezone.now().strftime('%Y%m%d')
+            base = f'RTN-{today}'
+            count = SalesReturn.objects.filter(return_number__startswith=base).count()
+            self.return_number = f'{base}-{count + 1}'
+        super().save(*args, **kwargs)
+
+
+class SalesReturnItem(models.Model):
+    """One returned line.
+
+    ``price`` and ``discount_pct`` are **copied from the invoice line at return
+    time**, not looked up live. The refund has to be worth what the patient
+    actually paid, so a price change or a promotion expiring between the sale
+    and the return must not alter it.
+
+    ``cogs_reversed`` is captured when the restock actually happens, for the
+    same reason ``StockOutLog.value`` is: the batches have moved on by the time
+    anyone asks, so it cannot be recomputed afterwards.
+    """
+    sales_return = models.ForeignKey('SalesReturn', on_delete=models.CASCADE, related_name='items')
+    invoice_item = models.ForeignKey('InvoiceItem', on_delete=models.PROTECT,
+                                     related_name='return_items')
+    item         = models.ForeignKey('InventoryItem', on_delete=models.PROTECT,
+                                     null=True, blank=True, related_name='return_items')
+    item_name    = models.CharField(max_length=255, blank=True, default='')
+    quantity     = models.DecimalField(max_digits=14, decimal_places=3)
+    price        = models.DecimalField(max_digits=14, decimal_places=2)
+    discount_pct = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+
+    # Whether these units go back into sellable stock. False for a service (it
+    # cannot be un-performed) and for goods the operator marks unsellable.
+    restock       = models.BooleanField(default=True)
+    cogs_reversed = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+
+    class Meta:
+        ordering = ['id']
+        verbose_name = 'Sales Return Item'
+
+    def __str__(self):
+        return f'{self.sales_return} - {self.item_name or self.item} x{self.quantity}'
+
+    @property
+    def gross(self):
+        """Price before any line discount — what the revenue leg is worth."""
+        return (self.price or Decimal('0')) * (self.quantity or Decimal('0'))
+
+    @property
+    def net(self):
+        """What this line actually contributed to the invoice subtotal."""
+        return self.gross * (Decimal('1') - (self.discount_pct or Decimal('0')) / Decimal('100'))
+
+
 class LedgerEntry(models.Model):
     ENTRY_TYPE_CHOICES = [('debit', 'Debit'), ('credit', 'Credit')]
     SOURCE_TYPE_CHOICES = [
@@ -650,6 +850,10 @@ class LedgerEntry(models.Model):
         ('restore_memo', 'Restore Memo (un-void repost)'),
         # Phase 3 — operating expense accrual/payment postings.
         ('expense',    'Expense'),
+        # A sales return: revenue and (for restocked goods) COGS reversed on the
+        # day the goods came back, as its own document rather than an edit of
+        # the original sale.
+        ('sales_return', 'Sales Return'),
     ]
 
     account          = models.ForeignKey('ChartOfAccounts', on_delete=models.PROTECT, related_name='ledger_entries')
@@ -670,6 +874,15 @@ class LedgerEntry(models.Model):
     transfer         = models.ForeignKey('AccountTransfer', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
     expense          = models.ForeignKey('Expense', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
     stock_out_log    = models.ForeignKey('StockOutLog', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
+    sales_return     = models.ForeignKey('SalesReturn', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_entries')
+    reconciliation   = models.ForeignKey('BankReconciliation', on_delete=models.SET_NULL, null=True, blank=True, related_name='cleared_entries', db_index=True)
+    # Denormalised from the source document at posting time by
+    # ``journal_engine.write_legs``. Kept on the line (not only on the entry)
+    # because the financial reports aggregate LedgerEntry directly, and a
+    # per-branch P&L that had to join back through five nullable document FKs
+    # would be both slow and wrong for manual entries. Null means group-wide —
+    # a legitimate state for a shared overhead entry, not a missing value.
+    branch           = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='ledger_entries')
     created_at       = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -678,6 +891,130 @@ class LedgerEntry(models.Model):
 
     def __str__(self):
         return f'{self.date} | {self.entry_type.upper()} {self.amount} → {self.account}'
+
+
+class BankReconciliation(models.Model):
+    """One period's reconciliation of a cash/bank account against its statement.
+
+    The question this answers is narrow and worth stating precisely: **does the
+    ledger balance of this account agree with what the bank says, and if not,
+    exactly which transactions explain the gap?** Everything here exists to make
+    that gap enumerable rather than a single scary number.
+
+    A reconciliation is ``draft`` while the operator matches lines, and
+    ``completed`` once it balances. Completing is refused while a difference
+    remains — a closed reconciliation that does not balance is worse than an
+    open one, because it looks finished. Completing also stamps every matched
+    ``LedgerEntry`` with this row, so the next period never re-offers a
+    transaction that has already been cleared.
+
+    Nothing here posts to the ledger. Reconciliation is an *assertion about*
+    the books, not a change to them: a missing transaction is fixed by entering
+    it (an expense, a transfer, a manual journal), never by the reconciler
+    quietly writing one.
+    """
+
+    STATUS_CHOICES = [('draft', 'Draft'), ('completed', 'Selesai')]
+
+    account = models.ForeignKey(
+        'ChartOfAccounts', on_delete=models.PROTECT, related_name='reconciliations',
+        limit_choices_to={'account_type': 'asset'},
+        help_text='The cash/bank account being reconciled. Must be one of '
+                  'services.cash_accounts.cash_bank_account_ids().',
+    )
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True,
+                               related_name='reconciliations')
+
+    statement_start = models.DateField()
+    statement_end   = models.DateField()
+
+    # Both come from the paper (or PDF) statement, typed by the operator. The
+    # opening balance is not derived from the ledger on purpose: if the two
+    # disagree, that disagreement is the finding, and deriving it would hide it.
+    opening_balance = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    closing_balance = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    status       = models.CharField(max_length=10, choices=STATUS_CHOICES, default='draft')
+    notes        = models.TextField(blank=True, default='')
+    created_by   = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True,
+                                     related_name='reconciliations_created')
+    created_at   = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+    completed_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True,
+                                     related_name='reconciliations_completed')
+
+    class Meta:
+        ordering = ['-statement_end', '-id']
+        verbose_name = 'Bank Reconciliation'
+
+    def __str__(self):
+        return f'{self.account} {self.statement_start}..{self.statement_end}'
+
+    @property
+    def is_locked(self):
+        """A completed reconciliation is read-only: its matches are the record
+        of what was cleared, and editing them would silently un-clear ledger
+        rows that a later period has already skipped over."""
+        return self.status == 'completed'
+
+
+class BankStatementLine(models.Model):
+    """One row from the bank's statement, and what it was matched to.
+
+    ``amount`` is **signed from the account's point of view**: positive money
+    in, negative money out. Banks present this as two columns and disagree with
+    each other about which is which, so the import normalises to one signed
+    number and every comparison downstream is plain arithmetic.
+
+    ``ledger_entry`` is the match. Null means unexplained — either the clinic
+    has not recorded the transaction yet (a bank charge nobody entered) or the
+    match simply has not been made. ``is_ignored`` separates the third case: a
+    line the operator has looked at and deliberately set aside, which stops
+    counting against the reconciliation without pretending it was matched.
+    """
+
+    MATCH_AUTO = 'auto'
+    MATCH_MANUAL = 'manual'
+    MATCH_TYPE_CHOICES = [(MATCH_AUTO, 'Otomatis'), (MATCH_MANUAL, 'Manual')]
+
+    reconciliation = models.ForeignKey('BankReconciliation', on_delete=models.CASCADE,
+                                       related_name='lines')
+    date        = models.DateField()
+    description = models.CharField(max_length=255, blank=True, default='')
+    reference   = models.CharField(max_length=100, blank=True, default='')
+    amount      = models.DecimalField(max_digits=18, decimal_places=2)
+
+    # SET_NULL rather than CASCADE: a ledger entry that is later corrected away
+    # should leave the statement line visible and unmatched, not delete the
+    # bank's own record of the transaction.
+    ledger_entry = models.ForeignKey('LedgerEntry', on_delete=models.SET_NULL,
+                                     null=True, blank=True, related_name='statement_lines')
+    match_type   = models.CharField(max_length=10, choices=MATCH_TYPE_CHOICES,
+                                    blank=True, default='')
+    is_ignored   = models.BooleanField(default=False)
+    sort_order   = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['date', 'sort_order', 'id']
+        verbose_name = 'Bank Statement Line'
+        constraints = [
+            # One ledger entry can clear at most one statement line. Without
+            # this, a double-click on "match" produces two lines pointing at the
+            # same payment and the reconciliation balances while the books do
+            # not. Nulls do not collide, so unmatched lines are unaffected.
+            models.UniqueConstraint(
+                fields=['reconciliation', 'ledger_entry'],
+                condition=models.Q(ledger_entry__isnull=False),
+                name='uniq_ledger_entry_per_reconciliation',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.date} {self.amount} {self.description[:40]}'
+
+    @property
+    def is_matched(self):
+        return self.ledger_entry_id is not None
 
 
 class TreatmentCategory(models.Model):
@@ -1240,6 +1577,7 @@ class StockOutLog(models.Model):
     # time, by StockOutView — never derived afterwards.
     value = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     notes = models.TextField(blank=True, default='')
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='stock_out_logs')
     posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
     created_by = models.ForeignKey(AppUser, null=True, blank=True, on_delete=models.SET_NULL, related_name='stock_out_logs')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1546,6 +1884,7 @@ class PurchaseInvoice(models.Model):
     is_voided      = models.BooleanField(default=False)
     voided_at      = models.DateTimeField(null=True, blank=True)
     voided_by      = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='voided_purchase_invoices')
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='purchase_invoices')
     posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
 
     class Meta:
@@ -1676,6 +2015,7 @@ class AccountTransfer(models.Model):
     reference     = models.CharField(max_length=100, blank=True)
     created_at    = models.DateTimeField(auto_now_add=True)
     created_by    = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='account_transfers')
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='account_transfers')
     posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
 
     class Meta:
@@ -1778,6 +2118,7 @@ class Expense(models.Model):
     total_amount   = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     amount_paid    = models.DecimalField(max_digits=14, decimal_places=2, default=0)
     notes          = models.TextField(blank=True)
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='expenses')
     posting_status = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
     created_by     = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='expenses')
     created_at     = models.DateTimeField(auto_now_add=True)
@@ -1913,8 +2254,12 @@ class JournalEntry(models.Model):
     transfer         = models.ForeignKey('AccountTransfer', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
     expense          = models.ForeignKey('Expense',         on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
     stock_out_log    = models.ForeignKey('StockOutLog',     on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
+    sales_return     = models.ForeignKey('SalesReturn',     on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_entries')
 
     batch = models.ForeignKey('JournalBatch', on_delete=models.SET_NULL, null=True, blank=True, related_name='entries')
+
+    # Same denormalisation as LedgerEntry.branch, at document level.
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='journal_entries')
 
     # Correction chain. Both FKs point at the ORIGINAL entry: ``reverses`` is set
     # on the auto-generated reversal, ``corrects`` on the operator's replacement.
@@ -2234,6 +2579,10 @@ class AppointmentLocation(models.Model):
     """A bookable room. Maps to FHIR Location."""
     name = models.CharField(max_length=100)
     room_code = models.CharField(max_length=30, blank=True)
+    branch = models.ForeignKey(
+        'Branch', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='appointment_locations',
+    )
     is_active = models.BooleanField(default=True)
     # Assigned when the room is registered as a Location in SatuSehat. Sync phase only.
     ihs_id = models.CharField(max_length=64, null=True, blank=True)
@@ -2284,6 +2633,11 @@ class Appointment(models.Model):
         ('error', 'Error'),
     ]
 
+    SOURCE_CHOICES = [
+        ('staff', 'Staff'),
+        ('online', 'Online Reservation'),
+    ]
+
     appointment_no = models.CharField(max_length=20, unique=True, blank=True)
     patient = models.ForeignKey(
         Patient, on_delete=models.SET_NULL, null=True, blank=True,
@@ -2298,10 +2652,26 @@ class Appointment(models.Model):
         AppointmentLocation, on_delete=models.SET_NULL, null=True, blank=True,
         related_name='appointments',
     )
+    # Which clinic the booking is at. ``location`` is the room inside it — the
+    # two are not interchangeable, and a room belongs to exactly one branch.
+    branch = models.ForeignKey(
+        'Branch', on_delete=models.PROTECT, null=True, blank=True,
+        related_name='appointments',
+    )
     service_category = models.CharField(max_length=100, blank=True)
     service_type = models.CharField(max_length=100, blank=True)
     appointment_type = models.CharField(
         max_length=20, choices=APPOINTMENT_TYPE_CHOICES, blank=True)
+    # Who created the booking. Not a FHIR field — the schedule reads very
+    # differently when a row was typed by reception versus submitted by a
+    # stranger on the public form, and the page colours it accordingly.
+    source = models.CharField(
+        max_length=20, choices=SOURCE_CHOICES, default='staff')
+    # The number the booker gave. For a staff booking against a patient record
+    # this is redundant with Patient.phone_number; for an online booking whose
+    # phone matched nothing it is the *only* way to reach them, so it is stored
+    # on the appointment rather than looked up.
+    contact_phone = models.CharField(max_length=20, blank=True)
     reason = models.TextField(blank=True)
     start_at = models.DateTimeField()
     end_at = models.DateTimeField(null=True, blank=True)
@@ -2355,6 +2725,92 @@ class Appointment(models.Model):
                 self.start_at or timezone.now(), JAKARTA_TZ).year
             self.appointment_no = Appointment.next_number(year)
         super().save(*args, **kwargs)
+
+
+
+class ReservationRequest(models.Model):
+    """One booking submitted on the public web form and collected from Vercel.
+
+    The clinic backend has no public address, so nothing can push here. A
+    poller drains ``GET /api/reservation-sync`` and writes one row per booking
+    (see services/reservation_sync.py).
+
+    **The Appointment is created immediately, not on approval.** The public form
+    already enforces opening hours, slot capacity, the booking window and its
+    own rate limits before it accepts anything — by the time a row reaches here
+    the slot *is* taken, and holding it in a pending tray would let reception
+    double-book a time the patient has already been promised. So this model is a
+    worklist, not a gate: it records how the booking was matched to a patient
+    and what a human still needs to do about it.
+
+    ``external_id`` is the Vercel row id and is unique, which is the whole
+    idempotency story — the poll endpoint re-delivers anything unacked, and a
+    re-delivery must not produce a second appointment.
+    """
+
+    MATCH_MATCHED = 'matched'
+    MATCH_UNMATCHED = 'unmatched'
+    MATCH_AMBIGUOUS = 'ambiguous'
+    MATCH_INVALID = 'invalid_phone'
+    MATCH_STATUS_CHOICES = [
+        (MATCH_MATCHED, 'Matched'),
+        (MATCH_UNMATCHED, 'No Matching Patient'),
+        (MATCH_AMBIGUOUS, 'Multiple Matching Patients'),
+        (MATCH_INVALID, 'Unusable Phone Number'),
+    ]
+
+    external_id = models.PositiveIntegerField(unique=True)
+    name = models.CharField(max_length=100)
+    # Stored exactly as the form normalised it (628xxxxxxxxx). Kept verbatim so
+    # a mismatch can be diagnosed against what the patient actually typed.
+    phone = models.CharField(max_length=20)
+    reserved_at = models.DateTimeField()
+    service_name = models.CharField(max_length=100, blank=True)
+    service_id = models.PositiveIntegerField(null=True, blank=True)
+
+    match_status = models.CharField(
+        max_length=20, choices=MATCH_STATUS_CHOICES, default=MATCH_UNMATCHED)
+    matched_patient = models.ForeignKey(
+        Patient, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='reservation_requests',
+    )
+    # Every patient_no the phone resolved to when it resolved to more than one.
+    # Ambiguity is never guessed away (same rule as the bank reconciler): the
+    # candidates are handed to a human, who knows which Siti this is.
+    candidate_patient_nos = models.JSONField(default=list, blank=True)
+
+    appointment = models.OneToOneField(
+        Appointment, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='reservation_request',
+    )
+
+    # Cleared by reception once the row has been looked at. An acknowledged row
+    # with a matched patient needs nothing further; the inbox defaults to
+    # showing what still does.
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+    acknowledged_by = models.ForeignKey(
+        'AppUser', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='acknowledged_reservations',
+    )
+
+    # When this row was written locally, and the untouched payload it came from.
+    pulled_at = models.DateTimeField(auto_now_add=True)
+    raw = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ['-reserved_at']
+        indexes = [
+            models.Index(fields=['acknowledged_at', 'reserved_at']),
+            models.Index(fields=['match_status']),
+        ]
+
+    def __str__(self):
+        return f'Reservation #{self.external_id}: {self.name} ({self.phone})'
+
+    @property
+    def needs_attention(self):
+        """Rows the inbox surfaces by default."""
+        return self.acknowledged_at is None or self.match_status != self.MATCH_MATCHED
 
 
 # ─────────────────────────────────────────────────────────────────────────────

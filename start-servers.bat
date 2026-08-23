@@ -6,8 +6,9 @@ set BACKEND=%ROOT%Clinic-Patient-Management-System
 set FRONTEND=%ROOT%CPMS-Webapp
 
 REM ── Sub-process entry points ────────────────────────────────────────────────
-if "%1"=="backend"  goto :run_backend
-if "%1"=="frontend" goto :run_frontend
+if "%1"=="backend"      goto :run_backend
+if "%1"=="frontend"     goto :run_frontend
+if "%1"=="reservations" goto :run_reservations
 
 REM ── Main: pull both repos, install deps if needed, then launch ──────────────
 echo ============================================
@@ -62,9 +63,10 @@ if errorlevel 1 (
 REM ---- Launch ----------------------------------------------------------------
 echo.
 echo Starting servers...
-start "CMS Backend"  cmd /k "%~f0" backend
-start "CMS Frontend" cmd /k "%~f0" frontend
-echo Done. Both servers launched in separate windows.
+start "CMS Backend"      cmd /k "%~f0" backend
+start "CMS Frontend"     cmd /k "%~f0" frontend
+start "CMS Reservations" cmd /k "%~f0" reservations
+echo Done. Backend, frontend and the reservation poller launched in separate windows.
 exit /b 0
 
 REM ── Backend window ──────────────────────────────────────────────────────────
@@ -87,4 +89,16 @@ REM ── Frontend window ─────────────────�
 cd /d "%FRONTEND%"
 echo Starting Vite dev server...
 npm run dev -- --host
+exit /b
+
+REM ── Online reservation poller ───────────────────────────────────────────────
+REM Vercel cannot reach this machine, so the clinic collects instead: one pass a
+REM minute against /api/reservation-sync. Each pass is idempotent, so closing
+REM this window loses nothing — the bookings queue up on Vercel and the next
+REM run collects the backlog.
+:run_reservations
+cd /d "%BACKEND%"
+call Scriptsctivate.bat
+echo Polling for online reservations every 60s...
+python manage.py poll_reservations --loop --interval 60
 exit /b

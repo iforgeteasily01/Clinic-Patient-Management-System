@@ -31,7 +31,7 @@ from django.utils import timezone
 
 from ..models import (
     AccountTransfer, Expense, Invoice, JournalBatch, JournalDayLog,
-    PurchaseInvoice, StockOutLog,
+    PurchaseInvoice, SalesReturn, StockOutLog,
 )
 
 # Reasons whose cost reaches the P&L. Derived from the model's own mapping so
@@ -87,6 +87,14 @@ def _gather_events(date_to):
         value__gt=0, reason__in=JOURNALABLE_STOCK_REASONS,
     ).select_related('item'):
         add(s.out_date, 'stock', s)
+
+    # Sales returns. Voided ones are excluded on the same grounds as voided
+    # invoices: nothing came back, so there is nothing to reverse. A return
+    # posts on the day the goods arrived, not the day of the original sale.
+    for r in SalesReturn.objects.filter(
+        posting_status='unposted', is_voided=False, datetime__date__lte=date_to,
+    ).select_related('invoice'):
+        add(r.datetime.date(), 'sales_return', r)
 
     return by_date
 

@@ -42,7 +42,7 @@ def resolve_payment_account(payment_account_id):
     return account
 
 
-def create_alias_expense(*, data, scope, source, actor, status_override='paid'):
+def create_alias_expense(*, data, scope, source, actor, status_override='paid', branch=None):
     """Resolve alias rows to accounts and write one Expense.
 
     ``data`` is validated output from a serializer shaped like
@@ -93,6 +93,7 @@ def create_alias_expense(*, data, scope, source, actor, status_override='paid'):
         items=items,
         actor=actor,
         source=source,
+        branch=branch,
         # Paid immediately: these forms record money already spent, so there is
         # no payable to track. A liability that needs tracking goes through
         # /accounting/purchases (per-vendor AP) or the full expense form.

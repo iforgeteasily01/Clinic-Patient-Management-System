@@ -9,6 +9,7 @@ from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from ..api.serializers import PatientSerializer, PatientSyncSerializer, ActivePatientSerializer, TreatmentSerializer
+from ..services.branches import filter_by_branch, write_branch
 
 
 def _actor(request):
@@ -66,6 +67,7 @@ class PatientCreateWithActiveView(APIView):
             patient_no=patient,
             status=1 if consult_status else 3,
             consult_status=consult_status,
+            branch=write_branch(request, locked=True),
         )
 
         AuditLog.objects.create(
@@ -86,7 +88,12 @@ class PatientCreateWithActiveView(APIView):
 
 class ActivePatientClearView(APIView):
     def delete(self, request):
-        deleted_count, _ = ActivePatient.objects.all().delete()
+        # Scoped to the caller's own branch: clearing the queue is an end-of-day
+        # action at one clinic, and a group-wide wipe from one reception desk
+        # would delete another branch's live queue mid-shift.
+        deleted_count, _ = filter_by_branch(
+            ActivePatient.objects.all(), request, locked=True, include_null=False,
+        ).delete()
         AuditLog.objects.create(
             performed_by=_actor(request),
             action='DELETE',
@@ -123,6 +130,7 @@ class AppointmentAddView(APIView):
             patient_no=patient,
             status=1 if consult_status else 3,
             consult_status=consult_status,
+            branch=write_branch(request, locked=True),
         )
 
         visit_type = 'consultation' if consult_status else 'treatment'
@@ -140,7 +148,10 @@ class AppointmentAddView(APIView):
 
 class TreatmentQueueView(APIView):
     def get(self, request):
-        patients = ActivePatient.objects.filter(status__in=[3, 4])
+        patients = filter_by_branch(
+            ActivePatient.objects.filter(status__in=[3, 4]),
+            request, locked=True, include_null=False,
+        )
         serializer = ActivePatientSerializer(patients, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
 
@@ -161,6 +172,7 @@ class GeneralAppointmentCreateView(APIView):
             guest_name=guest_name,
             status=1 if consult_status else 3,
             consult_status=consult_status,
+            branch=write_branch(request, locked=True),
         )
 
         visit_type = 'consultation' if consult_status else 'treatment'
@@ -287,6 +299,7 @@ class TreatmentSessionCreateView(APIView):
             active_patient=active_patient,
             patient_no=patient,
             beautician=beautician,
+            branch=write_branch(request, locked=True),
         )
         session.treatments.set(treatment_list)
 

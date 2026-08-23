@@ -33,6 +33,7 @@ from ..models import (
     ActivePatient, AppUser, AuditLog, Expense, Invoice,
     OperationalInputEntry, OperationalInputTemplate, PurchaseInvoice,
 )
+from ..services.branches import filter_by_branch
 from ..services.operational_inputs import (
     JAKARTA_TZ,
     iter_period_starts,
@@ -538,8 +539,12 @@ class AdminDashboardView(APIView):
             })
 
         # ── Pending invoices ────────────────────────────────────────────────
-        unposted_invoices = Invoice.objects.filter(
-            posting_status='unposted', is_voided=False,
+        # Scoped to the branch selection, like every other figure on this
+        # dashboard: a manager looking at Cabang B must not see Cabang A's
+        # backlog as their own to clear.
+        unposted_invoices = filter_by_branch(
+            Invoice.objects.filter(posting_status='unposted', is_voided=False),
+            request,
         )
         unposted_count = unposted_invoices.count()
         unposted_total = unposted_invoices.aggregate(t=Sum('grand_total'))['t'] or Decimal('0')
@@ -549,15 +554,20 @@ class AdminDashboardView(APIView):
             .first()
         )
 
-        awaiting_billing = ActivePatient.objects.filter(status=5).count()
+        awaiting_billing = filter_by_branch(
+            ActivePatient.objects.filter(status=5), request, include_null=False,
+        ).count()
 
         # Purchase and expense backlogs are the same kind of "not journalled
         # yet" debt and cost one count each, so the dashboard reports them
         # rather than making the operator open /accounting to find out.
-        unposted_purchases = PurchaseInvoice.objects.filter(
-            posting_status='unposted', is_voided=False,
+        unposted_purchases = filter_by_branch(
+            PurchaseInvoice.objects.filter(posting_status='unposted', is_voided=False),
+            request,
         ).count()
-        unposted_expenses = Expense.objects.filter(posting_status='unposted').count()
+        unposted_expenses = filter_by_branch(
+            Expense.objects.filter(posting_status='unposted'), request,
+        ).count()
 
         # ── Operational input tasks ─────────────────────────────────────────
         tasks = _outstanding_for_active_templates(as_of=today)

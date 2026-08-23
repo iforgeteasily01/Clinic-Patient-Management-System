@@ -296,6 +296,27 @@ class TestPreviewEndpoints:
                            {"source_type": "purchase"})
         assert res.json()["count"] == 0
 
+    def test_day_rollup_flagged_count_matches_the_only_warnings_filter(
+        self, auth_api, stock, gl_accounts,
+    ):
+        """The rail badges a day "N perlu diperiksa" and clicking it filters to
+        that day with only_warnings — the two numbers must agree, or the
+        operator opens a day the rail promised had problems and finds none."""
+        _create_invoice(auth_api, stock, gl_accounts,
+                        dt=datetime.datetime(2026, 7, 1, 10, 0))
+        _create_invoice(auth_api, stock, gl_accounts,
+                        dt=datetime.datetime(2026, 7, 2, 10, 0))
+        _preview(None, datetime.date(2026, 7, 31))
+
+        days = auth_api.get(reverse("accounting-journal-preview")).json()["days"]
+        assert days, "the draft should roll up at least one day"
+
+        for day in days:
+            assert day["flagged"] <= day["entries"]
+            res = auth_api.get(reverse("accounting-journal-preview-entries"),
+                               {"date": day["date"], "only_warnings": "1"})
+            assert res.json()["count"] == day["flagged"], day["date"]
+
     def test_staged_entry_detail_returns_lines(self, auth_api, stock, gl_accounts):
         _create_invoice(auth_api, stock, gl_accounts,
                         dt=datetime.datetime(2026, 7, 1, 10, 0))

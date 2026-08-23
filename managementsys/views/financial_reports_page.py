@@ -37,9 +37,11 @@ from .financial_reports_utils import (
     earliest_ledger_date,
     earnings_through,
     opening_balances,
+    scope_to_branches,
     signed_balance,
     unposted_dates_in_range,
 )
+from ..services.branches import read_branch_ids
 
 WIB = ZoneInfo('Asia/Jakarta')
 
@@ -256,7 +258,7 @@ class TrialBalanceView(APIView):
         if gate:
             return gate
 
-        mv = account_movements(date_to=as_of)
+        mv = account_movements(date_to=as_of, branch_ids=read_branch_ids(request))
         accts = accounts_by_id()
 
         rows = []
@@ -337,7 +339,8 @@ class ProfitLossView(APIView):
         if gate:
             return gate
 
-        current = self._compute(d_from, d_to)
+        branch_ids = read_branch_ids(request)
+        current = self._compute(d_from, d_to, branch_ids)
         payload = {
             'date_from': d_from.isoformat(),
             'date_to':   d_to.isoformat(),
@@ -351,7 +354,7 @@ class ProfitLossView(APIView):
             payload['comparison'] = {
                 'date_from': p_from.isoformat(),
                 'date_to':   p_to.isoformat(),
-                **self._compute(p_from, p_to),
+                **self._compute(p_from, p_to, branch_ids),
             }
 
         if _wants_xlsx(request):
@@ -377,8 +380,8 @@ class ProfitLossView(APIView):
         rows.sort(key=lambda r: r['account_number'])
         return rows, total
 
-    def _compute(self, d_from, d_to):
-        mv = account_movements(date_from=d_from, date_to=d_to)
+    def _compute(self, d_from, d_to, branch_ids=None):
+        mv = account_movements(date_from=d_from, date_to=d_to, branch_ids=branch_ids)
         accts = accounts_by_id()
 
         revenue, rev_total = self._section(mv, accts, ('revenue',))
@@ -462,7 +465,7 @@ class BalanceSheetView(APIView):
         if gate:
             return gate
 
-        mv = account_movements(date_to=as_of)
+        mv = account_movements(date_to=as_of, branch_ids=read_branch_ids(request))
         accts = accounts_by_id()
 
         def section(types):
@@ -575,13 +578,15 @@ class GeneralLedgerView(APIView):
         else:
             target_ids = None  # all accounts that have entries
 
-        opening = opening_balances(d_from, account_ids=target_ids)
+        branch_ids = read_branch_ids(request)
+        opening = opening_balances(d_from, account_ids=target_ids, branch_ids=branch_ids)
 
-        entries_qs = (
+        entries_qs = scope_to_branches(
             LedgerEntry.objects
             .filter(date__gte=d_from, date__lte=d_to)
             .select_related('account')
-            .order_by('account__account_number', 'date', 'created_at')
+            .order_by('account__account_number', 'date', 'created_at'),
+            branch_ids,
         )
         if target_ids is not None:
             entries_qs = entries_qs.filter(account_id__in=target_ids)
@@ -728,13 +733,17 @@ class CashFlowView(APIView):
             key=lambda a: a.account_number,
         )
 
-        opening_map = opening_balances(d_from, account_ids=cash_ids)
+        branch_ids = read_branch_ids(request)
+        opening_map = opening_balances(d_from, account_ids=cash_ids, branch_ids=branch_ids)
         opening_cash = sum((opening_map.get(i, ZERO) for i in cash_ids), ZERO)
 
         cash_lines = list(
-            LedgerEntry.objects
-            .filter(date__gte=d_from, date__lte=d_to, account_id__in=cash_ids)
-            .only('id', 'account_id', 'amount', 'entry_type', 'source_type', 'journal_entry')
+            scope_to_branches(
+                LedgerEntry.objects
+                .filter(date__gte=d_from, date__lte=d_to, account_id__in=cash_ids)
+                .only('id', 'account_id', 'amount', 'entry_type', 'source_type', 'journal_entry'),
+                branch_ids,
+            )
         )
 
         # One extra query pulls every line of every journal entry that touched

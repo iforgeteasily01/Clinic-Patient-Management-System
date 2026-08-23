@@ -58,8 +58,8 @@ from django.utils import timezone
 
 from ..models import (
     AccountTransfer, ChartOfAccounts, Expense, Invoice, JournalBatch,
-    JournalDayLog, JournalStagingBatch, PurchaseInvoice, StagedJournalEntry,
-    StagedJournalLine, StockOutLog,
+    JournalDayLog, JournalStagingBatch, PurchaseInvoice, SalesReturn,
+    StagedJournalEntry, StagedJournalLine, StockOutLog,
 )
 from .journal_engine import (
     build_expense_legs, build_purchase_legs, build_stock_correction_legs,
@@ -167,6 +167,11 @@ def fingerprint_document(kind, obj) -> str:
             'stock', obj.pk, obj.out_date, obj.reason, obj.value,
             obj.quantity, obj.item_id, obj.warehouse_id, obj.notes,
         ])
+    if kind == 'sales_return':
+        # The parts list lives with the return logic rather than here, so the
+        # hash cannot drift from what the builder actually reads.
+        from .sales_returns import fingerprint as sales_return_fingerprint
+        return _fingerprint(sales_return_fingerprint(obj))
     return _fingerprint([kind, obj.pk])
 
 
@@ -238,23 +243,32 @@ def build_legs_for(kind, obj, *, deduct, sim=None):
         # so preview and commit read the same stored number and the legs are
         # never flagged as estimates.
         return build_stock_correction_legs(obj, create_accounts=deduct)
+    if kind == 'sales_return':
+        # FIFO-dependent in the same way the invoice is, but in the other
+        # direction: the preview estimates what restocking would cost back and
+        # flags those legs, the commit does the restock and posts the real
+        # figure. See services/sales_returns.build_sales_return_legs.
+        from .sales_returns import build_sales_return_legs
+        return build_sales_return_legs(obj, deduct=deduct, sim=sim)
     raise ValueError(f'Unknown document kind: {kind}')
 
 
 SOURCE_TYPE_BY_KIND = {
-    'invoice':  'invoice',
-    'purchase': 'purchase',
-    'transfer': 'transfer',
-    'expense':  'expense',
-    'stock':    'stock',
+    'invoice':      'invoice',
+    'purchase':     'purchase',
+    'transfer':     'transfer',
+    'expense':      'expense',
+    'stock':        'stock',
+    'sales_return': 'sales_return',
 }
 
 MODEL_BY_KIND = {
-    'invoice':  Invoice,
-    'purchase': PurchaseInvoice,
-    'transfer': AccountTransfer,
-    'expense':  Expense,
-    'stock':    StockOutLog,
+    'invoice':      Invoice,
+    'purchase':     PurchaseInvoice,
+    'transfer':     AccountTransfer,
+    'expense':      Expense,
+    'stock':        StockOutLog,
+    'sales_return': SalesReturn,
 }
 
 
@@ -267,6 +281,8 @@ def document_label(kind, obj):
         return f'Beban #{obj.pk}'
     if kind == 'stock':
         return f'Koreksi stok #{obj.pk}'
+    if kind == 'sales_return':
+        return obj.return_number or f'Retur #{obj.pk}'
     return f'Transfer #{obj.pk}'
 
 

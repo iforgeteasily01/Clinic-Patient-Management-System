@@ -22,6 +22,7 @@ from ..models import (
     LedgerEntry, Patient, PatientPackage, PatientPackageRedemption, PaymentMethod,
     PromotionUsage, Treatment, TreatmentPackage, Warehouse,
 )
+from ..services.branches import filter_by_branch, write_branch
 from ..services.cash_accounts import cash_bank_account_ids
 from ..services.journal_engine import LegSet, _apply_balance, _le, _post_legs, _revenue_legs
 from .crm_page import refresh_crm_profile
@@ -641,6 +642,9 @@ class InvoiceCreateView(APIView):
             grand_total=data['grand_total'],
             notes=data.get('notes', ''),
             promotion_code=(data.get('promotion_code') or '').strip(),
+            # POS is a locked module: the sale is booked where the till is,
+            # whatever branch the client has selected elsewhere in the app.
+            branch=write_branch(request, locked=True),
         )
 
         # ── Create InvoiceItems ───────────────────────────────────────────────
@@ -734,6 +738,7 @@ class InvoiceListView(APIView):
             .prefetch_related('items__item', 'payments__payment_method', 'payments__payment_account')
             .order_by('-datetime')
         )
+        qs = filter_by_branch(qs, request, include_null=True)
         if inv_no := request.GET.get('invoice_number', '').strip():
             qs = qs.filter(invoice_number=inv_no)
         elif q := request.GET.get('q', '').strip():

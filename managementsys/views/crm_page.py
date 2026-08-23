@@ -8,7 +8,10 @@ from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..models import Invoice, Patient, PatientCRMProfile, PatientTier, Promotion, ReportSettings
+from ..models import (
+    Invoice, Patient, PatientCRMProfile, PatientTier, Promotion, ReportSettings,
+    SalesReturn,
+)
 from ..services.patient_activity import classify
 
 logger = logging.getLogger(__name__)
@@ -39,6 +42,12 @@ def refresh_crm_profile(patient):
 
     Voided invoices are excluded — they represent reversed sales and should not
     count toward spend, visit count, or last-visit date.
+
+    Refunds are subtracted from spend but **not** from the visit count. A
+    patient who bought something and later brought part of it back still came
+    in, twice; erasing the visit would misreport how often the clinic sees them
+    and could silently demote a loyalty tier. Spend is different — money given
+    back was never spend — so lifetime value nets out the refunds.
     """
     agg = Invoice.objects.filter(patient_no=patient, is_voided=False).aggregate(
         total_spend=Sum('grand_total'),
@@ -49,6 +58,16 @@ def refresh_crm_profile(patient):
     total_spend = agg['total_spend'] or Decimal('0')
     total_visits = agg['total_visits'] or 0
     last_visit_date = agg['last_visit'].date() if agg['last_visit'] else None
+
+    refunded = SalesReturn.objects.filter(
+        invoice__patient_no=patient,
+        invoice__is_voided=False,
+        is_voided=False,
+    ).aggregate(total=Sum('total_refund'))['total'] or Decimal('0')
+    # Never negative: a refund larger than recorded spend is a data problem, and
+    # a negative lifetime value would place the patient below every tier
+    # threshold in a way no one could explain.
+    total_spend = max(total_spend - refunded, Decimal('0'))
 
     # Highest tier where both thresholds are met (ordered by sort_order desc)
     best_tier = (
