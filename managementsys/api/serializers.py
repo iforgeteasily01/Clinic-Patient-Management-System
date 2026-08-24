@@ -7,19 +7,43 @@ from rest_framework import serializers
 from ..models import (
     JAKARTA_TZ,
     AccountTransfer, ActivePatient, Appointment, AppointmentLocation, AppUser,
-    AssessmentCode, AttendanceRecord, Beauticians,
+    AssessmentCode, AttendanceRecord, Beauticians, Branch,
+    BankReconciliation, BankStatementLine,
     ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseAlias, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem, InvoicePayment,
     IssueTicket, IssueTicketImage, JournalEntry, JournalStagingBatch, LedgerEntry,
     MedRec, OperationalInputEntry, OperationalInputTemplate, Patient, PatientCRMProfile,
     PatientNote, PatientPackage, PatientPackageRedemption, PatientPhoto, PatientTier,
     PaymentMethod,
+    SalesReturn, SalesReturnItem,
     ProductionRecipe, ProductionRecipeIngredient, ProductionRun, ProductionRunIngredient,
     Promotion, PurchaseAdditionalCost, PurchaseInvoice, PurchaseInvoiceItem,
-    PurchasePayment, ReportSettings, SiteConfig,
+    PurchasePayment, ReportSettings, ReservationRequest, SiteConfig,
     SoapTemplate, StagedJournalEntry, StagedJournalLine, StaffSchedule, Supplier,
     Treatment, TreatmentCategory,
     TreatmentPackage, TreatmentPackageItem, TreatmentSession, Warehouse, WorkShift, patientStatus,
 )
+
+
+class BranchSerializer(serializers.ModelSerializer):
+    """Read/write shape for the Branches settings page.
+
+    ``is_default`` is writable: promoting a branch to default is the intended
+    admin action, and Branch.save() demotes the previous default so the
+    singleton can never be broken by two concurrent writes both setting True.
+    """
+    staff_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Branch
+        fields = ['id', 'code', 'name', 'address_line1', 'address_line2',
+                  'phone_fax', 'is_active', 'is_default', 'sort_order',
+                  'staff_count']
+
+    def get_staff_count(self, obj):
+        return obj.staff.filter(is_active=True).count()
+
+    def validate_code(self, value):
+        return value.strip().upper()
 
 
 class PatientSerializer(serializers.ModelSerializer):
@@ -231,11 +255,23 @@ class TreatmentSerializer(serializers.ModelSerializer):
 
 class AppUserPublicSerializer(serializers.ModelSerializer):
     profile_picture_url = serializers.SerializerMethodField()
+    # The client needs all three to render the branch picker without a second
+    # round trip: which branch to default to, what to label it, and whether the
+    # picker is a control at all or a read-only badge.
+    home_branch_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
+    home_branch_code = serializers.CharField(source='home_branch.code', read_only=True, default=None)
+    can_cross_branch = serializers.SerializerMethodField()
 
     class Meta:
         model = AppUser
         fields = ["id", "display_name", "role", "avatar_color", "profile_picture_url",
-                  "theme_primary", "theme_secondary", "theme_background"]
+                  "theme_primary", "theme_secondary", "theme_background",
+                  "home_branch", "home_branch_name", "home_branch_code",
+                  "can_cross_branch"]
+
+    def get_can_cross_branch(self, obj):
+        from ..services.branches import can_cross_branch
+        return can_cross_branch(obj)
 
     def get_profile_picture_url(self, obj):
         if not obj.profile_picture:
@@ -404,9 +440,11 @@ class ItemSyncSerializer(serializers.ModelSerializer):
 
 
 class WarehouseSerializer(serializers.ModelSerializer):
+    branch_name = serializers.CharField(source='branch.name', read_only=True, default=None)
+
     class Meta:
         model = Warehouse
-        fields = ['id', 'code', 'name', 'is_active']
+        fields = ['id', 'code', 'name', 'is_active', 'branch', 'branch_name']
 
 
 class InventoryBatchSerializer(serializers.ModelSerializer):
@@ -1078,10 +1116,12 @@ class JournalStagingBatchSerializer(serializers.ModelSerializer):
 class AppUserAdminSerializer(serializers.ModelSerializer):
     pin = serializers.CharField(write_only=True, required=False, allow_blank=True)
     profile_picture_url = serializers.SerializerMethodField()
+    home_branch_name = serializers.CharField(source='home_branch.name', read_only=True, default=None)
 
     class Meta:
         model = AppUser
-        fields = ['id', 'display_name', 'role', 'avatar_color', 'is_active', 'pin', 'profile_picture_url']
+        fields = ['id', 'display_name', 'role', 'avatar_color', 'is_active', 'pin',
+                  'profile_picture_url', 'home_branch', 'home_branch_name']
 
     def get_profile_picture_url(self, obj):
         if not obj.profile_picture:
@@ -1113,6 +1153,151 @@ class AppUserAdminSerializer(serializers.ModelSerializer):
             instance.set_pin(pin)
         instance.save()
         return instance
+
+
+# ── Bank Reconciliation ────────────────────────────────────────────────────
+
+class BankStatementLineSerializer(serializers.ModelSerializer):
+    """One statement row plus a flattened view of whatever it is matched to.
+
+    The matched entry is inlined rather than nested: the matching screen renders
+    a table, and a nested object per row means the template reaches through a
+    possibly-null relation on every cell.
+    """
+    is_matched = serializers.BooleanField(read_only=True)
+    matched_date = serializers.DateField(source='ledger_entry.date', read_only=True, default=None)
+    matched_description = serializers.CharField(source='ledger_entry.description',
+                                                read_only=True, default=None)
+    matched_amount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BankStatementLine
+        fields = ['id', 'date', 'description', 'reference', 'amount',
+                  'ledger_entry', 'match_type', 'is_ignored', 'is_matched',
+                  'matched_date', 'matched_description', 'matched_amount']
+
+    def get_matched_amount(self, obj):
+        """The matched row's effect on the account, signed like the statement.
+
+        Signed here rather than left as a debit/credit pair so the screen can
+        put the two numbers side by side and a mismatch is visible without the
+        reader having to remember which side raises an asset.
+        """
+        if not obj.ledger_entry_id:
+            return None
+        entry = obj.ledger_entry
+        return str(entry.amount if entry.entry_type == 'debit' else -entry.amount)
+
+
+class BankReconciliationListSerializer(serializers.ModelSerializer):
+    account_name = serializers.CharField(source='account.name', read_only=True)
+    account_number = serializers.IntegerField(source='account.account_number', read_only=True)
+    branch_name = serializers.CharField(source='branch.name', read_only=True, default=None)
+    created_by_name = serializers.CharField(source='created_by.display_name',
+                                            read_only=True, default=None)
+    completed_by_name = serializers.CharField(source='completed_by.display_name',
+                                              read_only=True, default=None)
+    line_count = serializers.SerializerMethodField()
+    matched_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BankReconciliation
+        fields = ['id', 'account', 'account_name', 'account_number',
+                  'branch', 'branch_name', 'statement_start', 'statement_end',
+                  'opening_balance', 'closing_balance', 'status', 'notes',
+                  'created_by_name', 'completed_by_name', 'created_at',
+                  'completed_at', 'line_count', 'matched_count']
+
+    def get_line_count(self, obj):
+        return obj.lines.count()
+
+    def get_matched_count(self, obj):
+        return obj.lines.filter(ledger_entry__isnull=False).count()
+
+
+class BankReconciliationDetailSerializer(BankReconciliationListSerializer):
+    """Adds the live figures.
+
+    ``summary`` is computed on read rather than stored, because every number in
+    it is derived from rows that change under the operator's hands. A stored
+    copy would be stale the moment a match is made, and a stale difference on a
+    reconciliation screen is worse than no difference at all.
+    """
+    summary = serializers.SerializerMethodField()
+    is_locked = serializers.BooleanField(read_only=True)
+
+    class Meta(BankReconciliationListSerializer.Meta):
+        fields = BankReconciliationListSerializer.Meta.fields + ['summary', 'is_locked']
+
+    def get_summary(self, obj):
+        from ..services.bank_reconciliation import summary as compute_summary
+        return {
+            k: (str(v) if isinstance(v, Decimal) else v)
+            for k, v in compute_summary(obj).items()
+        }
+
+
+# ── Sales Returns ──────────────────────────────────────────────────────────
+
+class SalesReturnItemSerializer(serializers.ModelSerializer):
+    item_code = serializers.CharField(source='item.code', read_only=True, default=None)
+    line_refund = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalesReturnItem
+        fields = ['id', 'invoice_item', 'item', 'item_code', 'item_name',
+                  'quantity', 'price', 'discount_pct', 'restock',
+                  'cogs_reversed', 'line_refund']
+
+    def get_line_refund(self, obj):
+        """The line's own net value — before the invoice-level apportionment.
+
+        Deliberately *not* the line's share of ``total_refund``: the invoice
+        discount, tax and charges are apportioned once against the return as a
+        whole (see services/sales_returns.compute_refund), so there is no
+        per-line share to report without inventing one. The header carries the
+        number that was actually paid out.
+        """
+        return str(obj.net.quantize(Decimal('0.01')))
+
+
+class SalesReturnListSerializer(serializers.ModelSerializer):
+    invoice_number = serializers.CharField(source='invoice.invoice_number', read_only=True)
+    patient_name = serializers.CharField(source='invoice.patient_no.name',
+                                         read_only=True, default=None)
+    refund_method_name = serializers.CharField(source='refund_method.name',
+                                               read_only=True, default=None)
+    refund_account_name = serializers.CharField(source='refund_account.name',
+                                                read_only=True, default=None)
+    processed_by_name = serializers.CharField(source='processed_by.display_name',
+                                              read_only=True, default=None)
+    branch_name = serializers.CharField(source='branch.name', read_only=True, default=None)
+    reason_label = serializers.CharField(source='get_reason_display', read_only=True)
+    item_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SalesReturn
+        fields = ['id', 'return_number', 'invoice', 'invoice_number', 'patient_name',
+                  'datetime', 'reason', 'reason_label', 'notes', 'total_refund',
+                  'refund_method_name', 'refund_account_name', 'processed_by_name',
+                  'branch', 'branch_name', 'posting_status', 'is_voided', 'voided_at',
+                  'item_count']
+
+    def get_item_count(self, obj):
+        return obj.items.count()
+
+
+class SalesReturnDetailSerializer(SalesReturnListSerializer):
+    items = SalesReturnItemSerializer(many=True, read_only=True)
+    warehouse_name = serializers.CharField(source='warehouse.name', read_only=True, default=None)
+    voided_by_name = serializers.CharField(source='voided_by.display_name',
+                                           read_only=True, default=None)
+
+    class Meta(SalesReturnListSerializer.Meta):
+        fields = SalesReturnListSerializer.Meta.fields + [
+            'items', 'warehouse', 'warehouse_name', 'refund_method',
+            'refund_account', 'voided_by_name', 'created_at',
+        ]
 
 
 # ── Issue Tickets ──────────────────────────────────────────────────────────
@@ -1900,6 +2085,7 @@ class AppointmentSerializer(serializers.ModelSerializer):
             'practitioner', 'practitioner_name',
             'location', 'location_name',
             'service_category', 'service_type', 'appointment_type', 'reason',
+            'source', 'contact_phone',
             'start_at', 'end_at', 'status', 'note',
             'created_at', 'updated_at',
             'linked_active_patient',
@@ -1909,6 +2095,9 @@ class AppointmentSerializer(serializers.ModelSerializer):
         read_only_fields = [
             'appointment_no', 'linked_active_patient',
             'sync_status', 'synced_at', 'ihs_appointment_id',
+            # Origin is a fact about how the row was created, never a client
+            # choice: a staff booking must not be able to pose as an online one.
+            'source',
         ]
 
     def get_satusehat_readiness(self, obj):
@@ -1964,6 +2153,65 @@ class AppointmentSerializer(serializers.ModelSerializer):
         if errors:
             raise serializers.ValidationError(errors)
         return attrs
+
+
+class ReservationRequestSerializer(serializers.ModelSerializer):
+    """One online booking, as the reservations inbox reads it."""
+
+    reserved_at = serializers.DateTimeField(
+        default_timezone=JAKARTA_TZ, read_only=True)
+    pulled_at = serializers.DateTimeField(
+        default_timezone=JAKARTA_TZ, read_only=True)
+    acknowledged_at = serializers.DateTimeField(
+        default_timezone=JAKARTA_TZ, read_only=True)
+
+    matched_patient_name = serializers.CharField(
+        source='matched_patient.name', read_only=True, allow_null=True)
+    acknowledged_by_name = serializers.CharField(
+        source='acknowledged_by.display_name', read_only=True, allow_null=True)
+    appointment_no = serializers.CharField(
+        source='appointment.appointment_no', read_only=True, allow_null=True)
+    appointment_status = serializers.CharField(
+        source='appointment.status', read_only=True, allow_null=True)
+    # Whether the booking has already been pulled into today's queue. The one
+    # thing reception needs that the inbox row itself does not carry.
+    checked_in = serializers.SerializerMethodField()
+    needs_attention = serializers.BooleanField(read_only=True)
+    candidates = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ReservationRequest
+        fields = [
+            'id', 'external_id', 'name', 'phone', 'reserved_at',
+            'service_name', 'service_id',
+            'match_status', 'matched_patient', 'matched_patient_name',
+            'candidate_patient_nos', 'candidates',
+            'appointment', 'appointment_no', 'appointment_status', 'checked_in',
+            'acknowledged_at', 'acknowledged_by', 'acknowledged_by_name',
+            'pulled_at', 'needs_attention',
+        ]
+        read_only_fields = fields
+
+    def get_checked_in(self, obj):
+        return bool(
+            obj.appointment_id and obj.appointment.linked_active_patient_id)
+
+    def get_candidates(self, obj):
+        """The ambiguous matches, named. A list of patient numbers is not
+        something a receptionist can choose between."""
+        numbers = obj.candidate_patient_nos or []
+        if not numbers:
+            return []
+        rows = Patient.objects.filter(patient_no__in=numbers).values(
+            'patient_no', 'name', 'phone_number')
+        return [
+            {
+                'patient_no': r['patient_no'],
+                'name': r['name'],
+                'phone_number': r['phone_number'],
+            }
+            for r in rows
+        ]
 
 
 # ── Operational inputs (planning only — never posts to the GL) ───────────────

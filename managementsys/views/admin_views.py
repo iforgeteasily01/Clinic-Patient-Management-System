@@ -12,6 +12,7 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from ..auth_backend import IsAppAuthenticated
+from ..services.branches import read_branch_ids
 from .financial_reports_utils import ledger_rows_with_balance, unposted_dates_in_range
 
 _HEADER_FONT = Font(bold=True, color='FFFFFF')
@@ -404,6 +405,7 @@ class AccountLedgerView(APIView):
 
         rows, opening, closing, total_debit, total_credit = ledger_rows_with_balance(
             account, date_from=date_from, date_to=date_to, entry_type=etype,
+            branch_ids=read_branch_ids(request),
         )
 
         # LedgerEntrySerializer is shared with other endpoints, so `balance` is
@@ -558,6 +560,7 @@ class AccountLedgerPrintView(APIView):
 
         rows, opening, closing, total_debit, total_credit = ledger_rows_with_balance(
             account, date_from=date_from, date_to=date_to, entry_type=entry_type,
+            branch_ids=read_branch_ids(request),
         )
 
         # An accountant printing an incomplete ledger with no warning is the

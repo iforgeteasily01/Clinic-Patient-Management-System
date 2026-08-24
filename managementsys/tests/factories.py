@@ -9,12 +9,23 @@ from django.utils import timezone
 
 from managementsys.models import (
     AppUser,
+    Branch,
     ChartOfAccounts,
     InventoryBatch,
     InventoryItem,
     PaymentMethod,
     Warehouse,
 )
+
+
+class BranchFactory(factory.django.DjangoModelFactory):
+    class Meta:
+        model = Branch
+
+    code = factory.Sequence(lambda n: f"BR{n}")
+    name = factory.Sequence(lambda n: f"Cabang {n}")
+    is_active = True
+    is_default = False
 
 
 class AppUserFactory(factory.django.DjangoModelFactory):

@@ -130,14 +130,31 @@ def signed_balance(account_type, net):
     return net if NORMAL_BALANCE.get(account_type) == 'debit' else -net
 
 
-def account_movements(date_from=None, date_to=None, account_ids=None):
+def scope_to_branches(qs, branch_ids, *, field='branch'):
+    """Narrow a ledger queryset to a branch selection.
+
+    ``branch_ids`` is what ``services.branches.read_branch_ids`` returns: None
+    for 'every branch' (no filter at all), or a list of ids.
+
+    Rows with a null branch are always included alongside a selected branch.
+    That is not laziness — it is what makes the reports add up. Group-wide
+    overhead and every entry posted before multi-branch existed carry no
+    branch, and excluding them would produce two branch P&Ls that quietly fail
+    to reconcile with the group P&L above them.
+    """
+    if branch_ids is None:
+        return qs
+    return qs.filter(Q(branch_id__in=branch_ids) | Q(branch_id__isnull=True))
+
+
+def account_movements(date_from=None, date_to=None, account_ids=None, branch_ids=None):
     """
     Aggregate debit/credit totals per account over an (inclusive) date window.
 
     Returns: dict[account_id] -> {'debit': Decimal, 'credit': Decimal, 'net': Decimal}
     where net = debit - credit. Accounts with no activity are simply absent.
     """
-    qs = LedgerEntry.objects.all()
+    qs = scope_to_branches(LedgerEntry.objects.all(), branch_ids)
     if date_from:
         qs = qs.filter(date__gte=date_from)
     if date_to:
@@ -162,10 +179,10 @@ def account_movements(date_from=None, date_to=None, account_ids=None):
     return out
 
 
-def opening_balances(before_date, account_ids=None):
+def opening_balances(before_date, account_ids=None, branch_ids=None):
     """Net balance (debit - credit) of each account for all entries strictly
     before `before_date`. Returns dict[account_id] -> Decimal net."""
-    qs = LedgerEntry.objects.filter(date__lt=before_date)
+    qs = scope_to_branches(LedgerEntry.objects.filter(date__lt=before_date), branch_ids)
     if account_ids is not None:
         qs = qs.filter(account_id__in=account_ids)
 
@@ -183,7 +200,8 @@ def _natural_sign(account_type):
     return 1 if signed_balance(account_type, Decimal('1')) > 0 else -1
 
 
-def ledger_rows_with_balance(account, date_from=None, date_to=None, entry_type=''):
+def ledger_rows_with_balance(account, date_from=None, date_to=None, entry_type='',
+                             branch_ids=None):
     """Ascending ledger rows for one account, each carrying its running balance.
 
     Returns ``(rows, opening, closing, total_debit, total_credit)`` where
@@ -207,10 +225,11 @@ def ledger_rows_with_balance(account, date_from=None, date_to=None, entry_type='
 
     Shared by AccountLedgerView and the ledger PDF.
     """
-    qs = (
+    qs = scope_to_branches(
         LedgerEntry.objects
         .filter(account=account)
-        .select_related('invoice', 'purchase_invoice', 'transfer', 'expense')
+        .select_related('invoice', 'purchase_invoice', 'transfer', 'expense'),
+        branch_ids,
     )
     if date_from:
         qs = qs.filter(date__gte=date_from)
@@ -219,7 +238,9 @@ def ledger_rows_with_balance(account, date_from=None, date_to=None, entry_type='
     qs = qs.order_by('date', 'created_at', 'id')
 
     if date_from:
-        raw_opening = opening_balances(date_from, account_ids=[account.pk]).get(account.pk, ZERO)
+        raw_opening = opening_balances(
+            date_from, account_ids=[account.pk], branch_ids=branch_ids,
+        ).get(account.pk, ZERO)
         opening = signed_balance(account.account_type, raw_opening)
     else:
         opening = ZERO

@@ -25,6 +25,22 @@ from .production_page import (
     ProductionPreviewView, ProductionRunListCreateView, ProductionRunDetailView,
 )
 from .auth_views import UserListView, LoginView, LogoutView, ProfileUpdateView, ThemeUpdateView
+from ..services.branches import filter_by_branch, write_branch
+from .branch_page import (
+    BranchListView, BranchListCreateAdminView, BranchDetailAdminView,
+    ReceiptIdentityView,
+)
+from .sales_return_page import (
+    InvoiceReturnableView, SalesReturnPreviewView,
+    SalesReturnListCreateView, SalesReturnDetailView,
+)
+from .bank_reconciliation_page import (
+    ReconciliationListCreateView, ReconciliationDetailView,
+    ReconciliationWorkspaceView, ReconciliationImportPreviewView,
+    ReconciliationImportConfirmView, ReconciliationAutoMatchView,
+    ReconciliationLineActionView, ReconciliationCompleteView,
+    ReconciliationReopenView,
+)
 from .admin_views import (
     DoctorListCreateAdminView, DoctorDetailAdminView,
     PatientListCreateAdminView, PatientDetailAdminView,
@@ -53,6 +69,12 @@ from .appointments_scheduled import (
     ScheduledAppointmentDetailView,
     AppointmentCheckInView,
     AppointmentLocationListView,
+)
+from .reservations_inbox import (
+    ReservationInboxView,
+    ReservationLinkPatientView,
+    ReservationAcknowledgeView,
+    ReservationSyncNowView,
 )
 from .package_page import PatientPackagesView
 from .medical_record_page import MedRecByPatientNoView
@@ -184,8 +206,16 @@ class PatientListCreate(generics.ListCreateAPIView):
     serializer_class = PatientSerializer
 
 class ActPatListCreate(generics.ListCreateAPIView):
-    queryset = ActivePatient.objects.exclude(status=0)
     serializer_class = ActivePatientSerializer
+
+    def get_queryset(self):
+        return filter_by_branch(
+            ActivePatient.objects.exclude(status=0),
+            self.request, locked=True, include_null=False,
+        )
+
+    def perform_create(self, serializer):
+        serializer.save(branch=write_branch(self.request, locked=True))
 
 class DoctorsListCreate(generics.ListCreateAPIView):
     queryset = Doctors.objects.all()
@@ -200,11 +230,14 @@ class BeauticiansListCreate(generics.ListCreateAPIView):
         return Beauticians.objects.all()
 
 class MedRecListCreate(generics.ListCreateAPIView):
-    queryset = MedRec.objects.all()
     serializer_class = MedRecSerializer
 
+    def get_queryset(self):
+        return filter_by_branch(MedRec.objects.all(), self.request,
+                                locked=True, include_null=True)
+
     def perform_create(self, serializer):
-        instance = serializer.save()
+        instance = serializer.save(branch=write_branch(self.request, locked=True))
         active = ActivePatient.objects.filter(
             patient_no=instance.patient_no,
             medrec__isnull=True,

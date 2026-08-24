@@ -8,6 +8,7 @@ from rest_framework.views import APIView
 
 from ..api.serializers import BillingPatientSerializer, todays_notes_by_visit
 from ..models import ActivePatient, AppUser, AuditLog, ChartOfAccounts, Invoice, InvoiceItem, PaymentMethod
+from ..services.branches import filter_by_branch, write_branch
 from ..services.cash_accounts import cash_bank_account_ids
 
 
@@ -67,8 +68,10 @@ class BillingQueueView(APIView):
 
     def get(self, request):
         patients = list(
-            ActivePatient.objects
-            .filter(status=5)
+            filter_by_branch(
+                ActivePatient.objects.filter(status=5),
+                request, locked=True, include_null=False,
+            )
             .select_related('patient_no', 'medrec')
             .prefetch_related(
                 'treatmentsession_set__treatments',
@@ -228,6 +231,10 @@ class BillingCompleteView(APIView):
             additional_charges=Decimal('0'),
             grand_total=grand_total,
             promotion_code=promotion_code,
+            # The sale belongs where the patient was treated, not where the
+            # ledger is being read from — hence the visit's own branch, with the
+            # cashier's as the fallback for pre-0113 queue rows.
+            branch=active_patient.branch or write_branch(request, locked=True),
         )
 
         # ── Create InvoiceItems ───────────────────────────────────────────────

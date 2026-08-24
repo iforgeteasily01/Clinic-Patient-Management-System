@@ -26,9 +26,14 @@ EXT_DB_USER=...
 EXT_DB_PASSWORD=...
 EXT_DB_HOST=...
 EXT_DB_PORT=...
-# Vercel dashboard push (optional)
+# Vercel dashboard push + online reservation pull (optional)
 CPMS_VERCEL_URL=https://cpms-dashboard-api.vercel.app
 CPMS_INGEST_SECRET=...
+# Length of an imported online booking. Keep equal to slot_minutes on the
+# Vercel admin page or the schedule shows gaps and overlaps that do not exist.
+CPMS_RESERVATION_DURATION_MINUTES=30
+# Branch an online booking is filed under. Unset = null (visible everywhere).
+CPMS_RESERVATION_BRANCH_ID=
 ```
 
 ## Tech Stack
@@ -209,6 +214,14 @@ All models are in a single file. Search carefully.
 | POST | `/api/treatment-session/` | Create treatment session |
 | POST | `/api/treatment-session/complete/` | Mark treatment complete (→ status 5) |
 | GET | `/beauticians/` | Beauticians (`?available=true`) |
+
+### Online Reservations
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/reservations/inbox/` | Worklist (`?filter=attention\|unmatched\|all`) + summary counts |
+| POST | `/api/reservations/sync-now/` | Collect one batch on demand. 503 when the link to Vercel is down |
+| POST | `/api/reservations/<pk>/link-patient/` | Attach the patient the phone could not resolve to |
+| POST | `/api/reservations/<pk>/acknowledge/` | "Seen" — moves the row out of the default filter |
 
 ### Medical Records
 | Method | Path | Purpose |
@@ -404,6 +417,7 @@ All under `/api/admin/` — require `superuser` or `manager` role:
 | `reports_page.py` | Dashboard |
 | `tickets_page.py` | Tickets + images |
 | `admin_views.py` | Admin CRUD for all entities |
+| `reservations_inbox.py` | Online reservation worklist, patient linking, manual sync |
 
 ---
 
@@ -495,6 +509,315 @@ Three signals fire HTTP POSTs to the Vercel dashboard on:
 
 ---
 
+## Online Reservations
+
+Bookings made on the public web form (`cpms-dashboard-api/public/reserve.html`)
+become ordinary `Appointment` rows in the clinic's own database.
+
+### The clinic collects; Vercel never pushes
+
+The dashboard push in `vercel_push.py` works because Vercel is on the public
+internet. The reverse is not true — this backend sits on a clinic LAN with no
+public address — so reservations travel by **poll**:
+
+```
+manage.py poll_reservations --loop --interval 60
+    GET  /api/reservation-sync    every row with pulled_at IS NULL
+    write Appointment + ReservationRequest, per row, in its own transaction
+    POST /api/reservation-sync    ack only what committed
+```
+
+**A row is acked only after its write commits.** Vercel keeps re-delivering
+anything unacked, so a crash mid-batch costs a redelivery, never a booking —
+and `ReservationRequest.external_id` is unique, which is what makes a
+redelivery harmless. One malformed row is skipped and left unacked rather than
+stranding the rest of the batch behind it.
+
+The poller is a **separate window** in `start-servers.bat`, not a thread in
+`apps.ready()`: closing it loses nothing, and one pass is idempotent, so
+running the one-shot form by hand is the fastest way to test the link.
+
+### The appointment is created on arrival, not on approval
+
+The public form already enforces opening hours, slot capacity, the booking
+window and its own rate limits before it accepts anything. By the time a row
+reaches here **the slot is taken** — the clinic promised it. Holding bookings in
+a pending tray would let reception double-book a time a patient already has, so
+`/reservations` is a *worklist*, not a gate.
+
+Imported appointments carry `source='online'` (read-only in the serializer — a
+staff booking must not be able to pose as a web one) and `contact_phone`. The
+schedule page paints them with `--accent-online` and an "Online" badge; origin
+takes the left edge from status because status is readable from the badge on
+the right and origin is not readable anywhere else.
+
+**Check-in is not duplicated.** An online booking enters the queue through
+`AppointmentCheckInView` like every other appointment — one door, one code path.
+
+### Phone matching refuses to guess
+
+`Patient.phone_number` is free text (`08123456789`, `0812-3456-789`,
+`+628123456789` all appear), so no SQL predicate matches all of it. Both sides
+are normalised through `whatsapp_gateway.normalize_phone` in Python, over a scan
+of two small columns — a few milliseconds once a minute, and exact where a LIKE
+would be a guess. Four outcomes, and only the first is automatic:
+
+| `match_status` | Meaning | What happens |
+|---|---|---|
+| `matched` | Exactly one patient | Appointment is filed against that chart |
+| `unmatched` | No patient has that number | Booked as a guest, phone kept on the appointment |
+| `ambiguous` | Two or more patients | **Never resolved** — candidates handed to reception |
+| `invalid_phone` | Not a readable Indonesian mobile | Guest, flagged for a human |
+
+Two hits are never collapsed into one, for the same reason the bank reconciler
+refuses an ambiguous match: a wrong link writes a stranger's visit into
+somebody's medical record. `ReservationLinkPatientView` is how a human resolves
+it, and it is **refused once the booking is checked in** — `ActivePatient` and
+anything hanging off it were created against whoever the row said it was, and
+re-pointing the appointment afterwards leaves the queue and the schedule
+disagreeing about who is in the building.
+
+### Vercel side
+
+`api/reservation-sync.js` (staff secret, no origin allowlist — the caller is a
+server with no `Origin` header). `reservations.pulled_at` / `clinic_ref` track
+collection; the ack is idempotent via `WHERE pulled_at IS NULL`.
+
+Covered by `tests/test_online_reservations.py`.
+
+---
+
+## Sales Returns
+
+A return is a **separate document**, never an edit of the invoice. Using
+`PUT /api/invoices/<pk>/` for a return would rewrite what the books said
+happened on the sale date, erase the fact that goods came back at all, and leave
+the CRM believing the patient simply bought less. `Invoice.is_voided` stays
+False: the sale happened.
+
+`SalesReturn` + `SalesReturnItem`, driven by `services/sales_returns.py`.
+
+### Lifecycle — identical to an invoice
+
+Created `unposted` with **zero ledger rows and no stock movement**. The journal
+run posts it, and the run is also where `_fifo_restock` actually happens: the
+COGS the entry needs cannot be known without doing the restock, exactly as the
+invoice's FIFO cost cannot be known without doing the deduction. Registered as
+the `'sales_return'` kind in `journal_sweep._gather_events`,
+`journal_preview` (fingerprint / `build_legs_for` / `SOURCE_TYPE_BY_KIND` /
+`MODEL_BY_KIND` / `document_label`) and `accounting_page._RUN_POSTERS`.
+
+### The entry — the invoice's mirror
+
+```
+Dr  revenue per line     gross (price x qty, via _line_revenue_account)
+Dr  Tax Payable          apportioned
+Dr  Additional Charges   apportioned
+    Cr  refund account   total_refund
+    Cr  Sales Discount   the plug — discount being un-granted
+```
+plus, per restocked physical line: `Dr Inventory / Cr COGS` at the FIFO cost.
+
+Revenue routes through the invoice's own `_line_revenue_account`, so a return
+credits back exactly the account the sale debited.
+
+### The refund is computed, never typed
+
+`compute_refund` apportions the invoice-level discount, tax and charges **once,
+against the returned subset as a whole**, in proportion to *net* line value (not
+gross — two lines of equal list price where one carried a 50% line discount did
+not contribute equally). A restocking fee or partial goodwill refund is a
+separate expense/other-income entry; folding it into the total would misstate
+revenue.
+
+### Rules worth knowing
+
+- **No edit.** Void and re-enter. A return is a physical event; amending one
+  means the clinic is unsure what came through the door.
+- **Voiding a posted return** deducts the stock again *and* writes a reversal
+  memo via `reverse_legset(legset_from_entry(...))` — never by rebuilding the
+  legs, which would re-run FIFO against today's batches.
+- **A redeemed treatment package blocks the line** (`_package_block_reason`),
+  mirroring the same refusal in the invoice-edit path.
+- **A service is never restocked**, whatever the client sends.
+- **Branch comes from the invoice**, not the request header: a refund booked
+  into a different branch than the revenue it reverses leaves both wrong.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/invoices/<pk>/returnable/` | Per-line open quantities + block reasons |
+| POST | `/api/returns/preview/` | What a proposed return would refund. Writes nothing |
+| GET/POST | `/api/returns/` | List / create |
+| GET/DELETE | `/api/returns/<pk>/` | Detail / void |
+
+Covered by `tests/test_sales_returns.py` — the load-bearing test is that a full
+return of an entire invoice returns every balance and every batch to baseline.
+
+---
+
+## Bank Reconciliation
+
+`BankReconciliation` + `BankStatementLine`, driven by
+`services/bank_reconciliation.py` and `services/statement_import.py`.
+
+**Nothing here writes to the ledger.** A reconciliation is an assertion *about*
+the books, never a change to them: a bank charge nobody recorded is fixed by
+entering an expense, not by the reconciler inventing a journal line. If that
+rule bends, reconciliation stops being evidence and becomes a second, unreviewed
+posting path.
+
+### Signs are normalised once, at the edge
+
+A `LedgerEntry` on an asset account is a debit (in) or credit (out); a statement
+is two columns whose names differ per bank. Both become one signed number —
+**positive in, negative out** — via `signed_amount` and the import. Every
+comparison downstream is plain arithmetic.
+
+### Auto-matching refuses ambiguity
+
+Two passes: same-date-same-amount, then amount within `AUTO_MATCH_WINDOW_DAYS`
+(5). A line with more than one candidate is **left unmatched**, and a candidate
+claimed earlier in the run is off the table. A wrong match balances the period
+and hides a real discrepancy; an unmatched line is visible and gets dealt with.
+
+The rule is deliberately **asymmetric**. One statement line with two candidate
+book rows is refused — those rows are distinct records ("Setoran A" vs "Setoran
+B") and picking one misattributes the clearing. Two identical statement lines
+with one book row is *not* the same case: the lines carry no information that
+distinguishes them, so one is matched and the other left over, which states the
+discrepancy ("one Rp 500.000 deposit is missing from the books") in one line
+instead of three loose ends.
+`match_line` lets an operator force what the matcher refused, including a
+different amount (a netted bank fee is real) — the summary surfaces the gap
+rather than hiding it.
+
+### Two different numbers, reported separately
+
+- `difference` — ledger balance at period end minus the statement's closing
+  balance. **The headline.** Explained by the two enumerable lists: statement
+  lines with no book entry, and book entries with no statement line.
+- `statement_drift` — whether the *imported lines* add up from the stated
+  opening balance to the stated closing balance. Non-zero means the import is
+  incomplete, and chasing `difference` before fixing it is wasted effort.
+
+### Completing clears
+
+`complete()` is refused unless `difference == 0` **and** nothing is unmatched on
+either side — a closed reconciliation that does not balance looks finished, so
+nobody returns to it. It stamps `LedgerEntry.reconciliation`, which is what
+makes the next period correct: a cleared transaction is never offered again.
+`reopen()` releases the stamps but keeps the matches.
+
+Overlapping periods on one account+branch are refused at create time, for the
+same reason.
+
+**A completed reconciliation is evidence, so it holds the ledger down.**
+Deleting an `AccountTransfer` hard-deletes its ledger rows (it has no void-memo
+path), which would make a cleared row vanish from a closed period and silently
+un-match a statement line. `AccountTransferDetailView.delete` therefore refuses
+while any of its rows sit in a completed reconciliation — reopen it first. Any
+new code path that *deletes* rather than reverses ledger rows needs the same
+guard.
+
+### Statement import
+
+Two-phase like every other import here. `statement_import.parse` finds the
+header row by name (statements carry preamble rows), accepts separate
+debit/credit columns, a signed amount column, or an amount plus a direction
+column, and handles both `1.234.567,89` and `1,234,567.89`. **An unsigned amount
+column with no direction is rejected, not guessed** — guessing reverses half a
+statement. `'K'` is likewise rejected: kredit in some exports, keluar in others.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET/POST | `/api/accounting/reconciliations/` | List / start a period |
+| GET/PATCH/DELETE | `/api/accounting/reconciliations/<pk>/` | Only the statement figures and notes are editable |
+| GET | `.../<pk>/workspace/` | Lines + book entries + summary, in one round trip |
+| POST | `.../<pk>/import/preview/` \| `.../import/confirm/` | Two-phase import (confirm also auto-matches) |
+| POST | `.../<pk>/auto-match/` | Re-run the matcher |
+| POST | `.../<pk>/lines/<line_pk>/<match\|unmatch\|ignore>/` | Returns the line **and** the recomputed summary |
+| POST | `.../<pk>/complete/` \| `.../reopen/` | Close / undo |
+
+Covered by `tests/test_bank_reconciliation.py`.
+
+---
+
+## Multi-Branch
+
+One database, one chart of accounts, one patient registry — and a `Branch` row
+per physical clinic that every operational document is stamped with.
+
+### The two questions, answered separately
+
+`managementsys/services/branches.py` is the only module that decides branch
+access, and it answers two different questions with two different functions:
+
+| Function | Answers | Used by |
+|---|---|---|
+| `write_branch(request, locked=)` | Which branch a **new document** is stamped with | Every create path |
+| `read_branch_ids(request, locked=)` | Which branches a **query** may span (`None` = all) | Every list/report |
+| `filter_by_branch(qs, request, ...)` | Applies the above to a queryset | List views |
+
+`locked=True` is for POS, the patient queue, treatment sessions, beautician
+petty cash and medical records. Those callers **ignore the client's branch
+entirely** and use the user's `home_branch`. A cashier cannot book a sale into
+another clinic's books by editing a request header, and neither can a manager.
+
+`locked=False` is accounting and admin: the client's selection wins, subject to
+`CROSS_BRANCH_ROLES` (`superuser`, `manager`). Everyone else silently collapses
+to their home branch — a stale browser tab must never be able to 400 the app.
+
+### The client states, the server decides
+
+The browser sends `X-Branch-Id: <id>|all` on every request (`lib/apiFetch.ts`,
+fed by `lib/branchStorage.ts`). `?branch=` is accepted as a fallback so a link
+can carry it. **It is a preference, not a grant** — the role check happens
+server-side on every request.
+
+### `null` branch is a value, not a gap
+
+`filter_by_branch` and `scope_to_branches` keep null-branch rows when a specific
+branch is selected. That is deliberate: genuinely group-wide overhead and every
+row posted before migration 0113 carry no branch, and excluding them would
+produce branch P&Ls that quietly fail to reconcile with the group P&L. Pass
+`include_null=False` only for operational lists (the queue, POS) where null is
+legacy noise rather than shared cost. `read_branch_ids` returning `None` ("all
+branches") is **not** the same as listing every branch id, for the same reason.
+
+### Branch on the ledger is derived, never passed
+
+`journal_engine.write_legs` denormalises `branch` onto both `JournalEntry` and
+every `LedgerEntry`, taken from `document_branch_id(document, reverses,
+corrects)` — the source document, never the request. A journal run sweeps
+yesterday's invoices from a session that may have any branch selected; a
+request-derived branch would stamp every one of them wrong. Reversals and
+corrections inherit from the entry they act on, so a correction can never land
+in a different branch's books than the mistake it fixes.
+
+The one exception is a **manual journal**, which has no document — there the
+operator's selection is passed as `branch_id=`, and a document always overrides
+it.
+
+### Models carrying `branch`
+
+`ActivePatient`, `MedRec`, `TreatmentSession`, `Warehouse`, `Invoice`,
+`PurchaseInvoice`, `Expense`, `AccountTransfer`, `StockOutLog`, `LedgerEntry`,
+`JournalEntry`, `Appointment`, `AppointmentLocation`. Plus `AppUser.home_branch`.
+All `PROTECT` and nullable; migration 0113 seeds `PUSAT` from `SiteConfig` and
+backfills every pre-existing row to it.
+
+### API
+
+| Method | Path | Notes |
+|---|---|---|
+| GET | `/api/branches/` | Any authenticated user. Returns only what *they* may select, plus the resolved current selection and `allow_all` |
+| GET/POST | `/api/admin/branches/` | superuser/manager CRUD |
+| GET/PUT/PATCH/DELETE | `/api/admin/branches/<id>/` | Delete is refused for the default branch and for any branch with history — deactivate instead |
+
+Covered by `tests/test_branches.py`.
+
+---
+
 ## Settings Notes
 
 | Setting | Current value | Note |
@@ -512,6 +835,8 @@ Three signals fire HTTP POSTs to the Vercel dashboard on:
 python manage.py create_default_admin     # Create superuser (display_name=Admin, PIN=000000)
 python manage.py create_app_user <name> <pin> [--role admin]
 python manage.py populate_data            # Load demo data
+python manage.py poll_reservations        # Collect online bookings once
+python manage.py poll_reservations --loop --interval 60   # what start-servers.bat runs
 ```
 
 ## Migrations

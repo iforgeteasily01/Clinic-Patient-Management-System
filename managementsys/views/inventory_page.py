@@ -26,6 +26,7 @@ from ..models import (
     AppUser, AuditLog, ChartOfAccounts, InventoryBatch, InventoryItem,
     PencacahanRecord, StockOutLog, Warehouse,
 )
+from ..services.branches import filter_by_branch, write_branch
 
 
 def _actor(request):
@@ -120,13 +121,24 @@ class InventoryItemDetailView(APIView):
 
 class WarehouseListCreateView(APIView):
     def get(self, request):
-        return Response(WarehouseSerializer(Warehouse.objects.all(), many=True).data)
+        # Stock physically sits somewhere, so a warehouse list is scoped like
+        # any other branch data. ``?all_branches=true`` is the escape hatch for
+        # the transfer picker, which by definition needs both ends.
+        qs = Warehouse.objects.all()
+        if request.query_params.get('all_branches') != 'true':
+            qs = filter_by_branch(qs, request)
+        return Response(WarehouseSerializer(qs, many=True).data)
 
     def post(self, request):
         serializer = WarehouseSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        instance = serializer.save()
+        # A warehouse created without an explicit branch belongs to the one the
+        # creator is looking at, not to nobody.
+        instance = serializer.save(
+            **({} if serializer.validated_data.get('branch') else
+               {'branch': write_branch(request)})
+        )
         AuditLog.objects.create(
             performed_by=_actor(request),
             action='CREATE',
@@ -647,6 +659,7 @@ class StockOutView(APIView):
             value=cogs,
             notes=notes,
             created_by=actor,
+            branch=warehouse.branch or write_branch(request),
             posting_status=_stock_out_posting_status(reason, cogs),
         )
         return Response({
@@ -729,6 +742,7 @@ class StockOutView(APIView):
                 value=cogs,
                 notes=notes,
                 created_by=actor,
+                branch=warehouse.branch or write_branch(request),
                 posting_status=_stock_out_posting_status(out_reason, cogs),
             )
             deducted_count += 1

@@ -16,6 +16,7 @@ from rest_framework.views import APIView
 from ..api.serializers import BeauticianExpenseCreateSerializer, ExpenseAliasSerializer, ExpenseSerializer
 from ..models import AppUser, Expense, ExpenseAlias
 from ..services.alias_expense import AliasExpenseError, create_alias_expense
+from ..services.branches import write_branch
 
 
 def _actor(request):
@@ -97,6 +98,9 @@ class BeauticianExpenseListCreateView(APIView):
                 scope='beautician',
                 source='beautician',
                 actor=_actor(request),
+                # Petty cash is spent at the clinic the beautician works at, so
+                # this is locked like the rest of the floor-staff flows.
+                branch=write_branch(request, locked=True),
             )
         except AliasExpenseError as exc:
             return Response(exc.errors, status=status.HTTP_400_BAD_REQUEST)

@@ -24,13 +24,20 @@ def _safe_decimal(val) -> Decimal:
 
 
 def create_expense(*, expense_date, payment_method, payment_account, payment_memo,
-                    notes, amount_paid, items, actor, source='general', status_override=None):
+                    notes, amount_paid, items, actor, source='general', status_override=None,
+                    branch=None):
     """Write one Expense + its ExpenseItem lines and audit-log it.
 
     ``items`` is a list of dicts with at least ``account`` (a ChartOfAccounts
     pk) and ``amount``; ``description`` and ``alias`` (an ExpenseAlias
     instance, or None) are optional. Runs in its own transaction so a caller
     that is not already inside one still gets atomicity.
+
+    ``branch`` is the location the cost belongs to. The manager form passes
+    the accounting branch selection (a head-office user may book a cost against
+    either clinic); the beautician flow passes their own. None means group-wide
+    — a shared overhead that no single branch should carry — and is a
+    legitimate value, not a missing one.
 
     ``status_override`` lets the beautician flow force ``status='paid'``
     directly — petty cash is spent the moment it is logged, there is no
@@ -48,6 +55,7 @@ def create_expense(*, expense_date, payment_method, payment_account, payment_mem
             amount_paid=_safe_decimal(amount_paid),
             created_by=actor,
             source=source,
+            branch=branch,
         )
 
         item_objs = []

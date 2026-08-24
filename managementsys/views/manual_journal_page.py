@@ -29,6 +29,7 @@ from rest_framework.views import APIView
 from ..api.serializers import JournalEntryDetailSerializer
 from ..models import AppUser, AuditLog
 from ..services import manual_journal as mj
+from ..services.branches import write_branch
 from ..services.journal_engine import LegSet, UnbalancedJournalError, write_legs
 
 # Two decimal places, matching LedgerEntry.amount. Rounding here rather than
@@ -262,6 +263,11 @@ class ManualJournalCreateView(APIView):
                     source_type='adjustment',
                     actor=_actor(request),
                     memo=memo,
+                    # A manual entry has no source document to derive a branch
+                    # from, so this is the one place the operator's selection
+                    # decides it. Everything with a document ignores this
+                    # argument — see journal_engine.document_branch_id.
+                    branch_id=getattr(write_branch(request), 'pk', None),
                 )
                 AuditLog.objects.create(
                     performed_by=_actor(request),

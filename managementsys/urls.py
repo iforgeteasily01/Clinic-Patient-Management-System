@@ -9,7 +9,16 @@ urlpatterns = [
     path('api/auth/profile/', views.ProfileUpdateView.as_view(), name='auth-profile'),
     path('api/auth/profile/theme/', views.ThemeUpdateView.as_view(), name='auth-profile-theme'),
 
+    # Branches — the picker catalog is open to every authenticated user,
+    # the CRUD below it is not.
+    path('api/branches/', views.BranchListView.as_view(), name='branches'),
+    # The resolved receipt header for the caller's own branch. Distinct from
+    # /api/admin/site-config/, which stays the settings editor.
+    path('api/receipt-identity/', views.ReceiptIdentityView.as_view(), name='receipt-identity'),
+
     # Admin CRUD
+    path('api/admin/branches/', views.BranchListCreateAdminView.as_view(), name='admin-branches'),
+    path('api/admin/branches/<int:pk>/', views.BranchDetailAdminView.as_view(), name='admin-branch-detail'),
     path('api/admin/doctors/', views.DoctorListCreateAdminView.as_view(), name='admin-doctors'),
     path('api/admin/doctors/<int:pk>/', views.DoctorDetailAdminView.as_view(), name='admin-doctor-detail'),
     path('api/admin/patients/', views.PatientListCreateAdminView.as_view(), name='admin-patients'),
@@ -74,6 +83,14 @@ urlpatterns = [
     path("api/scheduled-appointments/<int:pk>/", views.ScheduledAppointmentDetailView.as_view(), name="scheduled-appointment-detail"),
     path("api/scheduled-appointments/<int:pk>/check-in/", views.AppointmentCheckInView.as_view(), name="scheduled-appointment-check-in"),
     path("api/appointment-locations/", views.AppointmentLocationListView.as_view(), name="appointment-locations"),
+
+    # Online reservations pulled from the public Vercel form. The bookings
+    # themselves are Appointments (above); these routes are the worklist for
+    # resolving which patient record each one belongs to.
+    path("api/reservations/inbox/", views.ReservationInboxView.as_view(), name="reservations-inbox"),
+    path("api/reservations/sync-now/", views.ReservationSyncNowView.as_view(), name="reservations-sync-now"),
+    path("api/reservations/<int:pk>/link-patient/", views.ReservationLinkPatientView.as_view(), name="reservation-link-patient"),
+    path("api/reservations/<int:pk>/acknowledge/", views.ReservationAcknowledgeView.as_view(), name="reservation-acknowledge"),
     path("activepatient/", views.ActPatListCreate.as_view(), name = "ActPat-view-create"),
     path("doctors/", views.DoctorsListCreate.as_view(), name = "doctors-list"),
     path("beauticians/", views.BeauticiansListCreate.as_view(), name = "beauticians-list"),
@@ -122,6 +139,14 @@ urlpatterns = [
     path('api/invoices/export/', views.InvoiceExportView.as_view(), name='invoice-export'),
     path('api/invoices/import/', views.InvoiceImportView.as_view(), name='invoice-import'),
     path('api/invoices/<int:pk>/', views.InvoiceDetailView.as_view(), name='invoice-detail'),
+
+    # Sales returns — a return is its own document against an invoice, never an
+    # edit of it. 'preview' is declared before '<int:pk>' out of habit; it could
+    # not be shadowed anyway, since the converter is int.
+    path('api/invoices/<int:pk>/returnable/', views.InvoiceReturnableView.as_view(), name='invoice-returnable'),
+    path('api/returns/', views.SalesReturnListCreateView.as_view(), name='sales-returns'),
+    path('api/returns/preview/', views.SalesReturnPreviewView.as_view(), name='sales-return-preview'),
+    path('api/returns/<int:pk>/', views.SalesReturnDetailView.as_view(), name='sales-return-detail'),
 
     # Inventory
     path('api/inventory/items/', views.InventoryItemListCreateView.as_view(), name='inventory-items'),
@@ -260,6 +285,18 @@ urlpatterns = [
     path('api/accounting/manual-journal/meta/',     views.ManualJournalMetaView.as_view(),        name='accounting-manual-journal-meta'),
     path('api/accounting/manual-journal/classify/', views.ManualJournalClassifyView.as_view(),    name='accounting-manual-journal-classify'),
     path('api/accounting/journal/',                views.JournalHistoryView.as_view(),           name='accounting-journal'),
+    # Bank reconciliation. The workspace endpoint bundles lines, book entries
+    # and the summary on purpose — see views/bank_reconciliation_page.py.
+    path('api/accounting/reconciliations/', views.ReconciliationListCreateView.as_view(), name='reconciliations'),
+    path('api/accounting/reconciliations/<int:pk>/', views.ReconciliationDetailView.as_view(), name='reconciliation-detail'),
+    path('api/accounting/reconciliations/<int:pk>/workspace/', views.ReconciliationWorkspaceView.as_view(), name='reconciliation-workspace'),
+    path('api/accounting/reconciliations/<int:pk>/import/preview/', views.ReconciliationImportPreviewView.as_view(), name='reconciliation-import-preview'),
+    path('api/accounting/reconciliations/<int:pk>/import/confirm/', views.ReconciliationImportConfirmView.as_view(), name='reconciliation-import-confirm'),
+    path('api/accounting/reconciliations/<int:pk>/auto-match/', views.ReconciliationAutoMatchView.as_view(), name='reconciliation-auto-match'),
+    path('api/accounting/reconciliations/<int:pk>/lines/<int:line_pk>/<str:action>/', views.ReconciliationLineActionView.as_view(), name='reconciliation-line-action'),
+    path('api/accounting/reconciliations/<int:pk>/complete/', views.ReconciliationCompleteView.as_view(), name='reconciliation-complete'),
+    path('api/accounting/reconciliations/<int:pk>/reopen/', views.ReconciliationReopenView.as_view(), name='reconciliation-reopen'),
+
     path('api/accounting/journal/run/',            views.JournalRunView.as_view(),               name='accounting-journal-run'),
     path('api/accounting/journal/run/stream/',     views.JournalRunStreamView.as_view(),         name='accounting-journal-run-stream'),
     path('api/accounting/journal/status/',         views.JournalStatusView.as_view(),            name='accounting-journal-status'),

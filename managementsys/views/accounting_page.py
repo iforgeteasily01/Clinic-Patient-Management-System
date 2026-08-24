@@ -55,7 +55,9 @@ def _safe_decimal(val) -> Decimal:
 # can both call them. Re-imported here under their original names so every
 # call site below (_post_le, _post_purchase_accrual, _unpost_purchase,
 # _post_purchase_price_variance) is unchanged.
+from ..services.branches import filter_by_branch, write_branch
 from ..services.cash_accounts import cash_bank_account_ids
+from ..services.sales_returns import build_sales_return_legs
 from ..services.expense_create import create_expense
 from ..services import journal_preview
 from ..services.journal_engine import (
@@ -427,6 +429,7 @@ class PurchaseInvoiceListCreateView(APIView):
             .select_related('supplier', 'payment_account', 'payment_method', 'payment_method__linked_account')
             .prefetch_related('payments')   # last_payment_date, one query for the page
         )
+        qs = filter_by_branch(qs, request)
 
         q = request.query_params.get('q', '').strip()
         if q:
@@ -532,6 +535,7 @@ class PurchaseInvoiceListCreateView(APIView):
                 due_date=data.get('due_date') or None,
                 notes=data.get('notes', ''),
                 created_by=_actor(request),
+                branch=write_branch(request),
             )
 
             # Attach image if uploaded
@@ -1466,8 +1470,11 @@ class ExpenseListCreateView(APIView):
     """
 
     def get(self, request):
-        qs = Expense.objects.select_related(
-            'payment_method', 'payment_method__linked_account', 'payment_account',
+        qs = filter_by_branch(
+            Expense.objects.select_related(
+                'payment_method', 'payment_method__linked_account', 'payment_account',
+            ),
+            request,
         )
 
         q = request.query_params.get('q', '').strip()
@@ -1556,6 +1563,7 @@ class ExpenseListCreateView(APIView):
             amount_paid=data.get('amount_paid', 0),
             items=items,
             actor=_actor(request),
+            branch=write_branch(request),
         )
 
         return Response(
@@ -1850,7 +1858,10 @@ class AccountTransferListCreateView(APIView):
     """
 
     def get(self, request):
-        qs = AccountTransfer.objects.select_related('from_account', 'to_account', 'created_by')
+        qs = filter_by_branch(
+            AccountTransfer.objects.select_related('from_account', 'to_account', 'created_by'),
+            request,
+        )
 
         date_from = request.query_params.get('date_from', '').strip()
         date_to   = request.query_params.get('date_to', '').strip()
@@ -1907,6 +1918,7 @@ class AccountTransferListCreateView(APIView):
                 description=description,
                 reference=data.get('reference', ''),
                 created_by=_actor(request),
+                branch=write_branch(request),
             )
 
             # Phase 2: posting is deferred (posting_status='unposted', the model
@@ -1954,6 +1966,22 @@ class AccountTransferDetailView(APIView):
         obj = self._get(pk)
         if not obj:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Deleting a transfer hard-deletes its ledger rows (see the docstring),
+        # so a row that a *completed* reconciliation cleared would vanish out
+        # from under a closed period, silently un-matching a statement line
+        # nobody will look at again. A closed reconciliation is evidence; reopen
+        # it deliberately if this transfer really was wrong.
+        locked = LedgerEntry.objects.filter(
+            transfer=obj, reconciliation__status='completed',
+        ).exists()
+        if locked:
+            return Response(
+                {'error': 'Transfer ini sudah termasuk dalam rekonsiliasi bank '
+                          'yang telah diselesaikan. Buka kembali rekonsiliasinya '
+                          'terlebih dahulu.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         with transaction.atomic():
             if obj.posting_status == 'posted':
@@ -2148,6 +2176,22 @@ def _post_stock_correction_for_run(log):
     log.save(update_fields=['posting_status'])
 
 
+def _post_sales_return_for_run(sales_return):
+    """Post a sales return and flip it to 'posted'.
+
+    ``build_sales_return_legs(deduct=True)`` is what actually puts the stock
+    back on the shelf — the FIFO cost the COGS reversal needs cannot be known
+    without doing the restock, exactly as the invoice's FIFO deduction cannot be
+    known without doing the deduction. So the physical movement happens here, at
+    posting time, and not when the operator saved the return.
+    """
+    legset = build_sales_return_legs(sales_return, deduct=True)
+    write_legs(legset, date=sales_return.datetime.date(),
+               source_type='sales_return', document=sales_return)
+    sales_return.posting_status = 'posted'
+    sales_return.save(update_fields=['posting_status'])
+
+
 # kind -> poster, injected into run_journal_sweep so the service module does not
 # need to import this views module (which would be a cycle).
 _RUN_POSTERS = {
@@ -2156,6 +2200,7 @@ _RUN_POSTERS = {
     'expense': _post_expense_for_run,
     'transfer': _post_transfer_for_run,
     'stock': _post_stock_correction_for_run,
+    'sales_return': _post_sales_return_for_run,
 }
 
 
@@ -2434,18 +2479,31 @@ class JournalPreviewView(APIView):
         return _stream(frames())
 
 
+#: An entry an operator would want to look at twice. Kept in one place so the
+#: per-day `flagged` count and the ?only_warnings= list filter can never drift
+#: apart — a day badged "3 perlu diperiksa" must return exactly those 3.
+NEEDS_REVIEW = Q(is_balanced=False) | Q(has_estimate=True) | ~Q(warnings=[])
+
+
 def _draft_day_counts(draft):
-    """Per-day entry counts for the review UI's day grouping."""
+    """Per-day rollup driving the review UI's day rail.
+
+    `flagged` is what lets the rail show where the problems are without the
+    client fetching every page: the operator can jump straight to the three
+    days that need attention instead of walking all forty-five.
+    """
     rows = (
         draft.entries
         .values('date')
         .annotate(entries=Count('id'),
+                  flagged=Count('id', filter=NEEDS_REVIEW),
                   debit=Sum('total_debit'), credit=Sum('total_credit'))
         .order_by('date')
     )
     return [{
         'date': r['date'].isoformat(),
         'entries': r['entries'],
+        'flagged': r['flagged'],
         'total_debit': str(r['debit'] or 0),
         'total_credit': str(r['credit'] or 0),
     } for r in rows]
@@ -2492,11 +2550,9 @@ class JournalPreviewEntriesView(APIView):
         if q:
             qs = qs.filter(Q(memo__icontains=q) | Q(source_label__icontains=q))
         if only_warn:
-            # Everything an operator would want to look at twice: an entry that
-            # does not balance, one whose account does not exist yet, or one
-            # carrying a FIFO estimate that may move at commit.
-            qs = qs.filter(Q(is_balanced=False) | Q(has_estimate=True) |
-                           ~Q(warnings=[])).distinct()
+            # An entry that does not balance, one whose account does not exist
+            # yet, or one carrying a FIFO estimate that may move at commit.
+            qs = qs.filter(NEEDS_REVIEW).distinct()
 
         try:
             page      = max(1, int(request.query_params.get('page', 1)))
@@ -2619,6 +2675,7 @@ class JournalEntryListView(APIView):
             .annotate(line_count=Count('lines', distinct=True),
                       reversal_count=Count('reversed_by', distinct=True))
         )
+        qs = filter_by_branch(qs, request)
 
         date_from   = request.query_params.get('date_from', '').strip()
         date_to     = request.query_params.get('date_to', '').strip()
@@ -2915,7 +2972,10 @@ class JournalHistoryView(APIView):
     """
 
     def get(self, request):
-        qs = LedgerEntry.objects.select_related('account', 'invoice', 'purchase_invoice', 'transfer')
+        qs = filter_by_branch(
+            LedgerEntry.objects.select_related('account', 'invoice', 'purchase_invoice', 'transfer'),
+            request,
+        )
 
         date_from    = request.query_params.get('date_from', '').strip()
         date_to      = request.query_params.get('date_to', '').strip()
@@ -3302,10 +3362,11 @@ class DailySalesView(APIView):
 
         # Voided invoices are out: this figure is counted against the physical
         # drawer, and a voided sale put nothing in it.
-        invoices = (
+        invoices = filter_by_branch(
             Invoice.objects
             .filter(datetime__gte=day_start, datetime__lt=day_end, is_voided=False)
-            .select_related('payment_method', 'payment_method__linked_account')
+            .select_related('payment_method', 'payment_method__linked_account'),
+            request,
         )
 
         grand_total = Decimal('0')
