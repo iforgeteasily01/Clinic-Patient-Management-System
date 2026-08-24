@@ -2429,11 +2429,28 @@ class JournalPreviewView(APIView):
         date_to, err = _parse_date_to(request)
         if err:
             return err
+
+        date_from = None
+        raw_from = request.data.get('date_from')
+        if raw_from:
+            try:
+                date_from = datetime.date.fromisoformat(str(raw_from))
+            except ValueError:
+                return Response(
+                    {'error': 'Format date_from tidak valid. Gunakan YYYY-MM-DD.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if date_from > date_to:
+                return Response(
+                    {'error': 'date_from tidak boleh setelah date_to.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         actor = _actor(request)
 
         def frames():
             try:
-                for evt in journal_preview.build_preview(actor, date_to):
+                for evt in journal_preview.build_preview(actor, date_to, date_from):
                     yield _sse(evt)
             except Exception as exc:  # noqa: BLE001 — cannot become a 500 mid-stream
                 yield _sse({'type': 'error', 'date': None,

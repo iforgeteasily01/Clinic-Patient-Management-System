@@ -2,6 +2,7 @@ import re
 
 from ..models import Patient, ActivePatient, patientStatus, Treatment, Beauticians, TreatmentSession, AppUser, AuditLog, PatientNote
 from django.http import HttpResponse
+from django.db import transaction
 from django.db.models import Max, Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -16,6 +17,29 @@ def _actor(request):
     return request.user if isinstance(request.user, AppUser) else None
 
 
+def _release_beauticians(active_patient):
+    """
+    Frees every beautician tied to `active_patient` via a TreatmentSession,
+    unless that beautician is still holding a *different* patient at status 4
+    (in treatment). Call this on every path that ends a patient's involvement
+    in a session — completed, cancelled, dismissed, or bulk-cleared — not just
+    the "finish treatment" button, or the beautician is left marked busy with
+    nothing left to finish it.
+    """
+    beautician_ids = set(
+        TreatmentSession.objects.filter(active_patient=active_patient)
+        .exclude(beautician__isnull=True)
+        .values_list('beautician_id', flat=True)
+    )
+    for beautician_id in beautician_ids:
+        still_busy = TreatmentSession.objects.filter(
+            beautician_id=beautician_id,
+            active_patient__status=4,
+        ).exclude(active_patient=active_patient).exists()
+        if not still_busy:
+            Beauticians.objects.filter(id=beautician_id).update(available=True)
+
+
 class PatientSearchView(APIView):
     def get(self, request):
         qs = Patient.objects.all()
@@ -25,7 +49,7 @@ class PatientSearchView(APIView):
         field = request.GET.get('field', '').strip()
         if search and field:
             if field == 'name':
-                qs = qs.filter(name__icontains=search)
+                qs = qs.filter(name__istartswith=search)
             elif field == 'patient_no':
                 qs = qs.filter(patient_no__icontains=search)
             elif field == 'phone':
@@ -34,7 +58,7 @@ class PatientSearchView(APIView):
                 qs = qs.filter(address__icontains=search)
             else:
                 qs = qs.filter(
-                    Q(name__icontains=search) |
+                    Q(name__istartswith=search) |
                     Q(patient_no__icontains=search) |
                     Q(phone_number__icontains=search)
                 )
@@ -43,7 +67,7 @@ class PatientSearchView(APIView):
             if no := request.GET.get('patient_no', '').strip():
                 qs = qs.filter(patient_no__icontains=no)
             if name := request.GET.get('name', '').strip():
-                qs = qs.filter(name__icontains=name)
+                qs = qs.filter(name__istartswith=name)
             if phone := request.GET.get('phone', '').strip():
                 qs = qs.filter(phone_number__icontains=phone)
             if address := request.GET.get('address', '').strip():
@@ -91,9 +115,13 @@ class ActivePatientClearView(APIView):
         # Scoped to the caller's own branch: clearing the queue is an end-of-day
         # action at one clinic, and a group-wide wipe from one reception desk
         # would delete another branch's live queue mid-shift.
-        deleted_count, _ = filter_by_branch(
+        queue = filter_by_branch(
             ActivePatient.objects.all(), request, locked=True, include_null=False,
-        ).delete()
+        )
+        with transaction.atomic():
+            for active_patient in queue.filter(status=4):
+                _release_beauticians(active_patient)
+            deleted_count, _ = queue.delete()
         AuditLog.objects.create(
             performed_by=_actor(request),
             action='DELETE',
@@ -216,27 +244,33 @@ class ActivePatientUpdateStatusView(APIView):
             )
 
         if target_status in (0, 6):
-            if active_patient.patient_no_id:
-                arrive_str = active_patient.visit_time.strftime(
-                    '%H:%M') if active_patient.visit_time else 'unknown time'
-                PatientNote.objects.create(
-                    patient_no=active_patient.patient_no,
-                    date=timezone.now().date(),
-                    content=f'Patient arrived at the clinic (check-in: {arrive_str}). Visit was ended early.',
-                    author='System',
+            with transaction.atomic():
+                if active_patient.status == 4:
+                    _release_beauticians(active_patient)
+                if active_patient.patient_no_id:
+                    arrive_str = active_patient.visit_time.strftime(
+                        '%H:%M') if active_patient.visit_time else 'unknown time'
+                    PatientNote.objects.create(
+                        patient_no=active_patient.patient_no,
+                        date=timezone.now().date(),
+                        content=f'Patient arrived at the clinic (check-in: {arrive_str}). Visit was ended early.',
+                        author='System',
+                    )
+                AuditLog.objects.create(
+                    performed_by=_actor(request),
+                    action='STATUS_CHANGE',
+                    entity_type='ActivePatient',
+                    entity_id=str(active_patient.id),
+                    description=f'ActivePatient #{active_patient.id} dismissed (status {target_status}) — visit note recorded',
                 )
-            AuditLog.objects.create(
-                performed_by=_actor(request),
-                action='STATUS_CHANGE',
-                entity_type='ActivePatient',
-                entity_id=str(active_patient.id),
-                description=f'ActivePatient #{active_patient.id} dismissed (status {target_status}) — visit note recorded',
-            )
-            active_patient.delete()
+                active_patient.delete()
             return Response({'deleted': True}, status=status.HTTP_200_OK)
 
-        active_patient.status = target_status
-        active_patient.save()
+        with transaction.atomic():
+            if active_patient.status == 4 and target_status != 4:
+                _release_beauticians(active_patient)
+            active_patient.status = target_status
+            active_patient.save()
 
         AuditLog.objects.create(
             performed_by=_actor(request),
@@ -295,19 +329,20 @@ class TreatmentSessionCreateView(APIView):
             id__in=treatment_ids, active=True)
 
         patient = active_patient.patient_no  # may be None for general appointments
-        session = TreatmentSession.objects.create(
-            active_patient=active_patient,
-            patient_no=patient,
-            beautician=beautician,
-            branch=write_branch(request, locked=True),
-        )
-        session.treatments.set(treatment_list)
+        with transaction.atomic():
+            session = TreatmentSession.objects.create(
+                active_patient=active_patient,
+                patient_no=patient,
+                beautician=beautician,
+                branch=write_branch(request, locked=True),
+            )
+            session.treatments.set(treatment_list)
 
-        beautician.available = False
-        beautician.save()
+            beautician.available = False
+            beautician.save()
 
-        active_patient.status = 4
-        active_patient.save()
+            active_patient.status = 4
+            active_patient.save()
 
         label = patient.name if patient else active_patient.guest_name
         AuditLog.objects.create(
@@ -332,17 +367,10 @@ class CompleteTreatmentView(APIView):
         except ActivePatient.DoesNotExist:
             return Response({"error": f"ActivePatient '{active_patient_id}' not found."}, status=status.HTTP_404_NOT_FOUND)
 
-        sessions = TreatmentSession.objects.filter(
-            active_patient=active_patient).select_related('beautician')
-        seen = set()
-        for session in sessions:
-            if session.beautician_id and session.beautician_id not in seen:
-                seen.add(session.beautician_id)
-                session.beautician.available = True
-                session.beautician.save(update_fields=['available'])
-
-        active_patient.status = 5
-        active_patient.save()
+        with transaction.atomic():
+            _release_beauticians(active_patient)
+            active_patient.status = 5
+            active_patient.save()
 
         label = active_patient.patient_no.name if active_patient.patient_no_id else active_patient.guest_name
         AuditLog.objects.create(
@@ -389,7 +417,11 @@ class TreatmentRemoveView(APIView):
         )
 
         if session.treatments.count() == 0:
-            session.delete()
+            active_patient = session.active_patient
+            with transaction.atomic():
+                session.delete()
+                if active_patient is not None:
+                    _release_beauticians(active_patient)
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 

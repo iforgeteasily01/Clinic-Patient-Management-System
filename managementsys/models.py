@@ -2344,6 +2344,10 @@ class JournalStagingBatch(models.Model):
     ]
 
     date_to    = models.DateField()
+    # Optional lower bound: a document dated before this is left alone even if
+    # it is unposted. Null means "reach back as far as there are stragglers",
+    # the original sweep behaviour.
+    date_from  = models.DateField(null=True, blank=True)
     status     = models.CharField(max_length=12, choices=STATUS_CHOICES, default='draft')
     created_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='journal_staging_batches')
     created_at = models.DateTimeField(auto_now_add=True)

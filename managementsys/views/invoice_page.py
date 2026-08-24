@@ -752,6 +752,10 @@ class InvoiceListView(APIView):
             qs = qs.filter(payment_method_id=method)
         if account := request.GET.get('payment_account', '').strip():
             qs = qs.filter(payment_account_id=account)
+        if date_from := request.GET.get('date_from', '').strip():
+            qs = qs.filter(datetime__date__gte=date_from)
+        if date_to := request.GET.get('date_to', '').strip():
+            qs = qs.filter(datetime__date__lte=date_to)
 
         # Hide voided invoices unless the caller explicitly asks to include them.
         if request.GET.get('include_voided', '').strip().lower() not in ('1', 'true', 'yes'):
@@ -1180,6 +1184,10 @@ class InvoiceExportView(APIView):
             qs = qs.filter(payment_method_id=method)
         if account := request.GET.get('payment_account', '').strip():
             qs = qs.filter(payment_account_id=account)
+        if date_from := request.GET.get('date_from', '').strip():
+            qs = qs.filter(datetime__date__gte=date_from)
+        if date_to := request.GET.get('date_to', '').strip():
+            qs = qs.filter(datetime__date__lte=date_to)
 
         # Hide voided invoices unless explicitly requested (mirrors the list view).
         if request.GET.get('include_voided', '').strip().lower() not in ('1', 'true', 'yes'):

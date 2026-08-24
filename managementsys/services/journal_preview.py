@@ -324,8 +324,12 @@ def discard_open_drafts():
 
 # ── Phase 1: preview ──────────────────────────────────────────────────────────
 
-def build_preview(actor, date_to):
+def build_preview(actor, date_to, date_from=None):
     """Materialise everything a sweep to ``date_to`` would post, into staging.
+
+    ``date_from``, when given, is a hard lower bound: a document dated before
+    it is left un-journaled even if unposted. Without it the sweep reaches
+    back as far as there are stragglers.
 
     Generator, same event vocabulary as ``run_journal_sweep``:
 
@@ -344,11 +348,12 @@ def build_preview(actor, date_to):
     purge_expired_drafts()
     discard_open_drafts()
 
-    by_date = _gather_events(date_to)
+    by_date = _gather_events(date_to, date_from)
     total_documents = sum(len(v) for v in by_date.values())
 
     batch = JournalStagingBatch.objects.create(
         date_to=date_to,
+        date_from=date_from,
         status='draft',
         created_by=actor,
         expires_at=timezone.now() + DRAFT_TTL,

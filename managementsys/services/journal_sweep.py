@@ -42,7 +42,7 @@ JOURNALABLE_STOCK_REASONS = [
 ]
 
 
-def _gather_events(date_to):
+def _gather_events(date_to, date_from=None):
     """Every unposted document dated on or before ``date_to``.
 
     Returns ``{date: [(kind, obj), ...]}``. Same four querysets the original
@@ -50,6 +50,10 @@ def _gather_events(date_to):
     corrections from Phase 5. Same-day void/edit memo entries are never selected
     here: they carry source_type='void_memo'/'edit_memo' and are written
     already-posted by the void/edit endpoints.
+
+    ``date_from``, when given, is a hard lower bound: a document dated before
+    it is left alone even if unposted. Without it the sweep reaches back as
+    far as there are stragglers, which is the historical "sweep" behaviour.
 
     Only stock corrections that will actually produce legs are gathered — a
     warehouse transfer moves no value and a zero-cost issue has nothing to
@@ -62,38 +66,56 @@ def _gather_events(date_to):
     def add(day, kind, obj):
         by_date.setdefault(day, []).append((kind, obj))
 
-    for inv in Invoice.objects.filter(
+    inv_qs = Invoice.objects.filter(
         posting_status='unposted', is_voided=False, datetime__date__lte=date_to,
-    ):
+    )
+    if date_from:
+        inv_qs = inv_qs.filter(datetime__date__gte=date_from)
+    for inv in inv_qs:
         add(inv.datetime.date(), 'invoice', inv)
 
-    for p in PurchaseInvoice.objects.filter(
+    purchase_qs = PurchaseInvoice.objects.filter(
         posting_status='unposted', is_voided=False, purchase_date__lte=date_to,
-    ).select_related('supplier'):
+    ).select_related('supplier')
+    if date_from:
+        purchase_qs = purchase_qs.filter(purchase_date__gte=date_from)
+    for p in purchase_qs:
         add(p.purchase_date, 'purchase', p)
 
-    for t in AccountTransfer.objects.filter(
+    transfer_qs = AccountTransfer.objects.filter(
         posting_status='unposted', transfer_date__lte=date_to,
-    ):
+    )
+    if date_from:
+        transfer_qs = transfer_qs.filter(transfer_date__gte=date_from)
+    for t in transfer_qs:
         add(t.transfer_date, 'transfer', t)
 
-    for e in Expense.objects.filter(
+    expense_qs = Expense.objects.filter(
         posting_status='unposted', expense_date__lte=date_to,
-    ):
+    )
+    if date_from:
+        expense_qs = expense_qs.filter(expense_date__gte=date_from)
+    for e in expense_qs:
         add(e.expense_date, 'expense', e)
 
-    for s in StockOutLog.objects.filter(
+    stock_qs = StockOutLog.objects.filter(
         posting_status='unposted', out_date__lte=date_to,
         value__gt=0, reason__in=JOURNALABLE_STOCK_REASONS,
-    ).select_related('item'):
+    ).select_related('item')
+    if date_from:
+        stock_qs = stock_qs.filter(out_date__gte=date_from)
+    for s in stock_qs:
         add(s.out_date, 'stock', s)
 
     # Sales returns. Voided ones are excluded on the same grounds as voided
     # invoices: nothing came back, so there is nothing to reverse. A return
     # posts on the day the goods arrived, not the day of the original sale.
-    for r in SalesReturn.objects.filter(
+    return_qs = SalesReturn.objects.filter(
         posting_status='unposted', is_voided=False, datetime__date__lte=date_to,
-    ).select_related('invoice'):
+    ).select_related('invoice')
+    if date_from:
+        return_qs = return_qs.filter(datetime__date__gte=date_from)
+    for r in return_qs:
         add(r.datetime.date(), 'sales_return', r)
 
     return by_date

@@ -1106,7 +1106,7 @@ class JournalStagingBatchSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = JournalStagingBatch
-        fields = ['id', 'date_to', 'status', 'created_at', 'created_by_name', 'expires_at',
+        fields = ['id', 'date_to', 'date_from', 'status', 'created_at', 'created_by_name', 'expires_at',
                   'entry_count', 'document_count', 'total_debit', 'total_credit',
                   'days_committed', 'error_message', 'variance_notes', 'committed_batch_id']
 
