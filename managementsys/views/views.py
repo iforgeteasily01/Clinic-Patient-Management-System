@@ -25,6 +25,9 @@ from .production_page import (
     ProductionPreviewView, ProductionRunListCreateView, ProductionRunDetailView,
 )
 from .auth_views import UserListView, LoginView, LogoutView, ProfileUpdateView, ThemeUpdateView
+from .activity_log_page import ActivityLogView, ActivityLogMetaView
+from .patient_renumber_page import PatientRenumberView
+from .system_status_page import SystemHealthView, SystemStatusView
 from ..services.branches import filter_by_branch, write_branch
 from .branch_page import (
     BranchListView, BranchListCreateAdminView, BranchDetailAdminView,

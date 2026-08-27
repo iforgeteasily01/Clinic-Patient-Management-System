@@ -7,7 +7,7 @@ from rest_framework import serializers
 from ..models import (
     JAKARTA_TZ,
     AccountTransfer, ActivePatient, Appointment, AppointmentLocation, AppUser,
-    AssessmentCode, AttendanceRecord, Beauticians, Branch,
+    AssessmentCode, AttendanceRecord, AuditLog, Beauticians, Branch,
     BankReconciliation, BankStatementLine,
     ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseAlias, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem, InvoicePayment,
     IssueTicket, IssueTicketImage, JournalEntry, JournalStagingBatch, LedgerEntry,
@@ -63,6 +63,23 @@ class PatientSerializer(serializers.ModelSerializer):
             # otherwise the model's save() auto-generates one from the name initial.
             'patient_no': {'required': False, 'allow_blank': True},
         }
+
+    def update(self, instance, validated_data):
+        """Refuse a changed patient_no here — it is the primary key.
+
+        Assigning a new pk and saving does not rename anything: Django's UPDATE
+        matches no row, so it falls through to an INSERT and the clinic ends up
+        with a duplicate chart and an orphaned history. Renaming is a multi-table
+        operation with its own endpoint,
+        ``POST /api/admin/patients/<no>/renumber/``.
+        """
+        submitted = validated_data.pop('patient_no', None)
+        if submitted is not None and str(submitted).strip().upper() != instance.patient_no.upper():
+            raise serializers.ValidationError({'patient_no': [
+                'A patient number cannot be changed by editing the patient. '
+                'Use the renumber action instead.'
+            ]})
+        return super().update(instance, validated_data)
 
 
 class ActivePatientSerializer(serializers.ModelSerializer):
@@ -809,6 +826,30 @@ class PaymentMethodSerializer(serializers.ModelSerializer):
             'is_active', 'is_system', 'sort_order',
         ]
         read_only_fields = ['id', 'is_system']
+
+
+# ── Activity log ───────────────────────────────────────────────────────────
+
+class ActivityLogSerializer(serializers.ModelSerializer):
+    """One AuditLog row as the server-manager Activity Log tab reads it."""
+    performed_by_name = serializers.SerializerMethodField()
+    performed_by_role = serializers.SerializerMethodField()
+    is_failure        = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = AuditLog
+        fields = [
+            'id', 'timestamp', 'action', 'entity_type', 'entity_id', 'description',
+            'performed_by_id', 'performed_by_name', 'performed_by_role',
+            'source', 'method', 'path', 'status_code', 'duration_ms',
+            'ip_address', 'metadata', 'is_failure',
+        ]
+
+    def get_performed_by_name(self, obj):
+        return obj.performed_by.display_name if obj.performed_by_id else None
+
+    def get_performed_by_role(self, obj):
+        return obj.performed_by.role if obj.performed_by_id else None
 
 
 # ── Chart of Accounts ──────────────────────────────────────────────────────

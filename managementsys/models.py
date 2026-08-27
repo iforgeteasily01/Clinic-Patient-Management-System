@@ -541,6 +541,24 @@ class PaymentMethod(models.Model):
 
 
 class AuditLog(models.Model):
+    """Every meaningful thing that happened, in one table.
+
+    Two kinds of row land here and ``source`` tells them apart:
+
+    - ``app``  — an explicit ``AuditLog.objects.create()`` from a view or service.
+      Hand-written description, the richer of the two.
+    - ``http`` — written by :class:`managementsys.activity_log.ActivityLogMiddleware`
+      for *every* mutating API request. Nothing has to opt in, so a flow nobody
+      remembered to instrument still leaves a trace; the trade-off is that the
+      description is derived from the URL rather than from domain knowledge.
+
+    The HTTP columns (``method`` … ``ip_address``) are blank on ``app`` rows.
+    """
+
+    SOURCE_APP  = 'app'
+    SOURCE_HTTP = 'http'
+    SOURCE_CHOICES = [(SOURCE_APP, 'Application'), (SOURCE_HTTP, 'HTTP request')]
+
     timestamp = models.DateTimeField(auto_now_add=True)
     performed_by = models.ForeignKey(AppUser, on_delete=models.SET_NULL, null=True, blank=True)
     action = models.CharField(max_length=20)  # LOGIN, LOGOUT, CREATE, UPDATE, DELETE, STATUS_CHANGE
@@ -548,11 +566,31 @@ class AuditLog(models.Model):
     entity_id = models.CharField(max_length=50, blank=True)
     description = models.TextField()
 
+    source      = models.CharField(max_length=10, choices=SOURCE_CHOICES, default=SOURCE_APP)
+    method      = models.CharField(max_length=10, blank=True, default='')
+    path        = models.CharField(max_length=255, blank=True, default='')
+    status_code = models.IntegerField(null=True, blank=True)
+    duration_ms = models.IntegerField(null=True, blank=True)
+    ip_address  = models.GenericIPAddressField(null=True, blank=True)
+    # Redacted request/response summary — never raw credentials, see
+    # activity_log.REDACT_KEYS.
+    metadata    = models.JSONField(null=True, blank=True)
+
     class Meta:
         ordering = ['-timestamp']
+        indexes = [
+            models.Index(fields=['-timestamp']),
+            models.Index(fields=['entity_type', '-timestamp']),
+            models.Index(fields=['action', '-timestamp']),
+            models.Index(fields=['source', '-timestamp']),
+        ]
 
     def __str__(self):
         return f'{self.timestamp:%Y-%m-%d %H:%M} | {self.action} {self.entity_type}'
+
+    @property
+    def is_failure(self) -> bool:
+        return self.status_code is not None and self.status_code >= 400
 
 
 class PatientPhoto(models.Model):

@@ -3,4 +3,7 @@ from .beautician_page import *
 from .doctor_page import *
 from .patient_page import *
 from .medical_record_page import *
+from .patient_renumber_page import *
+from .activity_log_page import *
+from .system_status_page import *
 from .views import *

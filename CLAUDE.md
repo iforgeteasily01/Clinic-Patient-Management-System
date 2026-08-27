@@ -60,6 +60,7 @@ Clinic-Patient-Management-System/
 │   ├── wsgi.py / asgi.py
 ├── managementsys/
 │   ├── models.py            # All 30+ models in one file
+│   ├── activity_log.py      # Middleware: one AuditLog row per mutating API call
 │   ├── urls.py              # 143 API routes
 │   ├── auth_backend.py      # Custom token auth
 │   ├── signals.py           # Post-save hooks → Vercel dashboard push
@@ -174,7 +175,7 @@ All models are in a single file. Search carefully.
 | `PatientNote` | `patient_no` (FK), `date`, `content`, `author` | Free-form notes |
 | `PatientPhoto` | `patient_no` (FK), `photo_date`, `body_area`, `image` | Upload path: `patient_photos/YYYY/mm/dd/` |
 | `AssessmentCode` | `code` (unique), `description`, `active`, `category` (1=Common, 2=Uncommon) | ICD-10 codes |
-| `AuditLog` | `performed_by` (FK), `action`, `entity_type`, `entity_id`, `description` | Actions: LOGIN, LOGOUT, CREATE, UPDATE, DELETE, STATUS_CHANGE |
+| `AuditLog` | `performed_by` (FK), `action`, `entity_type`, `entity_id`, `description`, `source`, `method`, `path`, `status_code`, `duration_ms`, `ip_address`, `metadata` | `source='app'` = explicit call from a view/service; `source='http'` = written automatically by `activity_log.ActivityLogMiddleware` for every mutating `/api/` request. HTTP columns are blank on `app` rows. Read via `/api/admin/activity-log/` (superuser/manager only, no write endpoint) |
 | `SiteConfig` | `clinic_name`, `address_line1/2`, `phone_fax`, `receipt_footer` | Singleton. Use `SiteConfig.get_solo()` |
 | `IssueTicket` | `ticket_no` (auto TKT-YYYYMMDD-NNNN), `submitted_by` (FK), `category`, `title`, `status` | Statuses: open/in_progress/resolved/closed |
 
@@ -195,6 +196,7 @@ All models are in a single file. Search carefully.
 | Method | Path | Purpose |
 |---|---|---|
 | GET/POST | `/api/patients/` (legacy) | Patient list/create |
+| GET/POST | `/api/admin/patients/<no>/renumber/` | Preview / change the patient number (the PK) — see below |
 | POST | `/api/patients/new/` | Create patient + auto-checkin |
 | GET | `/api/patients/search/` | Fuzzy search `?search=` |
 | GET | `/api/patients/count/` | Total patient count |
@@ -398,6 +400,8 @@ All under `/api/admin/` — require `superuser` or `manager` role:
 | File | Endpoints contained |
 |---|---|
 | `auth_views.py` | Login, logout, user list, profile, theme |
+| `activity_log_page.py` | Activity log read API + filter metadata |
+| `system_status_page.py` | `/api/system/health/` and `/api/system/status/` |
 | `patient_page.py` | Search, create+checkin, queue, appointment add, treatment session, status update, sync |
 | `medical_record_page.py` | MedRec by patient |
 | `medical_record_history.py` | History list + detail |
@@ -495,6 +499,55 @@ Two constraints worth knowing:
 - `_post_accounting` and `_reverse_accounting_instances` must stay mirror images. If you add a side effect to
   one, add it to the other, or edits and voids will silently corrupt balances.
   Covered by `tests/test_invoice_edit.py` (create → edit → void must return every balance and batch to baseline).
+
+### Renumbering a patient
+
+`Patient.patient_no` is the primary key, so changing it is **not** a field edit.
+`PatientSerializer.update` refuses a changed `patient_no` and
+`services/patient_renumber.py` is the only way in.
+
+**Why the refusal matters.** Assigning a new pk and calling `save()` does not
+rename anything: Django's `UPDATE ... WHERE pk = <new>` matches no row, falls
+through to an `INSERT`, and the clinic ends up with a duplicate chart plus an
+orphaned history. That path was open until this was added.
+
+**Why it exists.** The clinic reconciles against an external system. When that
+system is the authority on a patient's number, the local copy has to be
+corrected rather than a second chart created.
+
+Three things make the rename safe:
+
+- **One transaction.** Django creates every FK to `Patient` as
+  `DEFERRABLE INITIALLY DEFERRED`, so the parent key can move before the
+  children and the constraints are checked once, at commit.
+- **`SELECT … FOR UPDATE` on the patient row first.** PostgreSQL takes a
+  `FOR KEY SHARE` lock on a parent row when inserting a child that references
+  it, and `FOR UPDATE` conflicts with that. Without the lock, a check-in
+  happening *during* the rename could be written against the old number after
+  the sweep had passed that table, and be left dangling.
+- **The tables are discovered, not listed** — `Patient._meta.related_objects` at
+  call time. An FK added next year moves with it. A many-to-many to `Patient`
+  (there is none today) raises rather than being silently skipped.
+
+**`medrec_id` is rewritten too.** It embeds the patient number
+(`MR-J000001-20260601-1`), so leaving it would show a stranger's number on the
+chart. The old→new mapping is stored in the `AuditLog` row's `metadata`, because
+a record number already printed on paper stops resolving. Collisions (the target
+number belonged to a chart renamed away earlier) are detected and reported as a
+validation error rather than left to blow up as a unique-constraint violation.
+The date parsers (`crm_dashboard._medrec_date`, the med-rec serializers) scan for
+the 8-digit part rather than splitting positionally, so the rewrite does not
+disturb them.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/admin/patients/<no>/renumber/` | Preview: how many rows in which tables would move. Writes nothing |
+| POST | `/api/admin/patients/<no>/renumber/` | Body `{new_patient_no}`. Performs it, returns a per-table summary |
+
+**Admin (superuser) only** — deliberately narrower than the rest of the patient
+form, which every manager uses. Covered by `tests/test_patient_renumber.py`, whose
+load-bearing test walks the model metadata to assert **no row anywhere** still
+points at the old number.
 
 ### Excel Import Pattern (two-phase)
 1. POST file to `import/preview/` → returns rows for user review
@@ -833,7 +886,10 @@ Covered by `tests/test_branches.py`.
 
 ```bash
 python manage.py create_default_admin     # Create superuser (display_name=Admin, PIN=000000)
-python manage.py create_app_user <name> <pin> [--role admin]
+python manage.py create_app_user <name> <pin> [--role superuser|doctor|beautician|cashier|manager]
+#   --role defaults to superuser. Its choices are read from AppUser.ROLE_CHOICES:
+#   the old literal `['admin']` was not a real role, and Django does not enforce
+#   choices at the DB level, so those users were locked out of every role-gated screen.
 python manage.py populate_data            # Load demo data
 python manage.py poll_reservations        # Collect online bookings once
 python manage.py poll_reservations --loop --interval 60   # what start-servers.bat runs

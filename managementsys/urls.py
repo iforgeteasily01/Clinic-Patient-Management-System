@@ -2,6 +2,12 @@ from django.urls import path
 from .views import views
 
 urlpatterns = [
+    # Server manager: activity log + health/status
+    path('api/admin/activity-log/',      views.ActivityLogView.as_view(),     name='admin-activity-log'),
+    path('api/admin/activity-log/meta/', views.ActivityLogMetaView.as_view(), name='admin-activity-log-meta'),
+    path('api/system/health/',           views.SystemHealthView.as_view(),    name='system-health'),
+    path('api/system/status/',           views.SystemStatusView.as_view(),    name='system-status'),
+
     # Auth
     path('api/auth/users/', views.UserListView.as_view(), name='auth-users'),
     path('api/auth/login/', views.LoginView.as_view(), name='auth-login'),
@@ -22,6 +28,7 @@ urlpatterns = [
     path('api/admin/doctors/', views.DoctorListCreateAdminView.as_view(), name='admin-doctors'),
     path('api/admin/doctors/<int:pk>/', views.DoctorDetailAdminView.as_view(), name='admin-doctor-detail'),
     path('api/admin/patients/', views.PatientListCreateAdminView.as_view(), name='admin-patients'),
+    path('api/admin/patients/<str:patient_no>/renumber/', views.PatientRenumberView.as_view(), name='admin-patient-renumber'),
     path('api/admin/patients/<str:patient_no>/', views.PatientDetailAdminView.as_view(), name='admin-patient-detail'),
     path('api/admin/treatments/', views.TreatmentListCreateAdminView.as_view(), name='admin-treatments'),
     path('api/admin/treatments/template/', views.TreatmentTemplateView.as_view(), name='admin-treatments-template'),

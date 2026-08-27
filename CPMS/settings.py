@@ -60,7 +60,14 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'managementsys.discord_alerts.DiscordErrorAlertMiddleware',
+    # Must sit last: it reads request.user in the response phase, which DRF only
+    # populates once the view has authenticated.
+    'managementsys.activity_log.ActivityLogMiddleware',
 ]
+
+# Set False to stop the automatic per-request AuditLog rows. Explicit
+# AuditLog.objects.create() calls in views/services are unaffected.
+ACTIVITY_LOG_ENABLED = env.bool('ACTIVITY_LOG_ENABLED', True)
 
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_HEADERS = list(default_headers) + ["x-branch-id"]
