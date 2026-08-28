@@ -230,8 +230,9 @@ All models are in a single file. Search carefully.
 |---|---|---|
 | GET/POST | `/medicalrecord/` | Create SOAP record |
 | GET | `/api/medicalrecords/<patient_no>/` | All records for patient |
-| GET | `/api/medical-records/history/` | All records, filterable |
+| GET | `/api/medical-records/history/` | The archive, **paged**. Filters `patient_name`/`patient_no`/`medrec_id`/`date`/`include_drafts`, ordering `sort`+`dir` (default `visit_date` desc), paging `page`+`page_size` (cap 500). Always returns the `{results, count, page, page_size, total_pages, sort, dir}` envelope, never a bare list |
 | GET | `/api/medical-records/history/<medrec_id>/` | Single record detail |
+| PATCH | `/api/medical-records/history/<medrec_id>/` | **Amend a finalized record.** `superuser`/`doctor` only; clinical fields only; every changed field logged with its previous value |
 | POST | `/api/photos/upload/` | Upload patient photo |
 | GET | `/api/photos/` | List photos `?patient_no=` |
 
@@ -404,7 +405,7 @@ All under `/api/admin/` — require `superuser` or `manager` role:
 | `system_status_page.py` | `/api/system/health/` and `/api/system/status/` |
 | `patient_page.py` | Search, create+checkin, queue, appointment add, treatment session, status update, sync |
 | `medical_record_page.py` | MedRec by patient |
-| `medical_record_history.py` | History list + detail |
+| `medical_record_history.py` | Archive list (paged + sorted), detail, and the amend path |
 | `photo_page.py` | Photo upload + list |
 | `billing_page.py` | Billing queue, complete billing |
 | `invoice_page.py` | Invoice CRUD, export, import |
@@ -548,6 +549,32 @@ disturb them.
 form, which every manager uses. Covered by `tests/test_patient_renumber.py`, whose
 load-bearing test walks the model metadata to assert **no row anywhere** still
 points at the old number.
+
+### Amending a finalized medical record
+
+A finalized `MedRec` is a signed clinical document, so
+`PATCH /api/medical-records/history/<medrec_id>/` is deliberately narrower than
+the drafting endpoint next to it:
+
+- **Two roles only** — `superuser` and `doctor` (`EDITOR_ROLES`). A manager runs
+  the clinic; they do not sign the note.
+- **Clinical content only.** `EDITABLE_FIELDS` is the SOAP block, the regimen and
+  the treatment text. `patient_no`, `doctor_id`, `medrec_id` and `status` are not
+  in it, so an amendment can never move a note onto another patient's chart or
+  quietly return a finalized record to draft.
+- **Every changed field is logged with its previous value.** One `AuditLog` row
+  per amendment, `source='app'`, carrying `field: before -> after` for each
+  change (values abbreviated to 80 chars so the row stays readable). A later
+  reader relies on the clinical content, so "who changed what" has to survive the
+  edit. A PATCH that changes nothing writes **no** row — an audit trail full of
+  non-edits makes the real ones harder to find.
+
+Sorting the list by visit date cannot use `medrec_id`: it starts with the patient
+number (`MR-<patient_no>-<YYYYMMDD>-<n>`), so it orders by patient first.
+`_with_date_key` annotates the embedded `YYYYMMDD` instead, which sorts
+chronologically as a zero-padded string.
+
+Covered by `tests/test_medrec_history.py`.
 
 ### Excel Import Pattern (two-phase)
 1. POST file to `import/preview/` → returns rows for user review
