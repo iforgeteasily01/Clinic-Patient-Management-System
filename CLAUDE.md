@@ -546,7 +546,7 @@ disturb them.
 | POST | `/api/admin/patients/<no>/renumber/` | Body `{new_patient_no}`. Performs it, returns a per-table summary |
 
 **Admin (superuser) only** — deliberately narrower than the rest of the patient
-form, which every manager uses. Covered by `tests/test_patient_renumber.py`, whose
+edit page (`/patients/:patientNo/edit`), which every manager and doctor uses. Covered by `tests/test_patient_renumber.py`, whose
 load-bearing test walks the model metadata to assert **no row anywhere** still
 points at the old number.
 
