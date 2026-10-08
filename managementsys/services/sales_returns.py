@@ -32,7 +32,7 @@ whatever the quantization moved.
 from decimal import Decimal, ROUND_HALF_UP
 
 from ..models import (
-    ChartOfAccounts, InvoiceItem, PatientPackageRedemption, SalesReturn,
+    EXCLUDED, ChartOfAccounts, InvoiceItem, PatientPackageRedemption, SalesReturn,
     TreatmentPackage,
 )
 # The system account numbers come from the engine and are never re-declared
@@ -194,6 +194,14 @@ def validate_invoice(invoice):
     if invoice.is_voided:
         raise SalesReturnError(
             {'invoice': 'Faktur ini sudah dibatalkan — tidak ada yang bisa diretur.'}
+        )
+    # An excluded invoice's revenue reached the GL by hand, not through the
+    # journal engine. A return posts a reversal of the engine's legs, which here
+    # would take out revenue CPMS never put in. Refunds on these belong in the
+    # same manual books the sale went into.
+    if invoice.posting_status == EXCLUDED:
+        raise SalesReturnError(
+            {'invoice': 'Faktur ini dicatat di luar jurnal — returnya harus dicatat manual juga.'}
         )
 
 

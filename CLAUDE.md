@@ -241,6 +241,7 @@ All models are in a single file. Search carefully.
 |---|---|---|
 | GET | `/api/billing/` | Patients ready for checkout (status=5) |
 | POST | `/api/billing/<id>/complete/` | Generate invoice + mark paid |
+| POST | `/api/activepatients/<id>/mark-paid/` | Close a visit as paid from **any** status (superuser/manager/cashier). `exclude_from_journal: true` → invoice dated at arrival with `posting_status='excluded'` — see below |
 | GET/POST | `/api/invoices/` | Invoice list / create |
 | POST | `/api/invoices/create/` | Create with line items |
 | GET | `/api/invoices/<id>/` | Invoice detail |
@@ -449,6 +450,21 @@ All under `/api/admin/` — require `superuser` or `manager` role:
 | 3 | Treatment queue (ready for beautician) |
 | 4 | In treatment |
 | 5 | Ready for billing |
+
+### Invoices kept out of the journal (`posting_status='excluded'`)
+Carried-over visits were often paid days earlier and already booked into the GL
+by manual journal. `mark-paid` with `exclude_from_journal: true` records the sale
+(sales history, CRM, the patient's record) without posting it twice:
+
+- The sweep selects only `'unposted'`, so an excluded invoice is never journaled.
+- Void/edit write memo entries only for `'posted'`, so they write none here.
+- `sales_returns.validate_invoice` **refuses** a return against one — it would
+  reverse revenue CPMS never booked. Refund by hand, like the sale.
+- A visit with no treatments gets no Rp 0 invoice; it is closed with a
+  `PatientNote` instead.
+
+The value exists on `Invoice` only (`INVOICE_POSTING_STATUS_CHOICES`, migration
+0119, a SQL no-op). The shared `POSTING_STATUS_CHOICES` is unchanged.
 
 ### Auto-Generated IDs
 - `patient_no`: `{initial}{6-digit-counter}` e.g. J000001

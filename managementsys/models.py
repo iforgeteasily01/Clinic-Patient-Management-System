@@ -609,6 +609,15 @@ class PatientPhoto(models.Model):
 
 POSTING_STATUS_CHOICES = [('unposted', 'Unposted'), ('posted', 'Posted')]
 
+# Invoices have a third state the other documents do not. 'excluded' is a sale
+# that really happened but was already put on the books by hand (a manual
+# journal, a paper receipt keyed in elsewhere) before the visit was ever closed
+# in CPMS. Posting it would count the money twice, so the sweep — which selects
+# only 'unposted' — never sees it, and void/edit write no memo because it was
+# never 'posted'. It still counts as a sale everywhere that is not the GL.
+EXCLUDED = 'excluded'
+INVOICE_POSTING_STATUS_CHOICES = POSTING_STATUS_CHOICES + [(EXCLUDED, 'Excluded from journal')]
+
 
 class Invoice(models.Model):
     invoice_number     = models.CharField(max_length=30, unique=True, blank=True)
@@ -648,7 +657,7 @@ class Invoice(models.Model):
     # already-posted invoice is handled live via same-day memo entries instead
     # (see managementsys/services/journal_engine.py).
     branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='invoices')
-    posting_status     = models.CharField(max_length=10, choices=POSTING_STATUS_CHOICES, default='unposted')
+    posting_status     = models.CharField(max_length=10, choices=INVOICE_POSTING_STATUS_CHOICES, default='unposted')
 
     class Meta:
         ordering = ['-datetime']

@@ -790,6 +790,8 @@ class InvoiceReadSerializer(serializers.ModelSerializer):
             'cashier_id', 'cashier_name',
             'warehouse_id', 'warehouse_name',
             'is_voided', 'voided_at', 'voided_by_name',
+            # 'excluded' marks a sale booked by hand and kept out of the journal.
+            'posting_status', 'notes',
             'items', 'payments',
         ]
 
