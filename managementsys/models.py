@@ -314,6 +314,43 @@ class TreatmentSession(models.Model):
         return f"{label} - {self.session_time}"
 
 
+class BeauticianAssignment(models.Model):
+    """
+    Who is looking after a visit, over time. One row per hand-over: the open
+    row (ended_at IS NULL) is the beautician shown on the queue, and closed rows
+    are the history.
+
+    Deliberately separate from TreatmentSession.beautician, which is never
+    rewritten on a reassignment — a session belongs to whoever started it, and
+    HR performance credits treatments from it. Rewriting it would hand the
+    outgoing beautician's work to whoever took the patient over.
+
+    `patient_no` is copied from the visit because ActivePatient rows are deleted
+    when a visit closes, and the history has to outlive that.
+    """
+    active_patient = models.ForeignKey(
+        ActivePatient, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='beautician_assignments',
+    )
+    patient_no = models.ForeignKey(Patient, on_delete=models.SET_NULL, null=True, blank=True)
+    guest_name = models.CharField(max_length=100, null=True, blank=True)
+    beautician = models.ForeignKey(Beauticians, on_delete=models.SET_NULL, null=True,
+                                   related_name='assignments')
+    branch = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True,
+                               related_name='beautician_assignments')
+    assigned_at = models.DateTimeField(default=timezone.now)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    assigned_by = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True,
+                                    related_name='+')
+    reason = models.CharField(max_length=200, blank=True, default='')
+
+    class Meta:
+        ordering = ['assigned_at', 'id']
+
+    def __str__(self):
+        return f'{self.beautician} @ visit {self.active_patient_id} ({self.assigned_at:%Y-%m-%d %H:%M})'
+
+
 class AppUser(models.Model):
     ROLE_CHOICES = [
         ('superuser',  'Superuser'),

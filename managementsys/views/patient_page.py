@@ -11,6 +11,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from ..api.serializers import PatientSerializer, PatientSyncSerializer, ActivePatientSerializer, TreatmentSerializer
 from ..services.branches import filter_by_branch, write_branch
+from ..services import beautician_assignment
 
 
 def _actor(request):
@@ -24,20 +25,9 @@ def _release_beauticians(active_patient):
     (in treatment). Call this on every path that ends a patient's involvement
     in a session — completed, cancelled, dismissed, or bulk-cleared — not just
     the "finish treatment" button, or the beautician is left marked busy with
-    nothing left to finish it.
+    nothing left to finish it. Also closes the visit's open BeauticianAssignment.
     """
-    beautician_ids = set(
-        TreatmentSession.objects.filter(active_patient=active_patient)
-        .exclude(beautician__isnull=True)
-        .values_list('beautician_id', flat=True)
-    )
-    for beautician_id in beautician_ids:
-        still_busy = TreatmentSession.objects.filter(
-            beautician_id=beautician_id,
-            active_patient__status=4,
-        ).exclude(active_patient=active_patient).exists()
-        if not still_busy:
-            Beauticians.objects.filter(id=beautician_id).update(available=True)
+    beautician_assignment.release(active_patient)
 
 
 class PatientSearchView(APIView):
@@ -329,17 +319,21 @@ class TreatmentSessionCreateView(APIView):
             id__in=treatment_ids, active=True)
 
         patient = active_patient.patient_no  # may be None for general appointments
+        branch = write_branch(request, locked=True)
         with transaction.atomic():
             session = TreatmentSession.objects.create(
                 active_patient=active_patient,
                 patient_no=patient,
                 beautician=beautician,
-                branch=write_branch(request, locked=True),
+                branch=branch,
             )
             session.treatments.set(treatment_list)
 
-            beautician.available = False
-            beautician.save()
+            # Same beautician again (adding treatments) is a no-op here; a
+            # different one is recorded as a hand-over.
+            beautician_assignment.assign(
+                active_patient, beautician, actor=_actor(request), branch=branch,
+            )
 
             active_patient.status = 4
             active_patient.save()
@@ -354,6 +348,88 @@ class TreatmentSessionCreateView(APIView):
         )
 
         return Response({"id": session.id}, status=status.HTTP_201_CREATED)
+
+
+class BeauticianReassignView(APIView):
+    """
+    GET  /api/activepatients/<pk>/beautician/  — current beautician + hand-over history
+    POST /api/activepatients/<pk>/beautician/  — body {beautician, reason?}
+
+    Hands a visit that is in treatment (status 4) to another beautician. The
+    previous assignment is closed, not overwritten, and existing treatment
+    sessions keep the beautician who started them.
+    """
+
+    def _payload(self, active_patient):
+        rows = beautician_assignment.history(active_patient)
+        current = next((a for a in reversed(rows) if a.ended_at is None), None)
+        return {
+            'active_patient_id': active_patient.id,
+            'current_beautician_id': current.beautician_id if current else None,
+            'current_beautician_name': (
+                current.beautician.beautician_name if current and current.beautician else None
+            ),
+            'history': [
+                {
+                    'id': a.id,
+                    'beautician_id': a.beautician_id,
+                    'beautician_name': a.beautician.beautician_name if a.beautician else None,
+                    'assigned_at': a.assigned_at,
+                    'ended_at': a.ended_at,
+                    'assigned_by': a.assigned_by.display_name if a.assigned_by else None,
+                    'reason': a.reason,
+                }
+                for a in rows
+            ],
+        }
+
+    def _visit(self, pk):
+        try:
+            return ActivePatient.objects.get(pk=pk)
+        except ActivePatient.DoesNotExist:
+            return None
+
+    def get(self, request, pk):
+        active_patient = self._visit(pk)
+        if active_patient is None:
+            return Response({'error': 'Visit not found.'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(self._payload(active_patient))
+
+    def post(self, request, pk):
+        active_patient = self._visit(pk)
+        if active_patient is None:
+            return Response({'error': 'Visit not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if active_patient.status != 4:
+            return Response(
+                {'error': 'Only a patient currently in treatment can change beautician.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        beautician_id = request.data.get('beautician')
+        try:
+            beautician = Beauticians.objects.get(pk=beautician_id)
+        except (Beauticians.DoesNotExist, ValueError, TypeError):
+            return Response({'beautician': 'Beautician not found.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reason = (request.data.get('reason') or '').strip()
+        _, previous = beautician_assignment.assign(
+            active_patient, beautician, actor=_actor(request), reason=reason,
+        )
+
+        if previous is not None:
+            label = active_patient.patient_no.name if active_patient.patient_no_id else active_patient.guest_name
+            old_name = previous.beautician.beautician_name if previous.beautician else '—'
+            AuditLog.objects.create(
+                performed_by=_actor(request),
+                action='UPDATE',
+                entity_type='ActivePatient',
+                entity_id=str(active_patient.id),
+                description=(
+                    f'Beautician for {label} changed: {old_name} -> {beautician.beautician_name}'
+                    + (f' ({reason})' if reason else '')
+                ),
+            )
+        return Response(self._payload(active_patient), status=status.HTTP_200_OK)
 
 
 class CompleteTreatmentView(APIView):

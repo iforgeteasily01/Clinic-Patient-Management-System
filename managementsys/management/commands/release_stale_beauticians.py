@@ -10,7 +10,8 @@ future code path that forgets to call `_release_beauticians`).
 """
 from django.core.management.base import BaseCommand
 
-from managementsys.models import Beauticians, TreatmentSession
+from managementsys.models import Beauticians
+from managementsys.services.beautician_assignment import busy_beautician_ids
 
 
 class Command(BaseCommand):
@@ -22,11 +23,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **opts):
         dry_run = opts['dry_run']
-        busy_with_live_session = set(
-            TreatmentSession.objects.filter(active_patient__status=4)
-            .exclude(beautician__isnull=True)
-            .values_list('beautician_id', flat=True)
-        )
+        busy_with_live_session = busy_beautician_ids()
         stuck = Beauticians.objects.filter(available=False).exclude(
             id__in=busy_with_live_session)
 

@@ -215,6 +215,7 @@ All models are in a single file. Search carefully.
 | GET | `/api/activepatients/treatment/` | Treatment queue (status=3) |
 | POST | `/api/treatment-session/` | Create treatment session |
 | POST | `/api/treatment-session/complete/` | Mark treatment complete (→ status 5) |
+| GET/POST | `/api/activepatients/<pk>/beautician/` | Current beautician + hand-over history / hand a status-4 visit to another beautician (`{beautician, reason?}`) — see below |
 | GET | `/beauticians/` | Beauticians (`?available=true`) |
 
 ### Online Reservations
@@ -450,6 +451,26 @@ All under `/api/admin/` — require `superuser` or `manager` role:
 | 3 | Treatment queue (ready for beautician) |
 | 4 | In treatment |
 | 5 | Ready for billing |
+
+### Changing beautician mid-treatment (`BeauticianAssignment`)
+
+A visit at status 4 can be handed to another beautician. `BeauticianAssignment`
+(migration 0120) holds one row per hand-over; the open row (`ended_at IS NULL`)
+is the beautician the queue shows, closed rows are the history. All rules live in
+`services/beautician_assignment.py`.
+
+- **`TreatmentSession.beautician` is never rewritten.** A session belongs to
+  whoever started it and HR performance credits from it; overwriting it would
+  hand the outgoing beautician's work to the incoming one. Treatments added after
+  a hand-over are new sessions under the new beautician.
+- **Busy/free comes from open assignments** on status-4 visits. Visits with no
+  assignment rows (predating 0120, which backfilled live ones) fall back to their
+  sessions. `_release_beauticians` delegates to `release()`, which also closes
+  the open row — keep every visit-ending path calling it.
+- `patient_no`/`guest_name` are copied onto the row because `ActivePatient` is
+  deleted when the visit closes; the history must outlive it.
+
+Covered by `tests/test_beautician_reassign.py`.
 
 ### Invoices kept out of the journal (`posting_status='excluded'`)
 Carried-over visits were often paid days earlier and already booked into the GL

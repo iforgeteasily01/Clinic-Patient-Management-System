@@ -7,7 +7,7 @@ from rest_framework import serializers
 from ..models import (
     JAKARTA_TZ,
     AccountTransfer, ActivePatient, Appointment, AppointmentLocation, AppUser,
-    AssessmentCode, AttendanceRecord, AuditLog, Beauticians, Branch,
+    AssessmentCode, AttendanceRecord, AuditLog, BeauticianAssignment, Beauticians, Branch,
     BankReconciliation, BankStatementLine,
     ChartOfAccounts, ColorPalette, Doctors, Expense, ExpenseAlias, ExpenseItem, InventoryBatch, InventoryItem, Invoice, InvoiceItem, InvoicePayment,
     IssueTicket, IssueTicketImage, JournalEntry, JournalStagingBatch, LedgerEntry,
@@ -115,15 +115,35 @@ class ActivePatientSerializer(serializers.ModelSerializer):
             session = TreatmentSession.objects.filter(patient_no=obj.patient_no).order_by('-session_time').first()
         return session
 
+    def _current_beautician(self, obj):
+        # The open assignment wins: after a hand-over the latest session still
+        # names whoever started it. Visits from before assignments existed
+        # fall back to the session.
+        cache = getattr(self, '_beautician_cache', None)
+        if cache is None:
+            cache = self._beautician_cache = {}
+        if obj.pk not in cache:
+            assignment = (
+                BeauticianAssignment.objects
+                .filter(active_patient=obj, ended_at__isnull=True)
+                .select_related('beautician')
+                .order_by('-assigned_at', '-id')
+                .first()
+            )
+            if assignment is not None:
+                cache[obj.pk] = assignment.beautician
+            else:
+                session = self._current_session(obj)
+                cache[obj.pk] = session.beautician if session else None
+        return cache[obj.pk]
+
     def get_current_beautician_name(self, obj):
-        session = self._current_session(obj)
-        if session and session.beautician:
-            return session.beautician.beautician_name
-        return None
+        b = self._current_beautician(obj)
+        return b.beautician_name if b else None
 
     def get_current_beautician_id(self, obj):
-        session = self._current_session(obj)
-        return session.beautician_id if session and session.beautician_id else None
+        b = self._current_beautician(obj)
+        return b.id if b else None
 
     def get_treatment_session_ids(self, obj):
         return list(obj.treatmentsession_set.values_list('id', flat=True))
@@ -158,9 +178,23 @@ class BeauticiansSerializer(serializers.ModelSerializer):
     current_patient = serializers.SerializerMethodField()
 
     def get_current_patient(self, obj):
+        assignment = (
+            BeauticianAssignment.objects
+            .filter(beautician=obj, ended_at__isnull=True, active_patient__status=4)
+            .select_related('active_patient__patient_no')
+            .order_by('-assigned_at')
+            .first()
+        )
+        if assignment is not None:
+            ap = assignment.active_patient
+            name = ap.patient_no.name if ap.patient_no else ap.guest_name
+            return {'active_patient_id': ap.id, 'patient_name': name}
+        # Sessions only speak for visits that predate assignments: on any other
+        # visit a session names whoever *started* it, who may have handed over.
         session = (
             TreatmentSession.objects
-            .filter(beautician=obj, active_patient__isnull=False)
+            .filter(beautician=obj, active_patient__isnull=False,
+                    active_patient__beautician_assignments__isnull=True)
             .select_related('active_patient__patient_no')
             .order_by('-session_time')
             .first()
@@ -207,8 +241,13 @@ class BeauticianAdminStatusSerializer(serializers.ModelSerializer):
         else:
             return None
 
-        # Stuck = beautician marked busy but patient is no longer in status 4
-        is_stuck = (not obj.available) and (ap_status != 4)
+        # Stuck = beautician marked busy but patient is no longer in status 4.
+        # A beautician who took a patient over holds no session on that visit,
+        # so their open assignment counts as busy too.
+        holds_handover = BeauticianAssignment.objects.filter(
+            beautician=obj, ended_at__isnull=True, active_patient__status=4,
+        ).exists()
+        is_stuck = (not obj.available) and (ap_status != 4) and not holds_handover
 
         return {
             'session_id': session.id,

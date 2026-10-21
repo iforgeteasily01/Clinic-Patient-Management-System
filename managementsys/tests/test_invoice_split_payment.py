@@ -225,6 +225,51 @@ class TestSplitPaymentEditAndVoid:
         assert (_debits_on(invoice, gl_accounts["cash"])
                 - _credits_on(invoice, gl_accounts["cash"])) == Decimal("350000")
 
+    def test_splitting_a_single_method_invoice_after_posting(
+            self, auth_api, stock, gl_accounts, bank_method):
+        # The invoice-edit dialog's payload: rows carry an explicit null
+        # account, so the method's linked account is used — as at the till.
+        _create(auth_api, stock, {"payment_method_id": gl_accounts["cash_method"].id})
+        invoice = Invoice.objects.latest("id")
+        _run_journal(auth_api)
+        invoice.refresh_from_db()
+        assert invoice.payments.count() == 0
+
+        res = auth_api.put(
+            reverse("invoice-detail", args=[invoice.id]),
+            {"payments": [
+                {"payment_method_id": gl_accounts["cash_method"].id,
+                 "payment_account_id": None, "amount": "100000.00"},
+                {"payment_method_id": bank_method.id,
+                 "payment_account_id": None, "amount": "250000.00"},
+            ]},
+            format="json",
+        )
+        assert res.status_code == 200, res.content
+        assert invoice.payments.count() == 2
+        assert (_debits_on(invoice, gl_accounts["cash"])
+                - _credits_on(invoice, gl_accounts["cash"])) == Decimal("100000")
+        assert (_debits_on(invoice, gl_accounts["bank"])
+                - _credits_on(invoice, gl_accounts["bank"])) == Decimal("250000")
+        debit, credit = _sides(invoice)
+        assert debit == credit
+
+    def test_collapsing_a_split_onto_a_different_account(
+            self, auth_api, stock, gl_accounts, bank_method):
+        invoice = self._posted_split_invoice(auth_api, stock, gl_accounts, bank_method)
+
+        res = auth_api.put(
+            reverse("invoice-detail", args=[invoice.id]),
+            {"payments": [], "payment_account_id": gl_accounts["bank"].id},
+            format="json",
+        )
+        assert res.status_code == 200, res.content
+        assert invoice.payments.count() == 0
+        assert (_debits_on(invoice, gl_accounts["cash"])
+                - _credits_on(invoice, gl_accounts["cash"])) == Decimal("0")
+        assert (_debits_on(invoice, gl_accounts["bank"])
+                - _credits_on(invoice, gl_accounts["bank"])) == Decimal("350000")
+
     def test_void_unwinds_each_account_separately(
             self, auth_api, stock, gl_accounts, bank_method):
         invoice = self._posted_split_invoice(auth_api, stock, gl_accounts, bank_method)

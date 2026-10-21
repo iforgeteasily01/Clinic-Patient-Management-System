@@ -111,6 +111,7 @@ urlpatterns = [
     path('api/activepatients/update-status/', views.ActivePatientUpdateStatusView.as_view(), name='activepatient-update-status'),
     path('api/activepatients/clear/', views.ActivePatientClearView.as_view(), name='activepatient-clear'),
     path('api/activepatients/<int:pk>/mark-paid/', views.ActivePatientMarkPaidView.as_view(), name='activepatient-mark-paid'),
+    path('api/activepatients/<int:pk>/beautician/', views.BeauticianReassignView.as_view(), name='activepatient-beautician'),
     path('api/activepatients/treatment/', views.TreatmentQueueView.as_view(), name='treatment-queue'),
     path('api/patient-statuses/', views.patStatusListCreate.as_view(), name='patient-statuses'),
     path('api/treatments/', views.TreatmentListView.as_view(), name='treatment-list'),
