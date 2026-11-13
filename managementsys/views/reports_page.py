@@ -552,7 +552,7 @@ def _build_purchases(start, end):
     qs = (
         PurchaseInvoice.objects
         .select_related('supplier', 'warehouse')
-        .prefetch_related('items__item')
+        .prefetch_related('items__item', 'payments')
         .filter(purchase_date__gte=start, purchase_date__lte=end, is_voided=False)
         .order_by('purchase_date', 'id')
     )
@@ -576,10 +576,17 @@ def _build_purchases(start, end):
                 round(pot_pct, 2),
                 round(total, 2),
             ])
+        # The newest settlement against this invoice. A purchase is paid in
+        # instalments, each with its own date, so there is no single payment date
+        # on the invoice itself — the latest one is what the report files it
+        # under. Unpaid invoices have no payment rows and report ''.
+        pay_dates = [p.payment_date for p in inv.payments.all()]
+        last_payment = max(pay_dates) if pay_dates else None
         groups.append({
             'header': {
                 'No Transaksi': inv.internal_id,
                 'Tanggal': inv.purchase_date.isoformat(),
+                'Tgl. Bayar': last_payment.isoformat() if last_payment else '',
                 'Dept.': inv.warehouse.code if inv.warehouse_id else '',
                 'Kode Supp.': inv.supplier_id,
                 'Nama Supplier': inv.supplier.name if inv.supplier_id else '',
@@ -776,6 +783,7 @@ def _report_to_xlsx(report, title, period_label, filename):
             h = grp['header']
             info = (
                 f"No Transaksi: {h['No Transaksi']}    Tanggal: {h['Tanggal']}    "
+                f"Tgl. Bayar: {h.get('Tgl. Bayar') or '-'}    "
                 f"Dept.: {h['Dept.']}    Supplier: {h['Nama Supplier']}"
             )
             ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=max(ncols, 1))
