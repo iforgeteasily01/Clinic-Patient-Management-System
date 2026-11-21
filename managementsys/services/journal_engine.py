@@ -62,6 +62,12 @@ class Leg:
     # True for FIFO-derived lines. Stock can move between preview and commit, so
     # these amounts are recomputed at commit and are shown as estimates.
     is_estimated: bool = False
+    # 'system' when the engine computed the line from a document, 'user' when a
+    # person typed it. Persisted to LedgerEntry.origin by write_legs.
+    origin: str = 'system'
+    # The AppUser who authored a user line. None for system lines: write_legs
+    # then stamps whoever ran the posting.
+    created_by: object = None
 
 
 @dataclass
@@ -72,9 +78,10 @@ class LegSet:
     warnings: list = field(default_factory=list)
 
     def add(self, account, entry_type, amount, description, *,
-            pending_account_label='', is_estimated=False):
+            pending_account_label='', is_estimated=False, origin='system',
+            created_by=None):
         self.legs.append(Leg(account, entry_type, Decimal(amount), description,
-                             pending_account_label, is_estimated))
+                             pending_account_label, is_estimated, origin, created_by))
 
     @property
     def total_debit(self):
@@ -228,6 +235,10 @@ def write_legs(legset, *, date, source_type, document=None, batch=None, actor=No
             source_type=source_type,
             journal_entry=entry,
             branch_id=resolved_branch_id,
+            origin=leg.origin,
+            # The line's own author when a person typed it; otherwise whoever
+            # ran the posting.
+            created_by=leg.created_by or actor,
             **({doc_field: document} if doc_field else {}),
         ))
     LedgerEntry.objects.bulk_create(rows, batch_size=500)
@@ -236,7 +247,10 @@ def write_legs(legset, *, date, source_type, document=None, batch=None, actor=No
 
 def reverse_legset(legset):
     """A LegSet that exactly negates ``legset`` — every side flipped, amounts and
-    descriptions preserved. Used by correction journals."""
+    descriptions preserved. Used by correction journals.
+
+    The result is always ``origin='system'``: a reversal is generated, nobody
+    typed it, even when the lines it negates were typed by hand."""
     out = LegSet(memo=legset.memo, warnings=list(legset.warnings))
     flip = {'debit': 'credit', 'credit': 'debit'}
     for leg in legset.legs:
@@ -248,8 +262,9 @@ def reverse_legset(legset):
 def legset_from_entry(entry):
     """Rebuild a LegSet from a posted JournalEntry's stored lines."""
     out = LegSet(memo=entry.memo)
-    for line in entry.lines.select_related('account').all():
-        out.legs.append(Leg(line.account, line.entry_type, line.amount, line.description))
+    for line in entry.lines.select_related('account', 'created_by').all():
+        out.legs.append(Leg(line.account, line.entry_type, line.amount, line.description,
+                            origin=line.origin, created_by=line.created_by))
     return out
 
 

@@ -137,6 +137,12 @@ def _lines_from_instances(item_instances):
     ]
 
 
+def _qty(value):
+    """A quantity for a warning sentence: '3', not '3.0000'."""
+    d = Decimal(str(value))
+    return format(d.quantize(Decimal(1)) if d == d.to_integral() else d.normalize(), 'f')
+
+
 def build_invoice_legs(invoice, line_items, items_by_id, *, deduct=True, sim=None):
     """Every journal leg a completed invoice produces, as a LegSet:
       - Cash/payment account  += grand_total  (DEBIT asset)
@@ -187,10 +193,24 @@ def build_invoice_legs(invoice, line_items, items_by_id, *, deduct=True, sim=Non
 
         if not item.is_service and invoice.warehouse_id:
             if line['quantity'] > 0:
-                _shortfall, cogs_amount = _fifo_deduct(
+                shortfall, cogs_amount = _fifo_deduct(
                     item.id, invoice.warehouse_id, line['quantity'],
                     commit=deduct, sim=sim,
                 )
+                # The routine FIFO estimate is not a problem — it is recomputed
+                # at commit. These two are: each means the cost posted for this
+                # sale is understated, and nothing else would say so.
+                if shortfall > 0:
+                    legset.warnings.append(
+                        f'Stok kurang: {item.name} terjual {_qty(line["quantity"])}, '
+                        f'tersedia {_qty(line["quantity"] - shortfall)} di gudang ini — '
+                        f'HPP untuk {_qty(shortfall)} tidak dijurnal.'
+                    )
+                elif cogs_amount == 0:
+                    legset.warnings.append(
+                        f'HPP nol: {item.name} diambil dari batch tanpa nilai '
+                        '(stok masuk tanpa pembelian).'
+                    )
                 if cogs_amount > 0:
                     cogs_pair(cogs_amount,
                               f'Invoice {inv_no} – FIFO deduction: {item.name}',

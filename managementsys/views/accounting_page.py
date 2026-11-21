@@ -2482,7 +2482,13 @@ class JournalPreviewView(APIView):
 #: An entry an operator would want to look at twice. Kept in one place so the
 #: per-day `flagged` count and the ?only_warnings= list filter can never drift
 #: apart — a day badged "3 perlu diperiksa" must return exactly those 3.
-NEEDS_REVIEW = Q(is_balanced=False) | Q(has_estimate=True) | ~Q(warnings=[])
+#:
+#: `has_estimate` is deliberately NOT here. Every sale of a physical item has a
+#: FIFO-estimated COGS that commit recomputes, so flagging it flagged nearly
+#: every invoice and buried the real problems. What is worth a second look —
+#: stock shortfalls, zero-cost batches — arrives as an explicit warning from
+#: build_invoice_legs.
+NEEDS_REVIEW = Q(is_balanced=False) | ~Q(warnings=[])
 
 
 def _draft_day_counts(draft):
@@ -2550,8 +2556,8 @@ class JournalPreviewEntriesView(APIView):
         if q:
             qs = qs.filter(Q(memo__icontains=q) | Q(source_label__icontains=q))
         if only_warn:
-            # An entry that does not balance, one whose account does not exist
-            # yet, or one carrying a FIFO estimate that may move at commit.
+            # An entry that does not balance, or one carrying a warning (an
+            # account still to be created, a stock shortfall, a zero-cost draw).
             qs = qs.filter(NEEDS_REVIEW).distinct()
 
         try:
@@ -2586,9 +2592,71 @@ class JournalPreviewEntryDetailView(APIView):
         )
         if entry is None:
             return Response({'error': 'Entri tidak ditemukan.'}, status=status.HTTP_404_NOT_FOUND)
-        payload = StagedJournalEntryDetailSerializer(entry).data
-        payload['batch'] = JournalStagingBatchSerializer(entry.batch).data
-        return Response(payload)
+        return Response(_staged_entry_payload(entry))
+
+
+def _staged_entry_payload(entry):
+    entry = (
+        StagedJournalEntry.objects
+        .filter(pk=entry.pk)
+        .select_related('batch')
+        .prefetch_related('lines__account', 'lines__created_by')
+        .get()
+    )
+    payload = StagedJournalEntryDetailSerializer(entry).data
+    payload['batch'] = JournalStagingBatchSerializer(entry.batch).data
+    return payload
+
+
+class JournalPreviewAdjustmentView(APIView):
+    """
+    POST   /api/accounting/journal/preview/entries/<pk>/adjustments/
+           Body: { lines: [{account, entry_type, amount, description}] }
+    DELETE /api/accounting/journal/preview/entries/<pk>/adjustments/<group>/
+
+    Lets the reviewer correct a staged entry before it reaches the ledger by
+    adding lines to it. The lines are validated exactly like a correction
+    journal's — at least two, positive amounts, no head accounts, and debits
+    equal to credits — so the entry stays balanced. They are stored as
+    ``origin='user'`` with their author and posted after the system lines at
+    commit. A set is removed whole, never line by line, for the same reason.
+
+    The system lines are not editable here. They are the document's own
+    accounting; if those are wrong, the document is what needs fixing.
+    """
+
+    def post(self, request, pk):
+        entry = StagedJournalEntry.objects.filter(pk=pk).first()
+        if entry is None:
+            return Response({'error': 'Entri tidak ditemukan.'}, status=status.HTTP_404_NOT_FOUND)
+
+        legset, errors = _parse_correction_lines(
+            request.data.get('lines') or [],
+            too_few='Penyesuaian butuh minimal dua baris — satu debit dan satu kredit.',
+        )
+        if errors:
+            return Response({'error': 'Baris penyesuaian tidak valid.', 'lines': errors},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            journal_preview.add_adjustment(entry, legset, _actor(request))
+        except journal_preview.DraftLockedError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
+
+        return Response(_staged_entry_payload(entry), status=status.HTTP_201_CREATED)
+
+    def delete(self, request, pk, group):
+        entry = StagedJournalEntry.objects.filter(pk=pk).first()
+        if entry is None:
+            return Response({'error': 'Entri tidak ditemukan.'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            removed = journal_preview.remove_adjustment(entry, group)
+        except journal_preview.DraftLockedError as exc:
+            return Response({'error': str(exc)}, status=status.HTTP_409_CONFLICT)
+        if not removed:
+            return Response({'error': 'Penyesuaian tidak ditemukan.'},
+                            status=status.HTTP_404_NOT_FOUND)
+        return Response(_staged_entry_payload(entry))
 
 
 class JournalPreviewCommitView(APIView):
@@ -2887,7 +2955,7 @@ def _entry_document(entry):
     return entry.invoice or entry.purchase_invoice or entry.expense or entry.transfer
 
 
-def _parse_correction_lines(raw):
+def _parse_correction_lines(raw, *, too_few='Jurnal koreksi butuh minimal dua baris.'):
     """Validate the operator's lines and turn them into a LegSet.
 
     Returns ``(legset, errors)``; ``errors`` maps line index → message and is
@@ -2900,7 +2968,7 @@ def _parse_correction_lines(raw):
     legset = LegSet()
 
     if len(raw) < 2:
-        return legset, {'_': 'Jurnal koreksi butuh minimal dua baris.'}
+        return legset, {'_': too_few}
 
     account_ids = []
     for i, row in enumerate(raw):
@@ -2939,7 +3007,9 @@ def _parse_correction_lines(raw):
             errors[i] = 'Keterangan baris wajib diisi.'
             continue
 
-        legset.add(account, entry_type, amount, description)
+        # Typed by the operator — tagged so the ledger can tell it apart from
+        # what the engine computed. The author is stamped by write_legs.
+        legset.add(account, entry_type, amount, description, origin='user')
 
     if errors:
         return legset, errors

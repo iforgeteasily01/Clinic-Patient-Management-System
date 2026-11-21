@@ -39,6 +39,20 @@ on the staging batch as a variance note and reported back to the operator. Those
 lines were flagged ``is_estimated`` in the preview, so the difference is never a
 surprise.
 
+OPERATOR ADJUSTMENTS
+====================
+While a draft is under review the operator can add lines to a staged entry —
+``add_adjustment``. They come in balanced sets (one ``adjustment_group`` per
+set), so the entry stays balanced however many are added or removed, and they
+are tagged ``origin='user'`` with their author. Commit rebuilds the system
+lines from the document as above and then appends the user lines verbatim:
+the engine's arithmetic and the operator's correction stay separate rows in
+the ledger, and either can be traced.
+
+Re-running the preview carries the adjustments over to the new draft for any
+document still in it (see ``_collect_adjustments``) — a stale document forces
+a re-preview, and that must not throw away the operator's work.
+
 TRANSACTION BOUNDARIES
 ======================
 Preview is disposable, so it runs in a single transaction and rolls back whole.
@@ -51,9 +65,11 @@ an outer atomic block — that would silently restore all-or-nothing behaviour.
 
 import datetime
 import hashlib
+import uuid
 from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import Sum
 from django.utils import timezone
 
 from ..models import (
@@ -347,6 +363,9 @@ def build_preview(actor, date_to, date_from=None):
     from ..views.inventory_page import FifoSimulation
 
     purge_expired_drafts()
+    # Read before discarding: the operator's adjustments on the old draft are
+    # re-attached to the same documents in the new one.
+    carried = _collect_adjustments(open_draft())
     discard_open_drafts()
 
     by_date = _gather_events(date_to, date_from)
@@ -364,7 +383,7 @@ def build_preview(actor, date_to, date_from=None):
         yield {'type': 'start', 'staging_batch_id': batch.id,
                'date_from': date_from.isoformat() if date_from else None,
                'date_to': date_to.isoformat(), 'total': 0, 'days': []}
-        yield _preview_done(batch)
+        yield _preview_done(batch, dropped=_dropped_labels(carried))
         return
 
     # The window the operator asked for wins over where the documents happen to
@@ -391,7 +410,7 @@ def build_preview(actor, date_to, date_from=None):
             for index, day in enumerate(days):
                 events = by_date.get(day, [])
                 for sequence, (kind, obj) in enumerate(events):
-                    _stage_entry(batch, day, sequence, kind, obj, sim, totals)
+                    _stage_entry(batch, day, sequence, kind, obj, sim, totals, carried)
                 yield {
                     'type': 'day', 'index': index, 'date': day.isoformat(),
                     'documents': len(events),
@@ -413,25 +432,36 @@ def build_preview(actor, date_to, date_from=None):
         return
 
     batch.refresh_from_db()
-    yield _preview_done(batch)
+    yield _preview_done(batch, dropped=_dropped_labels(carried))
 
 
-def _stage_entry(batch, day, sequence, kind, obj, sim, totals):
+def _stage_entry(batch, day, sequence, kind, obj, sim, totals, carried=None):
     """Compute one document's legs and persist them as a staged entry."""
     legset = build_legs_for(kind, obj, deduct=False, sim=sim)
     if not legset.legs:
         return
 
-    debit = legset.total_debit
-    credit = legset.total_credit
     has_estimate = any(l.is_estimated for l in legset.legs)
 
     warnings = list(legset.warnings)
-    if debit != credit:
-        warnings.append(f'Tidak seimbang: debit {debit} vs kredit {credit}.')
+    if legset.total_debit != legset.total_credit:
+        warnings.append(f'Tidak seimbang: debit {legset.total_debit} '
+                        f'vs kredit {legset.total_credit}.')
     for leg in legset.legs:
         if leg.account is None and leg.pending_account_label:
             warnings.append(f'Akun "{leg.pending_account_label}" akan dibuat saat pencatatan.')
+
+    fingerprint = fingerprint_document(kind, obj)
+    previous = (carried or {}).pop((kind, obj.pk), None)
+    user_lines = previous['lines'] if previous else []
+    if previous and previous['fingerprint'] != fingerprint:
+        warnings.append('Baris penyesuaian dibawa dari draf sebelumnya, tetapi dokumen '
+                        'sudah berubah sejak itu — periksa apakah masih tepat.')
+
+    debit = legset.total_debit + sum(
+        (l['amount'] for l in user_lines if l['entry_type'] == 'debit'), Decimal('0'))
+    credit = legset.total_credit + sum(
+        (l['amount'] for l in user_lines if l['entry_type'] == 'credit'), Decimal('0'))
 
     entry = StagedJournalEntry.objects.create(
         batch=batch,
@@ -446,8 +476,9 @@ def _stage_entry(batch, day, sequence, kind, obj, sim, totals):
         total_credit=credit,
         is_balanced=(debit == credit),
         has_estimate=has_estimate,
+        has_adjustment=bool(user_lines),
         warnings=warnings,
-        source_fingerprint=fingerprint_document(kind, obj),
+        source_fingerprint=fingerprint,
     )
 
     StagedJournalLine.objects.bulk_create([
@@ -462,6 +493,9 @@ def _stage_entry(batch, day, sequence, kind, obj, sim, totals):
             sequence=i,
         )
         for i, leg in enumerate(legset.legs)
+    ] + [
+        StagedJournalLine(entry=entry, sequence=len(legset.legs) + i, **line)
+        for i, line in enumerate(user_lines)
     ], batch_size=500)
 
     totals['debit'] += debit
@@ -469,8 +503,13 @@ def _stage_entry(batch, day, sequence, kind, obj, sim, totals):
     totals['entries'] += 1
 
 
-def _preview_done(batch):
+def _preview_done(batch, dropped=()):
     return {
+        # Documents that carried operator adjustments on the previous draft but
+        # are not in this one (posted meanwhile, or outside the new window).
+        # The old draft is kept as 'discarded', so nothing is unrecoverable,
+        # but the operator has to be told.
+        'adjustments_dropped': list(dropped),
         'type': 'done',
         'staging_batch_id': batch.id,
         'status': batch.status,
@@ -482,6 +521,129 @@ def _preview_done(batch):
         'total_credit': str(batch.total_credit),
         'expires_at': batch.expires_at.isoformat(),
     }
+
+
+# ── Operator adjustments ──────────────────────────────────────────────────────
+
+class DraftLockedError(Exception):
+    """The draft can no longer be edited (committing, committed, expired…)."""
+
+
+def _lock_open_batch(batch_id):
+    """Lock the draft row for the rest of the transaction and confirm it is still
+    editable. Commit claims a draft with a conditional UPDATE on this same row,
+    so holding the lock means a commit cannot start halfway through an edit and
+    post an entry with only some of its new lines."""
+    batch = JournalStagingBatch.objects.select_for_update().get(pk=batch_id)
+    if batch.status != 'draft':
+        raise DraftLockedError(f'Draf berstatus "{batch.status}" dan tidak bisa diubah.')
+    if batch.expires_at <= timezone.now():
+        raise DraftLockedError('Draf sudah kedaluwarsa. Jalankan pratinjau ulang.')
+    return batch
+
+
+def _refresh_totals(entry, batch):
+    """Recompute an entry's totals from its lines, then the draft's from its
+    entries. Cheap, and never drifts the way incremental arithmetic can."""
+    sums = {row['entry_type']: row['total']
+            for row in entry.lines.values('entry_type').annotate(total=Sum('amount'))}
+    entry.total_debit = sums.get('debit') or Decimal('0')
+    entry.total_credit = sums.get('credit') or Decimal('0')
+    entry.is_balanced = entry.total_debit == entry.total_credit
+    entry.has_adjustment = entry.lines.filter(origin='user').exists()
+    entry.save(update_fields=['total_debit', 'total_credit', 'is_balanced', 'has_adjustment'])
+
+    agg = batch.entries.aggregate(d=Sum('total_debit'), c=Sum('total_credit'))
+    batch.total_debit = agg['d'] or Decimal('0')
+    batch.total_credit = agg['c'] or Decimal('0')
+    # Working on a draft keeps it alive: a review that takes longer than a day
+    # must not lose the adjustments made along the way.
+    batch.expires_at = timezone.now() + DRAFT_TTL
+    batch.save(update_fields=['total_debit', 'total_credit', 'expires_at'])
+
+
+def add_adjustment(entry, legset, actor):
+    """Attach a balanced set of operator lines to a staged entry.
+
+    ``legset`` must already be validated (accounts postable, amounts positive,
+    debits == credits) — the view does that with the same parser the
+    correction journal uses. Returns the new set's ``adjustment_group``.
+    """
+    if not legset.is_balanced or len(legset.legs) < 2:
+        raise ValueError('Baris penyesuaian harus seimbang dan minimal dua baris.')
+
+    with transaction.atomic():
+        batch = _lock_open_batch(entry.batch_id)
+        group = uuid.uuid4()
+        last = entry.lines.order_by('-sequence').values_list('sequence', flat=True).first()
+        start = (last if last is not None else -1) + 1
+        now = timezone.now()
+        StagedJournalLine.objects.bulk_create([
+            StagedJournalLine(
+                entry=entry,
+                account=leg.account,
+                entry_type=leg.entry_type,
+                amount=leg.amount,
+                description=leg.description[:255],
+                sequence=start + i,
+                origin='user',
+                created_by=actor,
+                adjustment_group=group,
+                created_at=now,
+            )
+            for i, leg in enumerate(legset.legs)
+        ])
+        _refresh_totals(entry, batch)
+    return group
+
+
+def remove_adjustment(entry, group):
+    """Remove one whole adjustment set. Returns the number of lines removed.
+
+    Only user lines can go — a system line is the document's own accounting
+    and the only way to change it is to change the document.
+    """
+    with transaction.atomic():
+        batch = _lock_open_batch(entry.batch_id)
+        removed, _ = entry.lines.filter(origin='user', adjustment_group=group).delete()
+        if removed:
+            _refresh_totals(entry, batch)
+    return removed
+
+
+def _collect_adjustments(draft):
+    """The operator lines on ``draft``, keyed by source document, ready to be
+    re-created on a new draft. Empty when there is no draft."""
+    if draft is None:
+        return {}
+    out = {}
+    lines = (StagedJournalLine.objects
+             .filter(entry__batch=draft, origin='user')
+             .select_related('entry')
+             .order_by('entry_id', 'sequence', 'id'))
+    for line in lines:
+        e = line.entry
+        bucket = out.setdefault((e.source_model, e.source_id), {
+            'fingerprint': e.source_fingerprint,
+            'label': e.source_label,
+            'lines': [],
+        })
+        bucket['lines'].append({
+            'account_id': line.account_id,
+            'entry_type': line.entry_type,
+            'amount': line.amount,
+            'description': line.description,
+            'origin': 'user',
+            'created_by_id': line.created_by_id,
+            'adjustment_group': line.adjustment_group,
+            'created_at': line.created_at,
+        })
+    return out
+
+
+def _dropped_labels(carried):
+    """Whatever ``_stage_entry`` did not claim from ``carried``."""
+    return [v['label'] for v in (carried or {}).values()]
 
 
 # ── Phase 2: commit ───────────────────────────────────────────────────────────
@@ -697,6 +859,12 @@ def _commit_entry(staged_entry, entry_number, journal_batch, actor):
     # documents this is identical to the staged lines; for invoices it is the
     # only way to get FIFO right.
     legset = build_legs_for(kind, obj, deduct=True)
+
+    # The operator's adjustment lines ride along unchanged, after the system
+    # lines. Each set was balanced when it was added, so the entry still is.
+    for line in staged_entry.lines.filter(origin='user').select_related('account', 'created_by'):
+        legset.add(line.account, line.entry_type, line.amount, line.description,
+                   origin='user', created_by=line.created_by)
 
     entry = write_legs(
         legset,

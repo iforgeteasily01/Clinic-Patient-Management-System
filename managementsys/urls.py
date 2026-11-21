@@ -197,6 +197,8 @@ urlpatterns = [
     # Reports
     path('api/reports/dashboard/', views.DashboardReportView.as_view(), name='reports-dashboard'),
     path('api/reports/sales/', views.SalesRangeReportView.as_view(), name='reports-sales'),
+    path('api/reports/sales/invoices/', views.SalesInvoiceListView.as_view(), name='reports-sales-invoices'),
+    path('api/reports/sales/export/', views.SalesReportExportView.as_view(), name='reports-sales-export'),
     path('api/reports/sales-items/', views.SalesItemsBreakdownView.as_view(), name='reports-sales-items'),
     path('api/reports/generate/', views.GenerateReportView.as_view(), name='reports-generate'),
     path('api/reports/stock-movement/', views.StockMovementReportView.as_view(), name='reports-stock-movement'),
@@ -313,6 +315,8 @@ urlpatterns = [
     path('api/accounting/journal/preview/',                views.JournalPreviewView.as_view(),            name='accounting-journal-preview'),
     path('api/accounting/journal/preview/entries/',        views.JournalPreviewEntriesView.as_view(),     name='accounting-journal-preview-entries'),
     path('api/accounting/journal/preview/entries/<int:pk>/', views.JournalPreviewEntryDetailView.as_view(), name='accounting-journal-preview-entry'),
+    path('api/accounting/journal/preview/entries/<int:pk>/adjustments/', views.JournalPreviewAdjustmentView.as_view(), name='accounting-journal-preview-adjustments'),
+    path('api/accounting/journal/preview/entries/<int:pk>/adjustments/<uuid:group>/', views.JournalPreviewAdjustmentView.as_view(), name='accounting-journal-preview-adjustment'),
     path('api/accounting/journal/preview/commit/',         views.JournalPreviewCommitView.as_view(),      name='accounting-journal-preview-commit'),
     path('api/accounting/journal/preview/discard/',        views.JournalPreviewDiscardView.as_view(),     name='accounting-journal-preview-discard'),
     # Posted journal entries (headers) + correction journals.

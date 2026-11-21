@@ -967,6 +967,19 @@ class LedgerEntry(models.Model):
     # would be both slow and wrong for manual entries. Null means group-wide —
     # a legitimate state for a shared overhead entry, not a missing value.
     branch           = models.ForeignKey('Branch', on_delete=models.PROTECT, null=True, blank=True, related_name='ledger_entries')
+
+    # Who authored this line's content — not shown anywhere, kept so a question
+    # like "did a person type this figure?" has an answer later.
+    #   system — computed by the engine from a document (sales, purchases, the
+    #            auto-generated half of a correction, memo reversals…)
+    #   user   — typed by a person: manual journals, the replacement half of a
+    #            correction, adjustment lines added to a staged journal entry.
+    # ``created_by`` is the person whose action wrote the row: the author of a
+    # user line, or whoever ran the commit for a system line. Null on legacy
+    # rows and on paths with no request behind them (scripts, migrations).
+    ORIGIN_CHOICES = [('system', 'System'), ('user', 'User')]
+    origin           = models.CharField(max_length=6, choices=ORIGIN_CHOICES, default='system', db_index=True)
+    created_by       = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='ledger_lines_created')
     created_at       = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -2481,6 +2494,9 @@ class StagedJournalEntry(models.Model):
     # True when any line is FIFO-derived. Those amounts are recomputed at commit
     # (stock can move between preview and commit), so the UI must label them.
     has_estimate = models.BooleanField(default=False)
+    # True once an operator has added adjustment lines to this entry. Those
+    # lines are posted alongside the rebuilt system lines at commit.
+    has_adjustment = models.BooleanField(default=False)
     warnings     = models.JSONField(default=list, blank=True)
 
     # SHA-256 over the source document's identity/totals/updated_at. Re-checked
@@ -2513,6 +2529,15 @@ class StagedJournalLine(models.Model):
     description  = models.CharField(max_length=255)
     is_estimated = models.BooleanField(default=False)
     sequence     = models.IntegerField(default=0)
+
+    # Same meaning as on LedgerEntry. System lines are rebuilt from the source
+    # document at commit; user lines are posted as written, after them.
+    origin       = models.CharField(max_length=6, choices=LedgerEntry.ORIGIN_CHOICES, default='system')
+    created_by   = models.ForeignKey('AppUser', on_delete=models.SET_NULL, null=True, blank=True, related_name='staged_journal_lines')
+    # User lines are added — and removed — as a balanced set. Every line of one
+    # set shares this id, so removing one can never leave the entry lopsided.
+    adjustment_group = models.UUIDField(null=True, blank=True, db_index=True)
+    created_at   = models.DateTimeField(default=timezone.now)
 
     class Meta:
         ordering = ['sequence', 'id']

@@ -253,6 +253,7 @@ class ManualJournalCreateView(APIView):
                 line['entry_type'],
                 line['amount'],
                 line['description'] or memo,
+                origin='user',
             )
 
         try:

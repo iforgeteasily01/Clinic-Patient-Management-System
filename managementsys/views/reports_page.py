@@ -8,7 +8,7 @@ import openpyxl
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from django.db.models import Count, DecimalField, F, Sum, Value
+from django.db.models import Count, DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse
 from django.utils import timezone
@@ -43,6 +43,7 @@ from ..models import (
     SiteConfig,
     StockOutLog,
 )
+from ..services import sales_report
 from ..services.branches import filter_by_branch
 
 _JAKARTA = ZoneInfo('Asia/Jakarta')
@@ -218,55 +219,34 @@ class DashboardReportView(APIView):
 class SalesRangeReportView(APIView):
     """
     GET /api/reports/sales/?start=YYYY-MM-DD&end=YYYY-MM-DD
-    Total sales and breakdown per cash (payment) account over an inclusive date
-    range. Defaults to the current month-to-date in Jakarta time.
+
+    Sales over an inclusive date range (a single date is ``start == end``):
+    the total, the per-payment-method split, and one row per calendar day.
+    Returns are reported beside sales (``returns_total`` / ``net_total``),
+    never subtracted from ``total``. Defaults to month-to-date in Jakarta time.
+    Scoping rules live in ``services/sales_report.py``.
     """
 
     def get(self, request):
-        today = timezone.now().astimezone(_JAKARTA).date()
-
-        def parse(param, default):
-            raw = request.query_params.get(param, '').strip()
-            if not raw:
-                return default, None
-            try:
-                return datetime.date.fromisoformat(raw), None
-            except ValueError:
-                return None, f'Tanggal {param} tidak valid. Gunakan format YYYY-MM-DD.'
-
-        start, err = parse('start', today.replace(day=1))
-        if err:
-            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
-        end, err = parse('end', today)
+        start, end, err = _parse_report_range(request)
         if err:
             return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
 
-        if start > end:
-            return Response(
-                {'error': 'Tanggal mulai tidak boleh setelah tanggal akhir.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # `datetime` is stored in UTC; bound the range by Jakarta-local midnights
-        # so a day belongs to the range the clinic actually worked it.
-        range_start = datetime.datetime(start.year, start.month, start.day, tzinfo=_JAKARTA)
-        range_end = datetime.datetime(end.year, end.month, end.day, tzinfo=_JAKARTA) + datetime.timedelta(days=1)
-
-        invoices = filter_by_branch(
-            Invoice.objects.filter(
-                datetime__gte=range_start, datetime__lt=range_end, is_voided=False,
-            ),
-            request,
-        )
-        agg = invoices.aggregate(total=Sum('grand_total'), count=Count('id'))
-
-        breakdown = payment_method_breakdown(invoices)
+        invoices = sales_report.sales_invoices(request, start, end)
+        returns = sales_report.sales_returns(request, start, end)
+        totals = sales_report.range_totals(invoices, returns)
 
         return Response({
             'start': str(start),
             'end': str(end),
-            'total': str(agg['total'] or 0),
-            'invoice_count': agg['count'] or 0,
+            'total': str(totals['total']),
+            'invoice_count': totals['invoice_count'],
+            'discount': str(totals['discount']),
+            'tax': str(totals['tax']),
+            'additional_charges': str(totals['additional_charges']),
+            'returns_total': str(totals['returns_total']),
+            'returns_count': totals['returns_count'],
+            'net_total': str(totals['net_total']),
             'by_account': [
                 {
                     'account_id': r['payment_method_id'],
@@ -275,9 +255,233 @@ class SalesRangeReportView(APIView):
                     'total': str(r['total'] or 0),
                     'invoice_count': r['invoice_count'],
                 }
-                for r in breakdown
+                for r in payment_method_breakdown(invoices)
+            ],
+            'by_day': [
+                {
+                    **row,
+                    'date': str(row['date']),
+                    **{k: str(row[k]) for k in ('total', 'discount', 'tax', 'returns_total', 'net_total')},
+                }
+                for row in sales_report.daily_breakdown(invoices, returns, start, end)
             ],
         })
+
+
+_POSTING_LABELS = {
+    'unposted': 'Belum dijurnal',
+    'posted':   'Sudah dijurnal',
+    'excluded': 'Dicatat manual',
+}
+
+
+class SalesInvoiceListView(APIView):
+    """
+    GET /api/reports/sales/invoices/?start=&end=&q=&page=&page_size=
+
+    The invoices behind ``/api/reports/sales/``'s total, oldest first, paged
+    server-side (default 50, max 500). Same scope as the summary by
+    construction — both read ``services/sales_report.sales_invoices``. ``q``
+    narrows by invoice number, patient number or patient name.
+    """
+
+    def get(self, request):
+        start, end, err = _parse_report_range(request)
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+
+        qs = sales_report.sales_invoices(request, start, end)
+        q = request.query_params.get('q', '').strip()
+        if q:
+            qs = qs.filter(
+                Q(invoice_number__icontains=q)
+                | Q(patient_no__patient_no__icontains=q)
+                | Q(patient_no__name__icontains=q)
+            )
+        qs = qs.order_by('datetime', 'id')
+
+        try:
+            page = max(int(request.query_params.get('page', 1)), 1)
+            page_size = min(max(int(request.query_params.get('page_size', 50)), 1), 500)
+        except ValueError:
+            return Response({'error': 'page dan page_size harus angka.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        count = qs.count()
+        offset = (page - 1) * page_size
+        rows = sales_report.invoice_rows(qs[offset:offset + page_size])
+
+        return Response({
+            'start': str(start),
+            'end': str(end),
+            'count': count,
+            'page': page,
+            'page_size': page_size,
+            'total_pages': max((count + page_size - 1) // page_size, 1),
+            'results': [
+                {
+                    **r,
+                    'date': str(r['date']),
+                    'discount': str(r['discount']),
+                    'tax': str(r['tax']),
+                    'grand_total': str(r['grand_total']),
+                    'posting_label': _POSTING_LABELS.get(r['posting_status'], r['posting_status']),
+                }
+                for r in rows
+            ],
+        })
+
+
+def _num(v):
+    """Decimal -> float for openpyxl; ints stay ints."""
+    return float(v) if isinstance(v, Decimal) else v
+
+
+def _money_format(ws, first_row, last_row, cols):
+    for r in range(first_row, last_row):
+        for c in cols:
+            ws.cell(r, c).number_format = '#,##0'
+
+
+class SalesReportExportView(APIView):
+    """
+    GET /api/reports/sales/export/?start=YYYY-MM-DD&end=YYYY-MM-DD
+
+    The sales report as a workbook: Ringkasan, Per Hari, Faktur, Per Item.
+
+    Authenticated and branch-scoped like the JSON — unlike GenerateReportView,
+    which is AllowAny because it is opened as a bare link. The page downloads
+    this through ``apiFetch`` as a blob instead, so the token and the
+    ``X-Branch-Id`` header both travel with it.
+    """
+    content_negotiation_class = IgnoreFormatQueryNegotiation
+
+    def get(self, request):
+        start, end, err = _parse_report_range(request)
+        if err:
+            return Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
+
+        invoices = sales_report.sales_invoices(request, start, end)
+        returns = sales_report.sales_returns(request, start, end)
+        totals = sales_report.range_totals(invoices, returns)
+        period = (
+            start.strftime('%d/%m/%Y') if start == end
+            else f'{start.strftime("%d/%m/%Y")} - {end.strftime("%d/%m/%Y")}'
+        )
+
+        wb = openpyxl.Workbook()
+
+        # ── Ringkasan ──
+        ws = wb.active
+        ws.title = 'Ringkasan'
+        ws.sheet_view.showGridLines = False
+        row, _ = _write_banner(ws, 'Laporan Penjualan', period, 4)
+        summary = [
+            ['Total Penjualan', _num(totals['total'])],
+            ['Jumlah Faktur', totals['invoice_count']],
+            ['Total Diskon', _num(totals['discount'])],
+            ['Total Pajak', _num(totals['tax'])],
+            ['Biaya Tambahan', _num(totals['additional_charges'])],
+            [f'Retur ({totals["returns_count"]} dokumen)', _num(totals['returns_total'])],
+            ['Penjualan Bersih (setelah retur)', _num(totals['net_total'])],
+        ]
+        first = row
+        for line in summary:
+            row = _write_data_row(ws, row, line)
+            ws.cell(row - 1, 1).font = Font(bold=True)
+        for r in range(first, row):
+            if r != first + 1:  # the invoice count is a count, not money
+                ws.cell(r, 2).number_format = '#,##0'
+        row += 1
+        method_cols = ['Metode Pembayaran', 'No. Akun', 'Jml. Faktur', 'Total']
+        row = _write_table_header(ws, row, method_cols)
+        method_rows = [
+            [r['method'], r['account_number'] or '', r['invoice_count'], _num(r['total'] or 0)]
+            for r in payment_method_breakdown(invoices)
+        ]
+        first = row
+        for line in method_rows:
+            row = _write_data_row(ws, row, line)
+        _money_format(ws, first, row, [4])
+        _autosize(ws, method_cols, summary + method_rows)
+
+        # ── Per Hari ──
+        ws = wb.create_sheet('Per Hari')
+        ws.sheet_view.showGridLines = False
+        day_cols = ['Tanggal', 'Hari', 'Jml. Faktur', 'Diskon', 'Pajak',
+                    'Penjualan', 'Retur', 'Bersih']
+        row, _ = _write_banner(ws, 'Laporan Penjualan Per Hari', period, len(day_cols))
+        row = _write_table_header(ws, row, day_cols)
+        day_rows = [
+            [d['date'].strftime('%d/%m/%Y'), d['weekday'], d['invoice_count'],
+             _num(d['discount']), _num(d['tax']), _num(d['total']),
+             _num(d['returns_total']), _num(d['net_total'])]
+            for d in sales_report.daily_breakdown(invoices, returns, start, end)
+        ]
+        first = row
+        for line in day_rows:
+            row = _write_data_row(ws, row, line)
+        total_row = ['TOTAL', '', totals['invoice_count'], _num(totals['discount']),
+                     _num(totals['tax']), _num(totals['total']),
+                     _num(totals['returns_total']), _num(totals['net_total'])]
+        row = _write_data_row(ws, row, total_row)
+        for c in range(1, len(day_cols) + 1):
+            ws.cell(row - 1, c).font = Font(bold=True)
+        _money_format(ws, first, row, [4, 5, 6, 7, 8])
+        _autosize(ws, day_cols, day_rows + [total_row])
+
+        # ── Faktur ──
+        ws = wb.create_sheet('Faktur')
+        ws.sheet_view.showGridLines = False
+        inv_cols = ['No. Faktur', 'Tanggal', 'Jam', 'No. Pasien', 'Nama Pasien',
+                    'Kasir', 'Pembayaran', 'Diskon', 'Pajak', 'Total', 'Status Jurnal']
+        row, _ = _write_banner(ws, 'Daftar Faktur Penjualan', period, len(inv_cols))
+        row = _write_table_header(ws, row, inv_cols)
+        inv_rows = [
+            [r['invoice_number'], r['date'].strftime('%d/%m/%Y'), r['time'],
+             r['patient_no'], r['patient_name'], r['cashier'], r['payment'],
+             _num(r['discount']), _num(r['tax']), _num(r['grand_total']),
+             _POSTING_LABELS.get(r['posting_status'], r['posting_status'])]
+            for r in sales_report.invoice_rows(invoices.order_by('datetime', 'id'))
+        ]
+        first = row
+        for line in inv_rows:
+            row = _write_data_row(ws, row, line)
+        _money_format(ws, first, row, [8, 9, 10])
+        _autosize(ws, inv_cols, inv_rows)
+
+        # ── Per Item ──
+        ws = wb.create_sheet('Per Item')
+        ws.sheet_view.showGridLines = False
+        lo, hi = sales_report.jakarta_bounds(start, end)
+        lines = filter_by_branch(
+            InvoiceItem.objects
+            .select_related('item', 'item__item_category', 'invoice')
+            .filter(invoice__datetime__gte=lo, invoice__datetime__lt=hi,
+                    invoice__is_voided=False),
+            request, field='invoice__branch',
+        )
+        items = _build_sales_by_item(start, end, lines=lines)
+        row, _ = _write_banner(ws, 'Penjualan Per Item Per Jenis', period, len(_SALES_COLUMNS))
+        row = _write_table_header(ws, row, _SALES_COLUMNS)
+        first = row
+        for line in items['rows']:
+            row = _write_data_row(ws, row, line)
+        _money_format(ws, first, row, [6])
+        _autosize(ws, _SALES_COLUMNS, items['rows'])
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        filename = (
+            f'laporan_penjualan_{start}.xlsx' if start == end
+            else f'laporan_penjualan_{start}_{end}.xlsx'
+        )
+        response = HttpResponse(
+            buf.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
 
 
 _ID_MONTHS = [
@@ -596,19 +800,23 @@ def _build_purchases(start, end):
     return {'kind': 'grouped', 'line_columns': _PURCHASE_LINE_COLUMNS, 'groups': groups}
 
 
-def _build_sales_by_item(start, end):
-    range_start = datetime.datetime(start.year, start.month, start.day, tzinfo=_JAKARTA)
-    range_end = datetime.datetime(end.year, end.month, end.day, tzinfo=_JAKARTA) + datetime.timedelta(days=1)
-
-    items = (
-        InvoiceItem.objects
-        .select_related('item', 'item__item_category', 'invoice')
-        .filter(
-            invoice__datetime__gte=range_start,
-            invoice__datetime__lt=range_end,
-            invoice__is_voided=False,
+def _build_sales_by_item(start, end, lines=None):
+    """``lines`` lets a caller pass an already branch-scoped InvoiceItem queryset
+    (the sales export does); GenerateReportView passes none and keeps its
+    original, unscoped behaviour."""
+    if lines is None:
+        range_start = datetime.datetime(start.year, start.month, start.day, tzinfo=_JAKARTA)
+        range_end = datetime.datetime(end.year, end.month, end.day, tzinfo=_JAKARTA) + datetime.timedelta(days=1)
+        lines = (
+            InvoiceItem.objects
+            .select_related('item', 'item__item_category', 'invoice')
+            .filter(
+                invoice__datetime__gte=range_start,
+                invoice__datetime__lt=range_end,
+                invoice__is_voided=False,
+            )
         )
-    )
+    items = lines
 
     agg = {}
     for ii in items:

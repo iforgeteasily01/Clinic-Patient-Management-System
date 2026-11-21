@@ -1160,12 +1160,13 @@ class StagedJournalLineSerializer(serializers.ModelSerializer):
     account_number = serializers.IntegerField(source='account.account_number', read_only=True, allow_null=True)
     account_name   = serializers.CharField(source='account.name', read_only=True, allow_null=True)
     account_type   = serializers.CharField(source='account.account_type', read_only=True, allow_null=True)
+    created_by_name = serializers.CharField(source='created_by.display_name', read_only=True, allow_null=True)
 
     class Meta:
         model = StagedJournalLine
         fields = ['id', 'account_id', 'account_number', 'account_name', 'account_type',
                   'pending_account_label', 'description', 'entry_type', 'amount',
-                  'is_estimated']
+                  'is_estimated', 'origin', 'adjustment_group', 'created_by_name']
 
 
 class StagedJournalEntryListSerializer(serializers.ModelSerializer):
@@ -1173,7 +1174,7 @@ class StagedJournalEntryListSerializer(serializers.ModelSerializer):
         model = StagedJournalEntry
         fields = ['id', 'date', 'source_type', 'source_model', 'source_id', 'source_label',
                   'memo', 'total_debit', 'total_credit', 'is_balanced', 'has_estimate',
-                  'warnings']
+                  'has_adjustment', 'warnings']
 
 
 class StagedJournalEntryDetailSerializer(StagedJournalEntryListSerializer):
