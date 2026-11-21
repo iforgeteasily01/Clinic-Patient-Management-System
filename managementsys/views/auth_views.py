@@ -165,8 +165,6 @@ class LogoutView(APIView):
                     entity_id=str(user.id),
                     description=f'{user.display_name} logged out',
                 )
-                # Token is kept alive so other clients (e.g. the cashier app) that
-                # saved the same token are not suddenly de-authenticated.
             except AppUser.DoesNotExist:
                 pass
         return Response({"ok": True})

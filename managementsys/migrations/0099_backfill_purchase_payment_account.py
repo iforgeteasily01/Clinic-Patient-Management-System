@@ -1,10 +1,3 @@
-"""Backfill the new COA payment_account from the legacy PaymentMethod link.
-
-Purchases used to name a PaymentMethod and reach its ``linked_account`` at
-posting time. The account is now stored directly, so every existing purchase
-invoice and payment gets the account its method resolved to. Rows whose method
-is null (unpaid invoices) stay null — they have no payment account yet.
-"""
 from django.db import migrations
 
 
@@ -22,12 +15,10 @@ def forwards(apps, schema_editor):
 
 
 def backwards(apps, schema_editor):
-    # payment_method was never cleared, so there is nothing to restore.
     pass
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0098_purchase_payment_account'),
     ]

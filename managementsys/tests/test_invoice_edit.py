@@ -1,10 +1,3 @@
-"""Integration tests for editing an invoice: PUT /api/invoices/<pk>/.
-
-An edit reverses the invoice's original stock + ledger postings and re-posts the
-new lines. The invariant these tests defend is that reverse-then-repost is
-value-neutral: create -> edit -> void must leave every account balance and every
-batch exactly where it started.
-"""
 import datetime
 from decimal import Decimal
 
@@ -22,12 +15,6 @@ from .factories import InventoryBatchFactory, InventoryItemFactory
 
 
 def _run_journal(auth_api, through=None):
-    """Phase 2: creation is deferred (posting_status='unposted', zero
-    LedgerEntry rows, stock untouched) until this runs. A subsequent void/edit
-    of a *posted* invoice then takes the same-day memo path, which does
-    perform the real FIFO restock/deduct immediately (only the ledger rows are
-    memo-dated) — these edit/void tests need that, so they sweep first,
-    mirroring how the app is actually used."""
     date_to = (through or datetime.date.today()).isoformat()
     res = auth_api.post(reverse("accounting-journal-run"), {"date_to": date_to}, format="json")
     assert res.status_code == 200, res.content
@@ -58,7 +45,6 @@ def _batches():
 
 @pytest.fixture
 def sold_invoice(auth_api, stock, gl_accounts):
-    """An invoice selling 2 units @ 10000 out of the 100-unit batch."""
     res = auth_api.post(
         reverse("invoice-create"),
         _create_payload(stock, gl_accounts, quantity=2, price=10000, grand_total=20000),
@@ -72,7 +58,6 @@ def sold_invoice(auth_api, stock, gl_accounts):
 @pytest.mark.django_db
 class TestInvoiceEditItems:
     def test_quantity_change_restocks_old_and_deducts_new(self, auth_api, stock, gl_accounts, sold_invoice):
-        # 100 - 2 = 98 after the sale; editing to 5 should land at 95, not 93.
         assert InventoryBatch.objects.get(pk=stock["batch"].pk).quantity_remaining == Decimal("98.0000")
 
         res = auth_api.put(
@@ -85,7 +70,6 @@ class TestInvoiceEditItems:
         assert res.status_code == 200, res.content
 
         assert InventoryBatch.objects.get(pk=stock["batch"].pk).quantity_remaining == Decimal("95.0000")
-        # Cash reflects the new total only — the old 20000 was reversed.
         gl_accounts["cash"].refresh_from_db()
         assert gl_accounts["cash"].balance == Decimal("50000")
         gl_accounts["revenue"].refresh_from_db()
@@ -106,7 +90,6 @@ class TestInvoiceEditItems:
         )
         assert res.status_code == 200, res.content
 
-        # Original item fully restored, new item deducted.
         assert InventoryBatch.objects.get(pk=stock["batch"].pk).quantity_remaining == Decimal("100.0000")
         assert InventoryBatch.objects.get(pk=other_batch.pk).quantity_remaining == Decimal("98.0000")
         assert InvoiceItem.objects.get(invoice=sold_invoice).item_id == other.id
@@ -187,9 +170,6 @@ class TestReversalIsValueNeutral:
 
 @pytest.mark.django_db
 class TestPackageReversal:
-    """Editing lines reverses this invoice's package sales and re-applies them.
-    An edit is refused when that would cascade away another invoice's redemption."""
-
     @pytest.fixture
     def bundle(self, stock, gl_accounts):
         patient = Patient.objects.create(name="Ana")
@@ -200,7 +180,7 @@ class TestPackageReversal:
             code="PKG5", name="Laser x5", price=Decimal("450000"),
         )
         TreatmentPackageItem.objects.create(package=package, treatment=treatment, sessions=5)
-        package.save()  # re-save so the catalog mirror picks up the items
+        package.save()
         package.refresh_from_db()
         return {"patient": patient, "treatment": treatment, "package": package}
 
@@ -230,7 +210,6 @@ class TestPackageReversal:
             format="json",
         )
         assert res.status_code == 200, res.content
-        # Two entitlements, not three: the original sale was reversed first.
         assert PatientPackage.objects.filter(purchased_invoice=invoice).count() == 2
 
     def test_removing_the_package_line_revokes_the_entitlement(self, auth_api, stock, gl_accounts, bundle):
@@ -250,7 +229,6 @@ class TestPackageReversal:
         invoice = self._sell_package(auth_api, stock, gl_accounts, bundle)
         pp = PatientPackage.objects.get(purchased_invoice=invoice)
 
-        # A later, separate invoice burns a session from that package.
         other_invoice = Invoice.objects.create(
             datetime=timezone.now(), grand_total=Decimal("0"), patient_no=bundle["patient"],
         )
@@ -268,7 +246,6 @@ class TestPackageReversal:
         assert res.status_code == 400, res.content
         assert "redeemed" in str(res.content)
 
-        # Nothing moved: entitlement, redemption and the invoice all intact.
         assert PatientPackage.objects.filter(pk=pp.pk).exists()
         assert PatientPackageRedemption.objects.count() == 1
         invoice.refresh_from_db()

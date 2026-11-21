@@ -3,13 +3,11 @@ import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0054_patient_optional_fields'),
     ]
 
     operations = [
-        # PurchaseInvoice: add invoice-level warehouse
         migrations.AddField(
             model_name='purchaseinvoice',
             name='warehouse',
@@ -22,7 +20,6 @@ class Migration(migrations.Migration):
             ),
         ),
 
-        # PurchaseInvoiceItem: per-item discount and final actual unit cost
         migrations.AddField(
             model_name='purchaseinvoiceitem',
             name='total_discount',
@@ -34,7 +31,6 @@ class Migration(migrations.Migration):
             field=models.DecimalField(decimal_places=4, default=0, max_digits=14),
         ),
 
-        # New model: PurchaseAdditionalCost
         migrations.CreateModel(
             name='PurchaseAdditionalCost',
             fields=[

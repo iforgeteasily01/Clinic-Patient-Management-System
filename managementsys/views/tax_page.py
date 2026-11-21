@@ -1,17 +1,3 @@
-"""
-Taxation endpoints, all under /api/accounting/tax/.
-
-    meta/          vocabulary the rule builder needs (accounts, choices)
-    rules/         list + create tax rules
-    rules/<pk>/    read, update, delete one rule
-    compute/       evaluate every active rule for a period
-
-Rules are built as data on /accounting/tax and evaluated against the
-LedgerEntry journal by services/tax_engine.py. This module deliberately writes
-nothing to the ledger: a computed tax is a report, and posting it would need
-the preview -> review -> commit discipline the journal run already has.
-"""
-
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
@@ -22,15 +8,9 @@ from rest_framework.views import APIView
 from ..models import ChartOfAccounts, TaxRule, TaxRuleBracket, TaxRuleComponent
 from .financial_reports_page import _parse_range, _unposted_gate, _s
 
-# services.tax_engine reads financial_reports_utils, which lives *under* this
-# views package — importing it here at module scope closes the loop
-# views/__init__ -> views.py -> tax_page -> tax_engine -> views/__init__ while
-# the package is still initialising. Deferred into the one view that needs it.
 
 ZERO = Decimal('0')
 
-
-# ── serialisation ────────────────────────────────────────────────────────────
 
 def _component_json(c):
     return {
@@ -88,8 +68,6 @@ def _rules_qs():
         'components__account', 'components__source_rule', 'brackets')
 
 
-# ── input coercion ───────────────────────────────────────────────────────────
-
 def _dec(value, field, default=ZERO):
     if value in (None, ''):
         return default
@@ -100,12 +78,6 @@ def _dec(value, field, default=ZERO):
 
 
 def _write_children(rule, data):
-    """Replace a rule's components and brackets from the payload.
-
-    Children are replaced wholesale rather than diffed: they carry no history
-    worth preserving, and a partial diff is how an editor ends up with an
-    orphaned component silently inflating a tax base.
-    """
     if 'components' in data:
         rule.components.all().delete()
         for i, raw in enumerate(data.get('components') or []):
@@ -170,15 +142,7 @@ def _write_rule(rule, data, *, creating):
             setattr(rule, field, data.get(field) or None)
 
 
-# ── views ────────────────────────────────────────────────────────────────────
-
 class TaxMetaView(APIView):
-    """GET /api/accounting/tax/meta/
-
-    Everything the builder needs to render its dropdowns without hardcoding a
-    second copy of the model's choices in the frontend.
-    """
-
     def get(self, request):
         accounts = [
             {
@@ -208,8 +172,6 @@ class TaxMetaView(APIView):
 
 
 class TaxRuleListCreateView(APIView):
-    """GET/POST /api/accounting/tax/rules/"""
-
     def get(self, request):
         return Response([_rule_json(r) for r in _rules_qs()])
 
@@ -227,8 +189,6 @@ class TaxRuleListCreateView(APIView):
 
 
 class TaxRuleDetailView(APIView):
-    """GET/PATCH/DELETE /api/accounting/tax/rules/<pk>/"""
-
     def get(self, request, pk):
         try:
             return Response(_rule_json(_rules_qs().get(pk=pk)))
@@ -257,8 +217,6 @@ class TaxRuleDetailView(APIView):
         except TaxRule.DoesNotExist:
             return Response({'error': 'Aturan tidak ditemukan.'},
                             status=status.HTTP_404_NOT_FOUND)
-        # PROTECT on the referencing FKs would raise a database error here;
-        # naming the dependants is more use than a 500.
         dependants = list(
             rule.referenced_by.select_related('rule').values_list('rule__name', flat=True))
         if dependants:
@@ -270,13 +228,6 @@ class TaxRuleDetailView(APIView):
 
 
 class TaxComputeView(APIView):
-    """GET /api/accounting/tax/compute/?date_from=&date_to=
-
-    Sits behind the same unposted-days gate as the financial reports: a tax
-    computed over a period the journal has not swept would read low, and would
-    look authoritative doing it.
-    """
-
     def get(self, request):
         d_from, d_to, err = _parse_range(request)
         if err:
@@ -301,7 +252,6 @@ class TaxComputeView(APIView):
 
 
 def _result_json(r):
-    """Stringify the Decimals in an engine result for JSON."""
     return {
         **r,
         'gross_base': _s(r['gross_base']),

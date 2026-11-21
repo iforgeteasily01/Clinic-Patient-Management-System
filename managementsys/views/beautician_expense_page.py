@@ -1,14 +1,3 @@
-"""GET/POST endpoints the beautician petty-cash flow uses (design doc §4).
-
-A beautician never picks a GL account: they pick a friendly ``ExpenseAlias``
-name, and this view resolves it to the real account behind the scenes. The
-actual write goes through ``services.alias_expense.create_alias_expense`` and
-from there ``services.expense_create.create_expense`` — the exact function the
-manager-facing expense form uses — so there is exactly one way an ``Expense``
-gets written in this system, not two that could drift apart. The admin
-quick-purchase form (``views/admin_quick_expense_page.py``) shares the same
-service with scope='general'.
-"""
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -24,8 +13,6 @@ def _actor(request):
 
 
 class BeauticianExpenseAliasListView(APIView):
-    """GET /api/beautician/expense-aliases/ — active, scope='beautician' aliases."""
-
     def get(self, request):
         aliases = (
             ExpenseAlias.objects
@@ -36,17 +23,6 @@ class BeauticianExpenseAliasListView(APIView):
 
 
 class BeauticianExpenseListCreateView(APIView):
-    """
-    GET  /api/beautician/expenses/  ?date_from=&date_to=&page=&page_size=
-         Scoped to source='beautician'. A `beautician` role sees only its own
-         rows (``created_by=request.user``); `manager`/`superuser` see all —
-         they are the ones curating/auditing the list.
-
-    POST /api/beautician/expenses/
-         { expense_date, payment_account_id, payment_memo?, notes?,
-           items: [{alias_id, amount, description?}] }
-    """
-
     def get(self, request):
         qs = (
             Expense.objects
@@ -98,8 +74,6 @@ class BeauticianExpenseListCreateView(APIView):
                 scope='beautician',
                 source='beautician',
                 actor=_actor(request),
-                # Petty cash is spent at the clinic the beautician works at, so
-                # this is locked like the rest of the floor-staff flows.
                 branch=write_branch(request, locked=True),
             )
         except AliasExpenseError as exc:
@@ -108,8 +82,6 @@ class BeauticianExpenseListCreateView(APIView):
 
 
 class BeauticianExpenseDetailView(APIView):
-    """GET /api/beautician/expenses/<pk>/ — same ownership scoping as the list."""
-
     def get(self, request, pk):
         try:
             expense = (
@@ -124,8 +96,6 @@ class BeauticianExpenseDetailView(APIView):
 
         actor = _actor(request)
         if actor is not None and actor.role == 'beautician' and expense.created_by_id != actor.id:
-            # Not "Forbidden" — a beautician probing other ids should not be
-            # able to distinguish "not yours" from "does not exist".
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
 
         return Response(ExpenseSerializer(expense).data)

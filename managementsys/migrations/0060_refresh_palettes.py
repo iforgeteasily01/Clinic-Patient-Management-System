@@ -1,7 +1,6 @@
 from django.db import migrations
 
 NEW_PALETTES = [
-    # name, primary, secondary, background, is_dark, sort_order
     ('Sky',      '#0ea5e9', '#8b5cf6', '#f0f9ff', False, 0),
     ('Sage',     '#059669', '#0891b2', '#ecfdf5', False, 1),
     ('Rose',     '#e11d48', '#f97316', '#fff1f2', False, 2),
@@ -30,7 +29,6 @@ def replace_palettes(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0059_colorpalette'),
     ]

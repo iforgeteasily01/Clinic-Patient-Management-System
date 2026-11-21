@@ -45,7 +45,6 @@ class ClockInView(APIView):
                         datetime.combine(today, schedule.shift.expected_start)
                         + timedelta(minutes=15)
                     )
-                    # Make threshold timezone-aware
                     threshold = timezone.make_aware(threshold) if timezone.is_naive(threshold) else threshold
                     record.status = 'late' if now > threshold else 'present'
                 else:

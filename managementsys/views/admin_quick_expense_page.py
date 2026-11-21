@@ -1,16 +1,3 @@
-"""The admin module's simplified purchasing form.
-
-Same shape as the beautician petty-cash flow, one scope up: the operator picks
-``ExpenseAlias`` names with ``scope='general'`` instead of touching a GL
-account, and the write goes through ``services.alias_expense`` into the one
-``create_expense`` path everything else uses. The rows it produces are ordinary
-``Expense`` records with ``source='general'`` — indistinguishable on
-/accounting/expenses from ones typed into the full form, which is the point.
-
-What this deliberately cannot do: raise a payable. Anything the clinic owes a
-named supplier belongs on /accounting/purchases, where per-vendor AP lives.
-This form records money that has already left a cash or bank account.
-"""
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -33,8 +20,6 @@ def _is_manager(request):
 
 
 class QuickExpenseAliasListView(APIView):
-    """GET /api/admin/quick-expenses/aliases/ — active, scope='general' aliases."""
-
     def get(self, request):
         aliases = (
             ExpenseAlias.objects
@@ -45,21 +30,6 @@ class QuickExpenseAliasListView(APIView):
 
 
 class QuickExpenseListCreateView(APIView):
-    """
-    GET  /api/admin/quick-expenses/ ?date_from=&date_to=&limit=
-         Recent general expenses, newest first — the confirmation list under
-         the form. Not paginated: it exists to show "did that save?", and the
-         full history with filters is /accounting/expenses.
-
-    POST /api/admin/quick-expenses/
-         { expense_date, payment_account_id, payment_memo?, notes?,
-           items: [{alias_id, amount, description?}] }
-
-    Reuses ``BeauticianExpenseCreateSerializer`` — the request body is the same
-    contract, and a second identical serializer would only be a second thing to
-    keep in sync.
-    """
-
     def get(self, request):
         qs = (
             Expense.objects

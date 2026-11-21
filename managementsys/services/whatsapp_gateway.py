@@ -1,32 +1,3 @@
-"""Thin HTTP client for an OpenWA gateway (github.com/rmyndharis/OpenWA).
-
-OpenWA is a self-hosted WhatsApp API gateway running as a **separate Node
-service** next to Django, default port 2785. Django never talks to WhatsApp; it
-talks to that gateway, and the gateway owns the paired phone session.
-
-Why hand-rolled instead of the official `rmyndharis-openwa` SDK: the whole
-surface used here is six endpoints, and `urllib` is already how this project
-does outbound HTTP (see vercel_push.py). One dependency-free module also means
-a gateway that is down or misconfigured can never break `manage.py migrate`.
-
-Route map (OpenWA prefixes everything with /api):
-
-    GET    /api/health                                    liveness
-    POST   /api/sessions                                  {name, config?}
-    GET    /api/sessions                                  list
-    GET    /api/sessions/{id}                             status
-    POST   /api/sessions/{id}/start                       begin pairing
-    POST   /api/sessions/{id}/logout                      unpair the phone
-    GET    /api/sessions/{id}/qr                          QR payload to scan
-    POST   /api/sessions/{id}/messages/send-text          {chatId, text}
-    POST   /api/sessions/{id}/messages/send-bulk          {messages[], options}
-    GET    /api/sessions/{id}/messages/batch/{batchId}    batch progress
-    POST   /api/sessions/{id}/messages/batch/{id}/cancel  stop mid-batch
-
-Every call raises ``GatewayError`` on failure rather than returning a sentinel.
-The views catch it and turn it into a 502 with the gateway's own message, so an
-operator sees "session not ready" rather than a blank 500.
-"""
 from __future__ import annotations
 
 import json
@@ -38,50 +9,24 @@ import urllib.request
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 15
-# Sending a batch of 100 asks the gateway to enqueue, not to deliver, so it
-# returns quickly — but it does more work than a status poll.
 SEND_TIMEOUT = 60
 
-# OpenWA caps a single bulk request at 100 messages (ArrayMaxSize(100) on
-# SendBulkMessageDto). Larger audiences are split into consecutive batches.
 BULK_MAX = 100
 
-# Gateway-enforced bounds on the inter-message delay. Mirrored here so a bad
-# settings value is rejected by us with a clear message instead of by the
-# gateway with a validation dump.
 DELAY_MIN_MS = 1000
 DELAY_MAX_MS = 60000
 
-# Session states that mean "paired and able to send". Anything else — qr_ready,
-# initializing, disconnected, action_required, failed — is not sendable.
 READY_STATES = {'ready'}
 
 
 class GatewayError(Exception):
-    """A call to the OpenWA gateway failed.
-
-    ``status`` is the HTTP status when there was one, and None for a transport
-    failure (gateway down, DNS, timeout) — the settings page renders those two
-    cases differently because they need different fixes.
-    """
-
     def __init__(self, message, *, status=None, payload=None):
         super().__init__(message)
         self.status = status
         self.payload = payload or {}
 
 
-# ── Phone number handling ──────────────────────────────────────────────────
-
 def normalize_phone(raw):
-    """Indonesian mobile number -> E.164 digits, or None if it cannot be one.
-
-    Accepts the four forms the clinic's data actually contains: ``08123456789``,
-    ``628123456789``, ``+62 812-3456-789`` and ``8123456789``. Anything that
-    does not resolve to a plausible Indonesian mobile returns None and the
-    caller skips that patient — guessing wrong here sends a patient's
-    appointment details to a stranger.
-    """
     if not raw:
         return None
     digits = re.sub(r'\D', '', str(raw))
@@ -95,7 +40,6 @@ def normalize_phone(raw):
     else:
         national = digits
 
-    # Indonesian mobile numbers start with 8 and run 9-13 digits nationally.
     if not national.startswith('8'):
         return None
     if not (9 <= len(national) <= 13):
@@ -104,12 +48,9 @@ def normalize_phone(raw):
 
 
 def to_chat_id(raw):
-    """Phone number -> OpenWA chat id (``628123456789@c.us``), or None."""
     phone = normalize_phone(raw)
     return f'{phone}@c.us' if phone else None
 
-
-# ── Client ─────────────────────────────────────────────────────────────────
 
 class OpenWAClient:
     def __init__(self, base_url, api_key, *, timeout=DEFAULT_TIMEOUT):
@@ -117,7 +58,6 @@ class OpenWAClient:
         self.api_key = api_key or ''
         self.timeout = timeout
 
-    # -- transport ---------------------------------------------------------
 
     def _request(self, method, path, body=None, *, timeout=None):
         if not self.base_url:
@@ -143,8 +83,6 @@ class OpenWAClient:
                 payload = json.loads(raw)
             except Exception:
                 payload = {}
-            # Nest's error envelope is {statusCode, message, error}; `message`
-            # can be a string or an array of validation strings.
             detail = payload.get('message') or payload.get('error') or raw or exc.reason
             if isinstance(detail, list):
                 detail = '; '.join(str(d) for d in detail)
@@ -161,15 +99,12 @@ class OpenWAClient:
                 'periksa apakah alamat menunjuk ke OpenWA.'
             ) from exc
 
-    # -- health & sessions -------------------------------------------------
 
     def health(self):
         return self._request('GET', '/api/health')
 
     def list_sessions(self):
         data = self._request('GET', '/api/sessions')
-        # The list endpoint is paginated in some versions and a bare array in
-        # others; both are unwrapped to a plain list here.
         if isinstance(data, dict):
             return data.get('data') or data.get('sessions') or data.get('items') or []
         return data or []
@@ -181,9 +116,6 @@ class OpenWAClient:
         return self._request('GET', f'/api/sessions/{session_id}')
 
     def start_session(self, session_id):
-        # Starting launches Chromium and waits for WhatsApp's socket, which the
-        # gateway itself times out at ~30s. Give it room past that so a slow
-        # start surfaces as the gateway's error, not ours.
         return self._request('POST', f'/api/sessions/{session_id}/start', timeout=45)
 
     def stop_session(self, session_id):
@@ -195,7 +127,6 @@ class OpenWAClient:
     def get_qr(self, session_id):
         return self._request('GET', f'/api/sessions/{session_id}/qr')
 
-    # -- messaging ---------------------------------------------------------
 
     def send_text(self, session_id, chat_id, text):
         return self._request(
@@ -204,7 +135,6 @@ class OpenWAClient:
         )
 
     def send_bulk(self, session_id, messages, *, delay_ms, randomize, batch_id=None):
-        """``messages`` is a list of {chatId, text}; at most BULK_MAX per call."""
         payload = {
             'messages': [
                 {'chatId': m['chatId'], 'type': 'text', 'content': {'text': m['text']}}
@@ -213,9 +143,6 @@ class OpenWAClient:
             'options': {
                 'delayBetweenMessages': max(DELAY_MIN_MS, min(DELAY_MAX_MS, int(delay_ms))),
                 'randomizeDelay': bool(randomize),
-                # Never stop the whole run because one number is not on
-                # WhatsApp — that is the single most common failure, and
-                # halting would silently drop everyone after it.
                 'stopOnError': False,
             },
         }

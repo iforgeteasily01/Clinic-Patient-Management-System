@@ -11,13 +11,6 @@ from ..models import AppUser, Patient, PatientCRMProfile, Promotion, PromotionUs
 
 
 def validate_promotion(code, patient, subtotal):
-    """
-    Returns (Promotion, discount_amount, None) on success,
-    or (None, Decimal('0'), error_string) on failure.
-
-    patient  — Patient instance or None
-    subtotal — Decimal
-    """
     zero = Decimal('0')
 
     try:
@@ -274,8 +267,6 @@ class PromotionValidateView(APIView):
             'error': None,
         })
 
-
-# ── Internal helper ────────────────────────────────────────────────────────
 
 def _serialize_promotion(p, *, usage_count):
     return {

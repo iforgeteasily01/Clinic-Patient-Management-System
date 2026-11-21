@@ -1,15 +1,3 @@
-"""Shared pytest fixtures.
-
-Covers:
-  * an unauthenticated and an authenticated DRF APIClient
-  * the chart-of-accounts skeleton the POS endpoint needs (cash payment method +
-    the system fallback revenue/COGS/inventory accounts)
-  * a ready-to-sell stock setup
-
-The module also points the secondary ``external`` database at the same test DB
-as ``default`` so the test runner does not try to create/connect to a separate
-``test_ipos`` database (the app never writes to it in these tests).
-"""
 from decimal import Decimal
 
 import pytest
@@ -25,21 +13,16 @@ from .factories import (
     WarehouseFactory,
 )
 
-# Mirror the external DB onto default so no second test database is provisioned.
 settings.DATABASES["external"]["TEST"] = {"MIRROR": "default"}
 
 
-# ── Clients ────────────────────────────────────────────────────────────────────
-
 @pytest.fixture
 def api():
-    """Anonymous DRF client."""
     return APIClient()
 
 
 @pytest.fixture
 def auth_user(db):
-    """A logged-in AppUser carrying a valid bearer token."""
     user = AppUserFactory(pin="654321")
     user.generate_token()
     return user
@@ -47,24 +30,12 @@ def auth_user(db):
 
 @pytest.fixture
 def auth_api(api, auth_user):
-    """DRF client pre-loaded with auth_user's bearer token."""
     api.credentials(HTTP_AUTHORIZATION=f"Bearer {auth_user.auth_token}")
     return api
 
 
-# ── Accounting / inventory scaffolding ──────────────────────────────────────────
-
 @pytest.fixture
 def gl_accounts(db):
-    """Create the GL accounts the invoice posting logic relies on.
-
-    Returns a dict with the cash payment account and the system fallbacks
-    (4200000 revenue, 5100000 COGS, 1300000 inventory asset) referenced by
-    ``_post_accounting`` when an item has no item_category, plus the accounts the
-    non-line parts of an invoice post to (4100000 discount, 2200000 tax,
-    7100000 additional charges) — without those an invoice carrying a discount,
-    tax or a surcharge cannot balance.
-    """
     cash_head = ChartOfAccountsFactory(
         account_number=1100000, name="Cash & Equivalents",
         account_type="asset", is_head=True,
@@ -91,15 +62,10 @@ def gl_accounts(db):
     additional_charges = ChartOfAccountsFactory(
         account_number=7100000, name="Additional Charges", account_type="other_income",
     )
-    # A second real cash location, so tests that move money between two cash
-    # accounts (transfers) have a valid counterparty. ``undeposited`` cannot
-    # serve: migration 0100 retired 1100011 out of the cash set.
     bank = ChartOfAccountsFactory(
         account_number=1102000, name="Bank BCA",
         account_type="asset", is_head=False, parent=cash_head,
     )
-    # The retired clearing account (migration 0076, renamed and retired by 0100).
-    # Only legacy rows point at it; it must never be offered as a cash account.
     legacy_clearing = ChartOfAccountsFactory(
         account_number=1100011, name="Kas Penjualan iPos (histori)",
         account_type="asset", is_head=False, parent=cash_head,
@@ -107,8 +73,6 @@ def gl_accounts(db):
     opening_equity = ChartOfAccountsFactory(
         account_number=3900000, name="Opening Balance Equity", account_type="equity",
     )
-    # PaymentMethod rows — what invoice/purchase-invoice creation actually points
-    # at now that "how the customer paid" is decoupled from the GL account.
     cash_method = PaymentMethodFactory(name="Cash", linked_account=cash)
     legacy_clearing_method = PaymentMethodFactory(
         name="Kas Penjualan iPos (histori)", linked_account=legacy_clearing,
@@ -132,7 +96,6 @@ def gl_accounts(db):
 
 @pytest.fixture
 def stock(db):
-    """A warehouse holding 100 units of one item at 5000/unit COGS."""
     warehouse = WarehouseFactory()
     item = InventoryItemFactory(selling_price=10000)
     batch = InventoryBatchFactory(

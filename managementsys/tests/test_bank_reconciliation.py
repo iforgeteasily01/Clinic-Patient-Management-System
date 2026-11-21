@@ -1,18 +1,3 @@
-"""Bank reconciliation: matching, the arithmetic, and the clearing stamp.
-
-Three properties these tests exist to defend:
-
-  * **Auto-matching never guesses between distinguishable records.** One
-    statement line with two candidate book rows is left unmatched: those rows
-    are different real transactions, and picking one misattributes the
-    clearing. The reverse — two identical statement lines and one book row — is
-    not the same situation and is handled differently; see
-    ``test_one_book_row_clears_only_one_of_two_identical_lines``.
-  * **A transaction is cleared once.** Completing a period stamps its ledger
-    rows, and the next period must not offer them again.
-  * **A reconciliation that does not balance cannot be closed.** A closed
-    reconciliation with a difference looks finished, so nobody returns to it.
-"""
 import datetime
 import io
 from decimal import Decimal
@@ -34,7 +19,6 @@ JAN = datetime.date(2026, 1, 1)
 
 @pytest.fixture
 def bank(db):
-    """A real cash/bank account — inside the 11xxxxx band, so it is selectable."""
     head = ChartOfAccountsFactory(account_number=1100000, name='Kas & Bank',
                                   account_type='asset', is_head=True)
     return ChartOfAccountsFactory(account_number=1100200, name='Bank BCA',
@@ -42,7 +26,6 @@ def bank(db):
 
 
 def _entry(bank, day, amount, description='', entry_type=None):
-    """One ledger row on the bank account. Positive amount = money in."""
     signed_in = amount > 0
     return LedgerEntry.objects.create(
         account=bank,
@@ -74,8 +57,6 @@ def _line(rec, day, amount, description=''):
     )
 
 
-# ── Sign normalisation ────────────────────────────────────────────────────────
-
 def test_a_debit_on_an_asset_account_is_money_in(bank):
     entry = _entry(bank, 1, D('500000'))
     assert recon.signed_amount(entry) == D('500000')
@@ -85,8 +66,6 @@ def test_a_credit_on_an_asset_account_is_money_out(bank):
     entry = _entry(bank, 1, D('-250000'))
     assert recon.signed_amount(entry) == D('-250000')
 
-
-# ── Auto-matching ─────────────────────────────────────────────────────────────
 
 def test_same_date_same_amount_matches(rec, bank):
     entry = _entry(bank, 3, D('500000'))
@@ -118,8 +97,6 @@ def test_beyond_the_window_the_amount_alone_is_not_enough(rec, bank):
 
 
 def test_two_identical_amounts_on_one_day_are_left_for_a_human(rec, bank):
-    """The load-bearing refusal. Pairing these arbitrarily would balance the
-    period against a transaction that may have happened once."""
     _entry(bank, 3, D('500000'), 'Setoran A')
     _entry(bank, 3, D('500000'), 'Setoran B')
     line = _line(rec, 3, '500000')
@@ -130,19 +107,6 @@ def test_two_identical_amounts_on_one_day_are_left_for_a_human(rec, bank):
 
 
 def test_one_book_row_clears_only_one_of_two_identical_lines(rec, bank):
-    """The mirror image of the test above, and deliberately not symmetric.
-
-    Two *book rows* competing for one statement line is refused, because those
-    rows are distinct records — 'Setoran A' and 'Setoran B' are different real
-    transactions and picking one misattributes the clearing.
-
-    Two identical *statement lines* competing for one book row is different:
-    the lines are indistinguishable from each other, so which one gets matched
-    carries no information. Matching one and leaving the other is the more
-    useful answer — it says "one Rp 500.000 deposit is missing from your books"
-    as a single unmatched line, instead of leaving three loose ends that mean
-    the same thing.
-    """
     _entry(bank, 3, D('500000'))
     _line(rec, 3, '500000')
     _line(rec, 3, '500000')
@@ -151,7 +115,6 @@ def test_one_book_row_clears_only_one_of_two_identical_lines(rec, bank):
 
     assert rec.lines.filter(ledger_entry__isnull=False).count() == 1
     assert rec.lines.filter(ledger_entry__isnull=True).count() == 1
-    # And the leftover is exactly the size of the discrepancy.
     assert recon.summary(rec)['unmatched_line_total'] == D('500000')
 
 
@@ -168,7 +131,6 @@ def test_exact_date_wins_over_a_nearby_one(rec, bank):
 
 
 def test_direction_matters_not_just_magnitude(rec, bank):
-    """A Rp 500.000 payment out must never match a Rp 500.000 deposit in."""
     _entry(bank, 3, D('-500000'), 'Pembayaran keluar')
     line = _line(rec, 3, '500000')
 
@@ -185,8 +147,6 @@ def test_an_ignored_line_is_not_auto_matched(rec, bank):
 
     assert recon.auto_match(rec) == 0
 
-
-# ── Manual matching ───────────────────────────────────────────────────────────
 
 def test_manual_match_can_force_what_the_matcher_refused(rec, bank):
     a = _entry(bank, 3, D('500000'), 'Setoran A')
@@ -237,8 +197,6 @@ def test_matching_is_refused_on_a_completed_reconciliation(rec, bank):
         recon.match_line(rec, line, other)
 
 
-# ── The arithmetic ────────────────────────────────────────────────────────────
-
 def test_a_clean_period_reports_no_difference(rec, bank):
     _entry(bank, 3, D('500000'))
     _entry(bank, 5, D('-200000'))
@@ -288,11 +246,9 @@ def test_a_cheque_that_has_not_cleared_shows_as_an_unmatched_book_entry(rec, ban
 
 
 def test_statement_drift_is_reported_separately_from_the_difference(rec, bank):
-    """An incomplete import is its own finding: chasing the main difference
-    before fixing it is wasted effort."""
     _line(rec, 3, '500000')
     rec.opening_balance = D('0')
-    rec.closing_balance = D('700000')   # the bank says more than the lines add to
+    rec.closing_balance = D('700000')
     rec.save()
 
     figures = recon.summary(rec)
@@ -317,8 +273,6 @@ def test_an_ignored_line_stops_counting_against_the_reconciliation(rec, bank):
 
     assert recon.summary(rec)['can_complete'] is True
 
-
-# ── Completing and clearing ───────────────────────────────────────────────────
 
 def test_completing_is_refused_while_a_difference_remains(rec, bank):
     _entry(bank, 3, D('500000'))
@@ -356,7 +310,6 @@ def test_a_cleared_row_is_not_offered_to_the_next_period(rec, bank):
     recon.auto_match(rec)
     recon.complete(rec, None)
 
-    # A second, overlapping period. The already-cleared row must not reappear.
     later = BankReconciliation.objects.create(
         account=bank,
         statement_start=JAN,
@@ -381,12 +334,10 @@ def test_reopening_releases_the_cleared_rows(rec, bank):
     rec.refresh_from_db()
     assert entry.reconciliation_id is None
     assert rec.status == 'draft'
-    # The matches survive, so the operator resumes rather than restarting.
     assert rec.lines.filter(ledger_entry__isnull=False).count() == 1
 
 
 def test_reconciliation_never_writes_to_the_ledger(rec, bank):
-    """The whole feature is an assertion about the books, not a posting path."""
     _entry(bank, 3, D('500000'))
     _line(rec, 3, '500000')
     rec.closing_balance = D('500000')
@@ -398,8 +349,6 @@ def test_reconciliation_never_writes_to_the_ledger(rec, bank):
 
     assert LedgerEntry.objects.count() == before
 
-
-# ── Statement import ──────────────────────────────────────────────────────────
 
 def _upload(text, name='statement.csv'):
     buf = io.BytesIO(text.encode('utf-8'))
@@ -448,7 +397,6 @@ def test_a_direction_column_signs_a_single_amount_column():
 
 
 def test_an_unsigned_amount_with_no_direction_is_refused_not_guessed():
-    """Guessing here silently reverses half a statement."""
     result = statement_import.parse(_upload(
         'Tanggal,Keterangan,Jumlah\n'
         '05/01/2026,Setoran,500000\n'
@@ -459,7 +407,6 @@ def test_an_unsigned_amount_with_no_direction_is_refused_not_guessed():
 
 
 def test_the_ambiguous_k_marker_is_refused():
-    """'K' is kredit in some exports and keluar in others."""
     result = statement_import.parse(_upload(
         'Tanggal,Keterangan,Jumlah,DK\n'
         '05/01/2026,Setoran,500000,K\n'
@@ -483,7 +430,6 @@ def test_preamble_rows_above_the_header_are_skipped():
 
 
 def test_rows_outside_the_period_are_flagged_not_dropped(rec):
-    """An operator who picked the wrong file finds out from the preview."""
     result = statement_import.parse(
         _upload('Tanggal,Keterangan,Debit,Kredit\n'
                 '05/01/2026,Dalam periode,,500000\n'
@@ -500,8 +446,6 @@ def test_a_file_with_no_recognisable_header_is_rejected_as_a_whole():
     with pytest.raises(statement_import.StatementParseError):
         statement_import.parse(_upload('foo,bar,baz\n1,2,3\n'))
 
-
-# ── API surface ───────────────────────────────────────────────────────────────
 
 def test_a_non_cash_account_cannot_be_reconciled(auth_api, bank, db):
     inventory = ChartOfAccountsFactory(account_number=1300000, name='Persediaan',

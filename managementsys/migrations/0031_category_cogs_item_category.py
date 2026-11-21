@@ -4,7 +4,6 @@ import django.db.models.deletion
 
 def seed_base_cogs_accounts(apps, schema_editor):
     ChartOfAccounts = apps.get_model('managementsys', 'ChartOfAccounts')
-    # Ensure the two base COGS system accounts exist (idempotent)
     for account_number, name in [
         (5100000, 'Cost of Products Sold'),
         (5200000, 'Treatment Supplies Consumed'),
@@ -16,13 +15,11 @@ def seed_base_cogs_accounts(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0030_appuser_theme_background_appuser_theme_primary_and_more'),
     ]
 
     operations = [
-        # Add cogs_account FK to TreatmentCategory
         migrations.AddField(
             model_name='treatmentcategory',
             name='cogs_account',
@@ -34,7 +31,6 @@ class Migration(migrations.Migration):
                 to='managementsys.chartofaccounts',
             ),
         ),
-        # Add item_category FK to InventoryItem
         migrations.AddField(
             model_name='inventoryitem',
             name='item_category',
@@ -46,6 +42,5 @@ class Migration(migrations.Migration):
                 to='managementsys.treatmentcategory',
             ),
         ),
-        # Ensure base COGS system accounts exist
         migrations.RunPython(seed_base_cogs_accounts, migrations.RunPython.noop),
     ]

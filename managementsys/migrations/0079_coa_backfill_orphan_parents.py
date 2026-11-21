@@ -1,6 +1,5 @@
 from django.db import migrations
 
-# Head account number per account type (seeded by 0037_coa_reseed_heads).
 TYPE_HEAD_NUMBER = {
     'asset':         1000000,
     'liability':     2000000,
@@ -14,12 +13,6 @@ TYPE_HEAD_NUMBER = {
 
 
 def forward(apps, schema_editor):
-    """File every parentless sub-account under its account type's head.
-
-    Per-category revenue/COGS/expense accounts were created without a parent,
-    so the Chart of Accounts page — which walks the tree from the heads down —
-    never displayed them.
-    """
     COA = apps.get_model('managementsys', 'ChartOfAccounts')
 
     heads = {
@@ -37,12 +30,10 @@ def forward(apps, schema_editor):
 
 
 def backward(apps, schema_editor):
-    # Non-destructive forward migration; nothing to undo safely.
     pass
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0078_fix_ipos_invoice_timezone'),
     ]

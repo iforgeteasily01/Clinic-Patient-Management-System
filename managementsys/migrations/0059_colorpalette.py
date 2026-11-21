@@ -34,7 +34,6 @@ def unseed_palettes(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0058_productionrecipe_productionrun_and_more'),
     ]

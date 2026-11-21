@@ -19,14 +19,6 @@ def _actor(request):
 
 
 def _release_beauticians(active_patient):
-    """
-    Frees every beautician tied to `active_patient` via a TreatmentSession,
-    unless that beautician is still holding a *different* patient at status 4
-    (in treatment). Call this on every path that ends a patient's involvement
-    in a session — completed, cancelled, dismissed, or bulk-cleared — not just
-    the "finish treatment" button, or the beautician is left marked busy with
-    nothing left to finish it. Also closes the visit's open BeauticianAssignment.
-    """
     beautician_assignment.release(active_patient)
 
 
@@ -34,7 +26,6 @@ class PatientSearchView(APIView):
     def get(self, request):
         qs = Patient.objects.all()
 
-        # Unified ?search=<value>&field=<name|patient_no|phone|address> format
         search = request.GET.get('search', '').strip()
         field = request.GET.get('field', '').strip()
         if search and field:
@@ -53,7 +44,6 @@ class PatientSearchView(APIView):
                     Q(phone_number__icontains=search)
                 )
         else:
-            # Legacy per-field params
             if no := request.GET.get('patient_no', '').strip():
                 qs = qs.filter(patient_no__icontains=no)
             if name := request.GET.get('name', '').strip():
@@ -102,9 +92,6 @@ class PatientCreateWithActiveView(APIView):
 
 class ActivePatientClearView(APIView):
     def delete(self, request):
-        # Scoped to the caller's own branch: clearing the queue is an end-of-day
-        # action at one clinic, and a group-wide wipe from one reception desk
-        # would delete another branch's live queue mid-shift.
         queue = filter_by_branch(
             ActivePatient.objects.all(), request, locked=True, include_null=False,
         )
@@ -318,7 +305,7 @@ class TreatmentSessionCreateView(APIView):
         treatment_list = Treatment.objects.filter(
             id__in=treatment_ids, active=True)
 
-        patient = active_patient.patient_no  # may be None for general appointments
+        patient = active_patient.patient_no
         branch = write_branch(request, locked=True)
         with transaction.atomic():
             session = TreatmentSession.objects.create(
@@ -329,8 +316,6 @@ class TreatmentSessionCreateView(APIView):
             )
             session.treatments.set(treatment_list)
 
-            # Same beautician again (adding treatments) is a no-op here; a
-            # different one is recorded as a hand-over.
             beautician_assignment.assign(
                 active_patient, beautician, actor=_actor(request), branch=branch,
             )
@@ -351,15 +336,6 @@ class TreatmentSessionCreateView(APIView):
 
 
 class BeauticianReassignView(APIView):
-    """
-    GET  /api/activepatients/<pk>/beautician/  — current beautician + hand-over history
-    POST /api/activepatients/<pk>/beautician/  — body {beautician, reason?}
-
-    Hands a visit that is in treatment (status 4) to another beautician. The
-    previous assignment is closed, not overwritten, and existing treatment
-    sessions keep the beautician who started them.
-    """
-
     def _payload(self, active_patient):
         rows = beautician_assignment.history(active_patient)
         current = next((a for a in reversed(rows) if a.ended_at is None), None)
@@ -461,12 +437,6 @@ class CompleteTreatmentView(APIView):
 
 
 class TreatmentRemoveView(APIView):
-    """
-    DELETE /api/treatment-session/<session_id>/treatment/<treatment_id>/
-    Removes one treatment from a session's M2M list.
-    Deletes the session entirely if it becomes empty.
-    """
-
     def delete(self, request, session_id, treatment_id):
         try:
             session = TreatmentSession.objects.get(id=session_id)
@@ -503,22 +473,11 @@ class TreatmentRemoveView(APIView):
 
 
 class PatientCountView(APIView):
-    """
-    GET /api/patients/count/
-    Returns the total number of patients. Lightweight — no data serialization.
-    """
-
     def get(self, request):
         return Response({'total': Patient.objects.count()})
 
 
 class PatientNextNoView(APIView):
-    """
-    GET /api/patients/next-no/?initial=J
-    Returns the projected next patient_no for the given name initial.
-    No DB write — preview only.
-    """
-
     def get(self, request):
         initial = request.GET.get('initial', '').strip().upper()
         if not initial or not initial.isalpha() or len(initial) != 1:
@@ -535,14 +494,6 @@ class PatientNextNoView(APIView):
 
 
 class PatientSyncView(APIView):
-    """
-    GET /api/patients/sync/?since=<ISO-8601>&page=<n>&page_size=<n>
-
-    Returns patients updated since the given timestamp, paginated.
-    Omit `since` for a full sync (first-time setup).
-    Default page_size=200, max=1000.
-    """
-
     def get(self, request):
         synced_at = timezone.now()
         since_raw = request.GET.get('since')

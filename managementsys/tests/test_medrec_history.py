@@ -1,10 +1,3 @@
-"""The medical-record archive: paging, sorting, and amending a finalized record.
-
-The amend path is the load-bearing half. A finalized MedRec is a signed
-clinical document, so the tests below pin three things: only a superuser or a
-doctor may change one, the change lands in ``AuditLog`` with its previous
-value, and a request that changes nothing writes no log row.
-"""
 import pytest
 from rest_framework.test import APIClient
 
@@ -25,7 +18,6 @@ def _patient(no, name):
 
 
 def _record(patient, date, **fields):
-    """A finalized MedRec dated ``date`` (``YYYY-MM-DD``)."""
     rec = MedRec(patient_no=patient, status=MedRec.FINALIZED, **fields)
     rec.save(visit_date=date)
     return rec
@@ -40,7 +32,6 @@ def _detail_url(medrec_id):
 
 @pytest.fixture
 def archive(db):
-    """Three finalized records across two patients, deliberately out of order."""
     zoe = _patient("Z00001", "Zoe Anggraini")
     adi = _patient("A00001", "Adi Pratama")
     return {
@@ -51,8 +42,6 @@ def archive(db):
         "adi": adi,
     }
 
-
-# ── Listing ────────────────────────────────────────────────────────────────────
 
 def test_blank_search_is_newest_first(archive):
     api, _ = _client("cashier")
@@ -84,7 +73,6 @@ def test_patient_name_sort(archive):
 
 
 def test_unknown_sort_key_falls_back_to_the_date(archive):
-    """A bad ``sort`` is ignored, not a 500 — the column list is a UI concern."""
     api, _ = _client("cashier")
     body = api.get(LIST_URL, {"sort": "'; DROP TABLE"}).json()
 
@@ -105,7 +93,6 @@ def test_paging_splits_the_result_set(archive):
 
 
 def test_page_past_the_end_clamps_to_the_last_page(archive):
-    """Filtering down to fewer pages while on page 9 must not answer nothing."""
     api, _ = _client("cashier")
     body = api.get(LIST_URL, {"page_size": 2, "page": 99}).json()
 
@@ -128,8 +115,6 @@ def test_drafts_are_excluded_unless_asked_for(archive):
     assert api.get(LIST_URL).json()["count"] == 3
     assert api.get(LIST_URL, {"include_drafts": "true"}).json()["count"] == 4
 
-
-# ── Amending ───────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("role", ["superuser", "doctor"])
 def test_editor_roles_may_amend(archive, role):
@@ -187,13 +172,12 @@ def test_amendment_is_logged_with_the_previous_value(archive):
 
     assert entry.action == "UPDATE"
     assert entry.performed_by_id == user.id
-    assert "Retinol nightly" in entry.description       # what it was
-    assert "Retinol alternate nights" in entry.description  # what it became
+    assert "Retinol nightly" in entry.description
+    assert "Retinol alternate nights" in entry.description
     assert "plan" in entry.description
 
 
 def test_a_no_op_patch_writes_no_log_row(archive):
-    """An audit trail full of non-edits makes the real ones harder to find."""
     record = _record(archive["adi"], "2026-08-23", plan="Retinol nightly")
     api, _ = _client("doctor")
 
@@ -208,7 +192,6 @@ def test_a_no_op_patch_writes_no_log_row(archive):
 
 
 def test_identity_fields_cannot_be_reassigned(archive):
-    """Only clinical content is editable — not whose chart this is."""
     record = archive["new"]
     doctor = Doctors.objects.create(doctor_name="Dr. Someone Else")
     api, _ = _client("superuser")

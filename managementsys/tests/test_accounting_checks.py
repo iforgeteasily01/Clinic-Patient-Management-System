@@ -1,13 +1,3 @@
-"""Guards on which invoices the ledger is expected to cover.
-
-``invoices_missing_from_ledger`` decides what ``repair_accounting_balance`` posts and
-what ``check_accounting_health`` fails on. Two exclusions in it are deliberate policy
-rather than convenience, and both are easy to undo by accident:
-
-* iPos-imported rows stay out even when dated after go-live — iPos ran alongside CPMS
-  until 2026-06-18 and those rows may duplicate CPMS-native sales.
-* wholly zero invoices are not "missing" — there is no entry to make for them.
-"""
 from datetime import date, datetime, timezone as dt_timezone
 from decimal import Decimal
 
@@ -46,7 +36,6 @@ class TestInvoicesMissingFromLedger:
         assert invoice not in invoices_missing_from_ledger()
 
     def test_excludes_ipos_imports_even_after_go_live(self):
-        """The parallel-run rows — the expensive mistake to make here."""
         invoice = _invoice("IPOS-4045/KSR/GD/0626")
         assert invoice not in invoices_missing_from_ledger()
         assert invoice in invoices_missing_from_ledger(include_imported=True)
@@ -59,7 +48,6 @@ class TestInvoicesMissingFromLedger:
         assert zero_lines not in missing
 
     def test_still_flags_an_invoice_discounted_to_zero(self):
-        """grand_total 0 with real lines needs Dr discount / Cr revenue."""
         invoice = _invoice("INV-20260620-4", total="0", lines=(("300000", "1"),))
         assert invoice in invoices_missing_from_ledger()
 
@@ -76,7 +64,6 @@ class TestInvoicesMissingFromLedger:
 @pytest.mark.django_db
 class TestNonReconcilingInvoices:
     def test_reports_a_line_total_that_disagrees_with_grand_total(self):
-        # 300,000 of lines charged as 240,000 — the WinUI discount_pct bug.
         _invoice("INV-20260620-6", total="240000", lines=(("300000", "1"),))
         found = non_reconciling_invoices()
         assert [gap for _inv, gap in found] == [Decimal("60000")]
@@ -93,7 +80,6 @@ class TestNonReconcilingInvoices:
 
 @pytest.mark.django_db
 def test_inventory_on_hand_prorates_partly_consumed_batches():
-    """``value`` is the batch total since migration 0074, not a unit cost."""
     warehouse = WarehouseFactory()
     item = InventoryItemFactory()
     InventoryBatchFactory(

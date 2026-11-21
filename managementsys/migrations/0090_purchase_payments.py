@@ -1,12 +1,3 @@
-"""Purchase payments become their own records.
-
-The payment method moves off PurchaseInvoice (where it was mandatory even for
-an unpaid credit purchase) and onto each settlement, which also carries the
-date it was paid. Existing invoices with amount_paid > 0 are backfilled with a
-single PurchasePayment row for what they had already paid, using the method
-that was recorded on the invoice and its purchase date.
-"""
-
 import django.db.models.deletion
 from django.db import migrations, models
 
@@ -33,7 +24,6 @@ def unbackfill_payments(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0089_unify_bank_accounts'),
     ]

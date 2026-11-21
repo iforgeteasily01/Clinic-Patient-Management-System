@@ -1,10 +1,3 @@
-"""Handing a patient in treatment over to another beautician.
-
-The load-bearing property: the hand-over is *recorded*, never overwritten.
-The queue shows the new beautician, the old assignment survives with an end
-time, and the sessions the first beautician started still name them (HR
-performance credits from those).
-"""
 from decimal import Decimal
 
 import pytest
@@ -56,12 +49,10 @@ def test_reassign_shows_new_beautician_and_keeps_history(auth_api, setup):
     assert body['history'][1]['ended_at'] is None
     assert body['history'][1]['reason'] == 'Ana pulang'
 
-    # What the treatment queue and /appointments render.
     row = ActivePatientSerializer(visit).data
     assert row['current_beautician_id'] == bela.pk
     assert row['current_beautician_name'] == 'Bela'
 
-    # The session Ana started is still hers.
     assert set(TreatmentSession.objects.filter(active_patient=visit)
                .values_list('beautician_id', flat=True)) == {ana.pk}
 
@@ -79,7 +70,6 @@ def test_adding_treatments_after_handover_credits_new_beautician(auth_api, setup
         'active_patient_id': visit.pk, 'beautician': bela.pk, 'treatment_ids': [facial.pk],
     }, format='json')
     assert res.status_code == 201
-    # Same beautician again is not a new hand-over.
     assert BeauticianAssignment.objects.filter(active_patient=visit).count() == 2
     assert list(TreatmentSession.objects.filter(active_patient=visit)
                 .order_by('id').values_list('beautician_id', flat=True)) == [ana.pk, bela.pk]

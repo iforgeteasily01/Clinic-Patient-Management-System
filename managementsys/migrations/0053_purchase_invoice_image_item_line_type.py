@@ -3,7 +3,6 @@ import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0052_treatmentcategory_show_to_beautician'),
     ]

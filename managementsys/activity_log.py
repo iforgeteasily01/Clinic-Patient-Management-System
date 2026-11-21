@@ -1,29 +1,3 @@
-"""Automatic activity logging for every mutating API request.
-
-Explicit ``AuditLog.objects.create()`` calls scattered through the views cover
-the flows somebody remembered to instrument. This middleware covers the rest:
-any ``POST`` / ``PUT`` / ``PATCH`` / ``DELETE`` under ``/api/`` writes one
-``AuditLog`` row with ``source='http'``, whether or not the view knows about it.
-Patient registration, invoicing, payments, check-ins — all of it lands here
-without a per-view edit.
-
-Three things this deliberately does *not* do:
-
-- **It never fails a request.** Every write is wrapped; a logging error is
-  swallowed to ``logger.exception`` and the response goes out untouched.
-- **It never stores credentials.** Request bodies are summarised, and any key
-  matching :data:`REDACT_KEYS` is replaced with ``'***'`` before it is stored.
-  File uploads are recorded by name and size only — never content.
-- **It does not read the response body.** Streaming responses would be consumed
-  by doing so. The created object's id is recovered from the ``Location``
-  header or the URL instead.
-
-The actor is read from ``request.user`` in the *response* phase, not the request
-phase: authentication is DRF's job and happens inside the view. DRF's
-``Request.user`` setter assigns through to the underlying ``HttpRequest``, so by
-the time the response comes back the ``AppUser`` is there.
-"""
-
 import json
 import logging
 import re
@@ -34,28 +8,22 @@ from django.utils.deprecation import MiddlewareMixin
 
 logger = logging.getLogger(__name__)
 
-# ── What gets logged ────────────────────────────────────────────────────────
 
 LOGGED_METHODS = {'POST', 'PUT', 'PATCH', 'DELETE'}
 
-#: Only paths under these prefixes are considered at all.
 INCLUDE_PREFIXES = ('/api/',)
 
-#: Paths that are noise or are already logged in richer form by the view.
-#: Matched as a prefix against the full path.
 EXCLUDE_PREFIXES = (
-    '/api/auth/login/',       # LoginView writes a LOGIN row itself
-    '/api/auth/logout/',      # LogoutView writes a LOGOUT row itself
-    '/api/admin/activity-log/',  # reading the log must not write to it
+    '/api/auth/login/',
+    '/api/auth/logout/',
+    '/api/admin/activity-log/',
 )
 
-#: Any body key containing one of these substrings (case-insensitive) is masked.
 REDACT_KEYS = (
     'pin', 'password', 'passwd', 'token', 'secret', 'api_key', 'apikey',
     'authorization', 'auth', 'credential', 'signature',
 )
 
-#: Hard cap on the stored body summary, so a bulk import cannot bloat the table.
 MAX_METADATA_CHARS = 4000
 MAX_LIST_ITEMS = 5
 
@@ -66,9 +34,6 @@ _ACTION_BY_METHOD = {
     'DELETE': 'DELETE',
 }
 
-#: Trailing path segments that describe an *operation* rather than a resource.
-#: When one of these ends the path the action is reported as that verb, because
-#: "CREATE invoices/12/void" reads as a lie.
 _VERB_SEGMENTS = {
     'void': 'VOID',
     'cancel': 'CANCEL',
@@ -93,8 +58,6 @@ _VERB_SEGMENTS = {
     'classify': 'CLASSIFY',
 }
 
-#: Friendly names for the resource segment. Anything not listed falls back to
-#: the raw segment, title-cased — good enough to search on.
 _ENTITY_NAMES = {
     'patients': 'Patient',
     'invoices': 'Invoice',
@@ -131,10 +94,7 @@ _ENTITY_NAMES = {
 _NUMERIC = re.compile(r'^\d+$')
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
-
 def _redact(value, depth=0):
-    """Recursively copy ``value``, masking anything that looks like a secret."""
     if depth > 6:
         return '...'
     if isinstance(value, dict):
@@ -157,12 +117,9 @@ def _redact(value, depth=0):
 
 
 def _body_summary(request):
-    """A redacted, size-capped snapshot of what the caller sent."""
     content_type = (request.content_type or '').lower()
 
     if content_type.startswith('multipart/'):
-        # Touching request.POST here is safe: the view has already run, so the
-        # stream is parsed and cached.
         try:
             fields = _redact({k: v for k, v in request.POST.items()})
             files = [
@@ -179,7 +136,6 @@ def _body_summary(request):
     try:
         raw = request.body
     except Exception:
-        # Body already consumed and not cached (streaming upload) — nothing to do.
         return None
     if not raw:
         return None
@@ -196,29 +152,21 @@ def _body_summary(request):
 
 
 def _path_segments(path):
-    """``/api/admin/patients/12/`` → ``['admin', 'patients', '12']``."""
     trimmed = path.split('?', 1)[0].strip('/')
     parts = [p for p in trimmed.split('/') if p]
     return parts[1:] if parts and parts[0] == 'api' else parts
 
 
 def describe(method, path):
-    """Derive ``(action, entity_type, entity_id)`` from the request line.
-
-    Pure and side-effect free so it can be unit-tested without a request.
-    """
     segments = _path_segments(path)
     action = _ACTION_BY_METHOD.get(method, method)
 
-    # A trailing verb wins over the method: POST .../void is a VOID, not a CREATE.
     if segments and segments[-1].lower() in _VERB_SEGMENTS:
         action = _VERB_SEGMENTS[segments[-1].lower()]
 
     numeric = [s for s in segments if _NUMERIC.match(s)]
     entity_id = numeric[-1] if numeric else ''
 
-    # The resource is the last non-numeric, non-verb segment; falling back to the
-    # first segment keeps something meaningful for a one-segment path.
     resource = ''
     for seg in reversed(segments):
         lowered = seg.lower()
@@ -229,8 +177,6 @@ def describe(method, path):
     if not resource and segments:
         resource = segments[0].lower()
 
-    # `/api/admin/patients/` should read as Patient, not Admin — prefer the
-    # deepest segment we have a friendly name for.
     entity_type = _ENTITY_NAMES.get(resource)
     if entity_type is None:
         for seg in reversed(segments):
@@ -259,15 +205,7 @@ def _actor(request):
     return user if isinstance(user, AppUser) else None
 
 
-# ── Middleware ──────────────────────────────────────────────────────────────
-
 class ActivityLogMiddleware(MiddlewareMixin):
-    """Writes one ``AuditLog`` row per mutating API request.
-
-    Disable with ``ACTIVITY_LOG_ENABLED = False`` in settings (tests that assert
-    on ``AuditLog`` counts of a *specific* explicit entry may want that).
-    """
-
     def process_request(self, request):
         if self._is_candidate(request):
             request._activity_started_at = time.monotonic()
@@ -286,8 +224,6 @@ class ActivityLogMiddleware(MiddlewareMixin):
         return response
 
     def process_exception(self, request, exception):
-        """An unhandled 500 never reaches ``process_response`` with a status we
-        can trust, so record the failure here and mark the request done."""
         try:
             if getattr(request, '_activity_started_at', None) is None:
                 return None
@@ -299,7 +235,6 @@ class ActivityLogMiddleware(MiddlewareMixin):
             logger.exception('[activity_log] failed to record exception')
         return None
 
-    # ── internals ──
 
     @staticmethod
     def _is_candidate(request):

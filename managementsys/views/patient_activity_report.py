@@ -1,11 +1,3 @@
-"""GET /api/reports/patient-activity/ and its .xlsx twin.
-
-Bucketing goes through ``services.patient_activity.classify`` — the same
-function the CRM list and the patient profile badge use (``crm_page.
-_serialize_crm_row``) — so this report can never disagree with those pages
-about which bucket a patient is in. See docs/
-stock-movement-patient-activity-design.md §5.
-"""
 import datetime
 from decimal import Decimal
 
@@ -40,8 +32,6 @@ def _parse_as_of(request):
 
 
 def _build_rows(request):
-    """Shared by the JSON view and the .xlsx export. Returns
-    (as_of, thresholds_dict, rows) on success, or (None, None, error_response)."""
     as_of, err = _parse_as_of(request)
     if err:
         return None, None, Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
@@ -103,7 +93,6 @@ def _serialize_row(r):
 
 
 def _filter_by_bucket(rows, request):
-    """-> (filtered_rows, error_response_or_None)."""
     bucket_param = request.query_params.get('bucket', '').strip().lower()
     if not bucket_param:
         return rows, None
@@ -119,7 +108,7 @@ class PatientActivityReportView(APIView):
     def get(self, request):
         as_of, thresholds, rows = _build_rows(request)
         if as_of is None:
-            return rows  # the error Response
+            return rows
 
         summary = {b: {'count': 0, 'total_spend': Decimal('0')} for b in BUCKETS}
         for r in rows:
@@ -173,12 +162,10 @@ _BUCKET_LABELS = {'active': 'Aktif', 'lapsing': 'Kurang Aktif', 'inactive': 'Tid
 
 
 class PatientActivityExportView(APIView):
-    """GET /api/reports/patient-activity/export/ — same params, returns .xlsx."""
-
     def get(self, request):
         as_of, _thresholds, rows = _build_rows(request)
         if as_of is None:
-            return rows  # the error Response
+            return rows
 
         rows, err = _filter_by_bucket(rows, request)
         if err:

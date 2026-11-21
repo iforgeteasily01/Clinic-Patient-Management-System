@@ -1,19 +1,3 @@
-"""Admin module endpoints: the operator dashboard and operational-cost inputs.
-
-Two unrelated jobs share this file because they share an audience — the manager
-who opens /admin and wants to know what is behind.
-
-**Operational inputs are planning records.** Recording a period's figure writes
-an ``OperationalInputEntry`` and nothing else: no ``Expense``, no
-``LedgerEntry``, no journal document. That is deliberate (product decision,
-19 Aug 2026) — the general ledger keeps exactly one way in, and this module
-cannot become a second one. The report here is therefore an *operational* view
-of cost, not a financial statement, and will not tie to the P&L unless someone
-also entered the real spend through /accounting/expenses.
-
-All period arithmetic is delegated to ``services.operational_inputs``. Do not
-recompute a period key or a due date locally.
-"""
 import datetime
 from collections import OrderedDict
 from decimal import Decimal
@@ -46,9 +30,6 @@ from ..services.operational_inputs import (
     recent_period_starts,
 )
 
-# How many periods back a missing entry is still reported as a task. Six months
-# is long enough to catch a genuinely forgotten month and short enough that a
-# template created today does not immediately owe a year of history.
 TASK_LOOKBACK_PERIODS = 6
 
 
@@ -65,13 +46,6 @@ def _forbidden():
 
 
 def _money(value):
-    """Money as a decimal string.
-
-    A bare ``Decimal`` handed to ``Response`` is encoded as a JSON float by
-    DRF's encoder, which would make these the only money fields in the API that
-    arrive as numbers. Every serializer-produced amount here is a string, so
-    these are too, and the frontend keeps one rule for parsing money.
-    """
     return None if value is None else str(value)
 
 
@@ -82,15 +56,7 @@ def _int_param(request, name, default):
         return default
 
 
-# ── Templates ────────────────────────────────────────────────────────────────
-
-
 class OperationalTemplateListCreateView(APIView):
-    """
-    GET  /api/admin/operations/templates/  ?active_only=1  ?frequency=  ?q=
-    POST /api/admin/operations/templates/
-    """
-
     def get(self, request):
         qs = (
             OperationalInputTemplate.objects
@@ -126,8 +92,6 @@ class OperationalTemplateListCreateView(APIView):
 
 
 class OperationalTemplateDetailView(APIView):
-    """GET/PUT/PATCH/DELETE /api/admin/operations/templates/<pk>/"""
-
     def _get(self, pk):
         return (
             OperationalInputTemplate.objects
@@ -158,9 +122,6 @@ class OperationalTemplateDetailView(APIView):
         serializer = OperationalInputTemplateSerializer(instance, data=request.data, partial=partial)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        # Changing frequency would orphan every existing entry under a period
-        # key from the other calendar ('2026-08' vs '2026-W34'), which the
-        # report then cannot place. Refuse rather than silently corrupt history.
         new_frequency = serializer.validated_data.get('frequency', instance.frequency)
         if new_frequency != instance.frequency and instance.entries.exists():
             return Response(
@@ -186,9 +147,6 @@ class OperationalTemplateDetailView(APIView):
         instance = self._get(pk)
         if instance is None:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
-        # Soft-retire a template that carries history: deleting it would take
-        # every recorded period with it (CASCADE) and silently rewrite the
-        # operational-cost report for closed months.
         if instance.entries.exists():
             instance.is_active = False
             instance.save(update_fields=['is_active'])
@@ -215,20 +173,7 @@ class OperationalTemplateDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-# ── Entries ──────────────────────────────────────────────────────────────────
-
-
 class OperationalEntryListCreateView(APIView):
-    """
-    GET  /api/admin/operations/entries/  ?template=&date_from=&date_to=&period=
-    POST /api/admin/operations/entries/  { template, period, amount, notes? }
-
-    POST is an upsert: re-posting the same (template, period) replaces the
-    figure rather than 409ing. Correcting a typo in last month's electricity
-    bill is the common case, and there is no ledger here that a rewrite could
-    corrupt — that is the whole point of these rows being planning-only.
-    """
-
     def get(self, request):
         qs = (
             OperationalInputEntry.objects
@@ -263,9 +208,6 @@ class OperationalEntryListCreateView(APIView):
         except ValueError as exc:
             return Response({'period': [str(exc)]}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Re-derive the key from the parsed start rather than trusting the
-        # client's spelling, so '2026-8' and '2026-08' cannot become two rows
-        # for the same month.
         period_key = period_key_for(template.frequency, period_start)
 
         with transaction.atomic():
@@ -297,8 +239,6 @@ class OperationalEntryListCreateView(APIView):
 
 
 class OperationalEntryDetailView(APIView):
-    """DELETE /api/admin/operations/entries/<pk>/ — clears one recorded period."""
-
     def delete(self, request, pk):
         if not _is_manager(request):
             return _forbidden()
@@ -317,11 +257,7 @@ class OperationalEntryDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-# ── Outstanding tasks ────────────────────────────────────────────────────────
-
-
 def _outstanding_for_active_templates(lookback=TASK_LOOKBACK_PERIODS, as_of=None):
-    """Every due-but-unrecorded period across active templates."""
     templates = list(OperationalInputTemplate.objects.filter(is_active=True))
     recorded = {}
     for template_id, period_key in (
@@ -334,8 +270,6 @@ def _outstanding_for_active_templates(lookback=TASK_LOOKBACK_PERIODS, as_of=None
 
 
 class OperationalTasksView(APIView):
-    """GET /api/admin/operations/tasks/ ?lookback= — periods still to record."""
-
     def get(self, request):
         lookback = max(1, min(_int_param(request, 'lookback', TASK_LOOKBACK_PERIODS), 24))
         tasks = _outstanding_for_active_templates(lookback=lookback)
@@ -347,21 +281,7 @@ class OperationalTasksView(APIView):
         })
 
 
-# ── The operational-cost report ──────────────────────────────────────────────
-
-
 class OperationalCostReportView(APIView):
-    """
-    GET /api/admin/operations/report/ ?frequency=monthly ?periods=12 ?year=
-
-    A template × period matrix of recorded figures with row, column and
-    category totals. ``frequency`` picks which calendar the columns are on —
-    monthly and weekly templates cannot share a column axis, so the report
-    renders one at a time rather than inventing a fake common period.
-
-    Amounts are ``Decimal`` and serialise as strings; the frontend parses them.
-    """
-
     def get(self, request):
         frequency = request.query_params.get('frequency', 'monthly').strip()
         if frequency not in ('monthly', 'weekly'):
@@ -373,8 +293,6 @@ class OperationalCostReportView(APIView):
         today = jakarta_today()
         year = _int_param(request, 'year', 0)
         if year:
-            # A calendar year of columns, but never beyond the current period —
-            # empty future columns make the row totals look like a shortfall.
             first = datetime.date(year, 1, 1)
             last = min(datetime.date(year, 12, 31), today)
             if last < first:
@@ -393,8 +311,6 @@ class OperationalCostReportView(APIView):
         )
         period_keys = [period_key_for(frequency, ps) for ps in period_starts]
 
-        # One query for the whole matrix; the grid is assembled in Python
-        # because the column set is a period list, not a database axis.
         recorded = {}
         if templates and period_keys:
             for entry in OperationalInputEntry.objects.filter(
@@ -437,15 +353,11 @@ class OperationalCostReportView(APIView):
                 'is_active': template.is_active,
                 'cells': [_money(c) for c in cells],
                 'total': _money(row_total),
-                # Average over periods that were actually recorded, not over
-                # every column: dividing by 12 when only 3 months are filled in
-                # reports a monthly cost that is a quarter of the real one.
                 'average': _money(row_total / recorded_count) if recorded_count else None,
                 'recorded_periods': recorded_count,
                 'missing_periods': len(period_keys) - recorded_count,
             })
 
-        # Category subtotals, in the same order the rows appear.
         categories = OrderedDict()
         for row in rows:
             bucket = categories.setdefault(row['category'], {
@@ -483,32 +395,10 @@ class OperationalCostReportView(APIView):
         })
 
 
-# ── Admin dashboard ──────────────────────────────────────────────────────────
-
-
 class AdminDashboardView(APIView):
-    """
-    GET /api/admin/dashboard/
-
-    What the manager needs on opening /admin:
-
-    * ``carried_over_visits`` — ``ActivePatient`` rows whose visit started
-      before today. A finished visit is *deleted* by the billing flow, so any
-      row still standing from an earlier day is by definition an unfinished
-      one; there is no separate "closed" state to filter out. Status 0 is
-      excluded to match the queue endpoint.
-    * ``pending_invoices`` — two different backlogs the operator asked to see
-      together: sales invoices not yet swept into the journal, and patients
-      parked at billing (status 5) with no invoice raised at all.
-    * ``operational_tasks`` — due-but-unrecorded operational input periods.
-    """
-
     def get(self, request):
         today = jakarta_today()
 
-        # ── Carried-over visits ──────────────────────────────────────────────
-        # visit_time is a timestamp in UTC; compare in Jakarta or a 21:00 local
-        # check-in on the 18th reads as the 19th and never looks carried over.
         day_start_utc = datetime.datetime.combine(
             today, datetime.time.min, tzinfo=JAKARTA_TZ,
         ).astimezone(datetime.timezone.utc)
@@ -538,10 +428,6 @@ class AdminDashboardView(APIView):
                 'medrec_id': visit.medrec_id,
             })
 
-        # ── Pending invoices ────────────────────────────────────────────────
-        # Scoped to the branch selection, like every other figure on this
-        # dashboard: a manager looking at Cabang B must not see Cabang A's
-        # backlog as their own to clear.
         unposted_invoices = filter_by_branch(
             Invoice.objects.filter(posting_status='unposted', is_voided=False),
             request,
@@ -558,9 +444,6 @@ class AdminDashboardView(APIView):
             ActivePatient.objects.filter(status=5), request, include_null=False,
         ).count()
 
-        # Purchase and expense backlogs are the same kind of "not journalled
-        # yet" debt and cost one count each, so the dashboard reports them
-        # rather than making the operator open /accounting to find out.
         unposted_purchases = filter_by_branch(
             PurchaseInvoice.objects.filter(posting_status='unposted', is_voided=False),
             request,
@@ -569,7 +452,6 @@ class AdminDashboardView(APIView):
             Expense.objects.filter(posting_status='unposted'), request,
         ).count()
 
-        # ── Operational input tasks ─────────────────────────────────────────
         tasks = _outstanding_for_active_templates(as_of=today)
 
         return Response({
@@ -588,8 +470,6 @@ class AdminDashboardView(APIView):
             },
             'operational_tasks': {
                 'count': len(tasks),
-                # The dashboard shows the worst offenders; the full list lives
-                # on /admin/operational-inputs.
                 'tasks': tasks[:8],
                 'overdue_count': sum(1 for t in tasks if t['days_overdue'] > 0),
             },

@@ -19,7 +19,7 @@ from managementsys.models import (
 from managementsys.api.serializers import (
     ProductionRecipeSerializer, ProductionRunSerializer,
 )
-from managementsys.views.inventory_page import (  # reuse, do not copy
+from managementsys.views.inventory_page import (
     _to_small, _actor, _fifo_deduct, _fifo_deduct_global,
 )
 
@@ -28,7 +28,6 @@ _HEADER_FILL = PatternFill('solid', fgColor='0284C7')
 
 
 def unit_cost_small(item_id, warehouse_id=None) -> Decimal:
-    """Weighted-average cost per smallest unit across remaining batches."""
     qs = InventoryBatch.objects.filter(item_id=item_id, quantity_remaining__gt=0)
     if warehouse_id:
         qs = qs.filter(warehouse_id=warehouse_id)
@@ -51,15 +50,6 @@ def available_small(item_id, warehouse_id=None) -> Decimal:
 
 
 def build_cost_breakdown(lines, output_quantity, warehouse_id=None):
-    """
-    lines: iterable of dicts {item_id, quantity, unit}
-    output_quantity: Decimal (smallest unit yield)
-    Returns (breakdown_list, total_cost, cost_per_output_unit).
-    Each breakdown row: {item_id, item_code, item_name, unit, quantity,
-                         quantity_small, unit_cost_small, line_cost,
-                         available_small, insufficient}
-    Raises ValueError on bad unit/qty (propagate as 400 upstream).
-    """
     breakdown = []
     total = Decimal('0')
     for ln in lines:
@@ -87,8 +77,6 @@ def build_cost_breakdown(lines, output_quantity, warehouse_id=None):
     per_unit = (total / out_q).quantize(Decimal('0.0001')) if out_q > 0 else Decimal('0')
     return breakdown, total.quantize(Decimal('0.01')), per_unit
 
-
-# ── Recipe CRUD ──────────────────────────────────────────────────────────────
 
 class RecipeListCreateView(APIView):
     def get(self, request):
@@ -125,7 +113,6 @@ class RecipeDetailView(APIView):
 
 
 class RecipeCostView(APIView):
-    """GET live cost breakdown for a saved recipe. ?warehouse_id= optional."""
     def get(self, request, pk):
         recipe = get_object_or_404(
             ProductionRecipe.objects.prefetch_related('ingredients'), pk=pk)
@@ -145,11 +132,6 @@ class RecipeCostView(APIView):
             'cost_per_output_unit': str(per_unit),
         })
 
-
-# ── Recipe Excel import/export ────────────────────────────────────────────────
-# Flat layout: one row per ingredient. Recipe-level columns (name/output/notes/
-# active) only need to be filled on the first row of each recipe's block —
-# blank cells on later rows inherit the most recent non-blank value.
 
 _RECIPE_HEADERS = [
     'recipe_name', 'output_item_code', 'output_quantity', 'notes', 'is_active',
@@ -181,8 +163,6 @@ def _xlsx_response(wb, filename):
 
 
 class RecipeExportView(APIView):
-    """GET — download all recipes (with ingredients) as an .xlsx file."""
-
     def get(self, request):
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -210,8 +190,6 @@ class RecipeExportView(APIView):
 
 
 class RecipeTemplateView(APIView):
-    """GET — download a blank sample .xlsx showing the expected import format."""
-
     def get(self, request):
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -254,18 +232,6 @@ def _parse_bool(value, default=True):
 
 
 class RecipeImportView(APIView):
-    """
-    POST multipart/form-data with file=<xlsx>
-    Columns (row 1 = header, row 2 may be a notes row, skipped as data only if
-    it fails to parse as a valid ingredient line):
-      recipe_name | output_item_code | output_quantity | notes | is_active |
-      ingredient_item_code | ingredient_quantity | ingredient_unit
-    One row per ingredient. Recipe-level columns only need to be present on the
-    first row of each recipe's block. Recipes matched by name are updated
-    (ingredients replaced wholesale); unmatched names create a new recipe.
-    Returns { created, updated, errors: [{row, message}] }
-    """
-
     def post(self, request):
         uploaded = request.FILES.get('file')
         if not uploaded:
@@ -290,7 +256,7 @@ class RecipeImportView(APIView):
         for i, row in enumerate(rows[1:], start=2):
             padded = (list(row) + [None] * 8)[:8]
             if all(v in (None, '') for v in padded):
-                continue  # fully blank row — skip silently
+                continue
 
             name = str(padded[0]).strip() if padded[0] not in (None, '') else ''
             if not name:
@@ -419,10 +385,7 @@ class RecipeImportView(APIView):
         return Response({'created': created, 'updated': updated, 'errors': errors})
 
 
-# ── Ad-hoc cost preview ──────────────────────────────────────────────────────
-
 class ProductionPreviewView(APIView):
-    """POST { lines:[{item_id, quantity, unit}], output_quantity, warehouse_id? }"""
     def post(self, request):
         d = request.data
         wh = d.get('warehouse_id') or None
@@ -435,8 +398,6 @@ class ProductionPreviewView(APIView):
                          'cost_per_output_unit': str(per_unit)})
 
 
-# ── Production run execution ──────────────────────────────────────────────────
-
 class ProductionRunListCreateView(APIView):
     def get(self, request):
         qs = ProductionRun.objects.prefetch_related('ingredients').all()[:200]
@@ -444,12 +405,11 @@ class ProductionRunListCreateView(APIView):
 
     def post(self, request):
         d = request.data
-        # --- validate output ---
         try:
             output_item = InventoryItem.objects.get(pk=d['output_item'])
             warehouse = Warehouse.objects.get(pk=d['output_warehouse'])
             output_qty = Decimal(str(d['output_quantity']))
-            lines = d['lines']  # [{item_id, quantity, unit, source_warehouse_id?}]
+            lines = d['lines']
         except (KeyError, InventoryItem.DoesNotExist, Warehouse.DoesNotExist):
             return Response({'error': 'Invalid output item, warehouse, or payload.'},
                             status=status.HTTP_400_BAD_REQUEST)
@@ -460,7 +420,6 @@ class ProductionRunListCreateView(APIView):
             return Response({'error': 'Output quantity and ingredients are required.'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # --- resolve qty_small + pre-check stock (deduct nothing yet) ---
         resolved = []
         shortages = []
         for ln in lines:
@@ -487,7 +446,6 @@ class ProductionRunListCreateView(APIView):
             return Response({'error': 'Insufficient stock.', 'shortages': shortages},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # --- commit atomically ---
         try:
             with transaction.atomic():
                 total_cost = Decimal('0')
@@ -497,7 +455,7 @@ class ProductionRunListCreateView(APIView):
                         shortfall, cogs = _fifo_deduct(item.id, int(src_wh), qty_small)
                     else:
                         shortfall, cogs = _fifo_deduct_global(item.id, qty_small)
-                    if shortfall > 0:                      # race-condition guard
+                    if shortfall > 0:
                         raise ValueError(f'Stock changed for {item.code}; aborted.')
                     total_cost += cogs
                     consumed.append((item, qty_small, cogs, src_wh))

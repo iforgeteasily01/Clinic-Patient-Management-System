@@ -1,11 +1,3 @@
-"""Changing a patient's number — the primary key.
-
-The load-bearing test is :meth:`TestRenumber.test_nothing_is_left_behind`:
-after a rename, no row anywhere may still point at the old number, and every
-row that pointed at it before must point at the new one. It walks the model
-metadata rather than a written-down list, so an FK added later is covered by
-this test on the day it is added.
-"""
 import pytest
 from django.db import connection
 
@@ -26,7 +18,6 @@ def patient(db):
 
 @pytest.fixture
 def history(patient, db):
-    """A patient with something in every shape of table that references them."""
     medrec = MedRec.objects.create(patient_no=patient, subjective='keluhan')
     ActivePatient.objects.create(patient_no=patient, status=1, consult_status=False, medrec=medrec)
     TreatmentSession.objects.create(patient_no=patient)
@@ -37,7 +28,6 @@ def history(patient, db):
 
 @pytest.fixture
 def admin(db):
-    """The Admin account — ``create_default_admin`` seeds it as a superuser."""
     user = AppUserFactory(display_name='Admin', role='superuser', pin='654321')
     user.generate_token()
     return user
@@ -58,7 +48,6 @@ def manager_api(api, db):
 
 
 def rows_pointing_at(patient_no):
-    """{table.column: count} for every FK column holding ``patient_no``."""
     found = {}
     with connection.cursor() as cursor:
         for related in patient_renumber._related_columns():
@@ -70,8 +59,6 @@ def rows_pointing_at(patient_no):
                 found[f'{table}.{column}'] = count
     return found
 
-
-# ── Validation ─────────────────────────────────────────────────────────────
 
 @pytest.mark.django_db
 class TestValidation:
@@ -98,8 +85,6 @@ class TestValidation:
             patient_renumber.renumber(patient, 'J 000 1')
 
     def test_a_legacy_shaped_number_is_accepted(self, patient):
-        """The external system is the authority, so the canonical
-        {initial}{6 digits} shape is not enforced."""
         patient_renumber.renumber(patient, 'PN00691')
         assert Patient.objects.filter(patient_no='PN00691').exists()
 
@@ -107,8 +92,6 @@ class TestValidation:
         patient_renumber.renumber(patient, 'j000105')
         assert Patient.objects.filter(patient_no='J000105').exists()
 
-
-# ── The rename itself ──────────────────────────────────────────────────────
 
 @pytest.mark.django_db
 class TestRenumber:
@@ -146,8 +129,6 @@ class TestRenumber:
         assert summary['medrec_ids_rewritten'] == 1
 
     def test_only_this_patients_records_are_rewritten(self, patient, history, db):
-        """``MR-J0001-`` must not match ``J00012``'s records — hence the
-        trailing dash in the prefix."""
         other = Patient.objects.create(patient_no='J0000012', name='Joni')
         other_rec = MedRec.objects.create(patient_no=other)
         original = other_rec.medrec_id
@@ -158,8 +139,6 @@ class TestRenumber:
         assert other_rec.medrec_id == original
 
     def test_the_visit_date_survives_the_rewrite(self, patient, history):
-        """The parsers scan for the 8-digit part, so moving the patient segment
-        must not shift the date."""
         from managementsys.views.crm_dashboard import _medrec_date
 
         before = _medrec_date(history.medrec_id)
@@ -175,12 +154,9 @@ class TestRenumber:
         assert log.entity_id == 'J000105'
         assert log.performed_by_id == admin.id
         assert log.metadata['old_patient_no'] == 'J000001'
-        # A printed medical-record number has to be traceable to its replacement.
         assert log.metadata['medrec_ids']
 
     def test_a_failure_leaves_everything_untouched(self, patient, history, monkeypatch):
-        """The rename is one transaction; a half-renamed chart is not a state
-        the clinic is ever allowed to be in."""
         def boom(*args, **kwargs):
             raise RuntimeError('database went away')
 
@@ -199,8 +175,6 @@ class TestRenumber:
         assert summary['medrec_ids_rewritten'] == 0
 
 
-# ── Preview ────────────────────────────────────────────────────────────────
-
 @pytest.mark.django_db
 class TestPreview:
     def test_it_counts_without_moving_anything(self, patient, history):
@@ -216,14 +190,11 @@ class TestPreview:
         assert result['total_rows'] == 0
 
 
-# ── API ────────────────────────────────────────────────────────────────────
-
 @pytest.mark.django_db
 class TestRenumberApi:
     URL = '/api/admin/patients/J000001/renumber/'
 
     def test_a_cashier_is_refused(self, auth_api, patient):
-        """auth_user is a cashier — they edit patients but must not renumber one."""
         assert auth_api.post(self.URL, {'new_patient_no': 'J000105'}, format='json').status_code == 403
         assert Patient.objects.filter(patient_no='J000001').exists()
 
@@ -231,7 +202,6 @@ class TestRenumberApi:
         assert api.post(self.URL, {'new_patient_no': 'J000105'}, format='json').status_code in (401, 403)
 
     def test_a_manager_is_refused(self, manager_api, patient, history):
-        """A manager edits patients all day. Renumbering one is not that."""
         assert manager_api.post(self.URL, {'new_patient_no': 'J000105'}, format='json').status_code == 403
         assert Patient.objects.filter(patient_no='J000001').exists()
 
@@ -267,12 +237,9 @@ class TestRenumberApi:
         assert response.status_code == 404
 
 
-# ── The path that used to corrupt data ─────────────────────────────────────
-
 @pytest.mark.django_db
 class TestPutCannotRenumber:
     def test_editing_the_patient_with_a_new_number_is_refused(self, manager_api, patient, history):
-        """Django would INSERT a second row and orphan the first. It must 400."""
         response = manager_api.put(
             '/api/admin/patients/J000001/',
             {'patient_no': 'J000105', 'name': 'Joko'},

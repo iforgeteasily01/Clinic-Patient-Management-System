@@ -1,25 +1,8 @@
-"""An expense becomes an explicit journal entry.
-
-Adds the two columns that turn "a bill with lines" into one credit leg out of
-a named cash/bank account plus N debit legs:
-
-  * ``Expense.payment_account`` — the ChartOfAccounts row the money actually
-    leaves from, replacing the ``payment_method`` indirection for new records.
-    ``payment_method`` stays (nullable) for back-compat.
-  * ``Expense.payment_memo`` — the credit leg's journal memo, and the fallback
-    for any expense line whose own memo is blank.
-
-``ExpenseItem`` gains no column: ``description`` is repurposed as that leg's
-memo, so only its help_text changes here. 0092 backfills ``payment_account``
-from the existing payment methods.
-"""
-
 import django.db.models.deletion
 from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0090_purchase_payments'),
     ]

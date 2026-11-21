@@ -1,36 +1,8 @@
-"""Schema for the stock-movement / patient-activity / bank-payment / beautician-expense shipment.
-
-Bundled in one migration because the design doc (docs/stock-movement-patient-activity-design.md,
-§0) ships all four features together — they share two pieces of plumbing:
-
-  * ``ReportSettings`` — a new singleton (same shape as ``SiteConfig``) holding the tunable
-    windows the stock-movement and patient-activity reports classify against. Kept separate
-    from ``SiteConfig`` because that model is scoped to receipt printing.
-  * ``Invoice.payment_account`` and the ``ExpenseAlias`` layer both replace/extend the
-    ``PaymentMethod`` indirection with a direct cash/bank ``ChartOfAccounts`` reference,
-    following the pattern ``Expense.payment_account`` already established in 0091.
-    ``payment_method`` is kept everywhere, unchanged: ``PurchasePayment``, ``Expense`` and the
-    ``repair_accounting_balance`` / ``void_duplicate_billing_invoices`` commands still reference
-    it, and ``cash_accounts.cash_bank_account_ids()`` unions ``PaymentMethod.linked_account``
-    into its allowed set.
-
-``ExpenseAlias`` lets a beautician log a spend ("Beli kapas") without picking a GL account —
-a manager curates the name-to-account mapping once, and the beautician-expense flow (built by
-the BACKEND agent that follows this migration) writes a completely ordinary ``Expense`` +
-``ExpenseItem`` through it, so posting, journal preview/commit, P&L and cash flow need zero new
-code. ``ExpenseItem.alias`` is SET_NULL rather than PROTECT: deleting a retired alias must not
-be blocked by, or destroy, a year of posted expense history — ``ExpenseItem.account`` and
-``description`` remain the record of truth, ``alias`` is only provenance.
-
-0102 backfills ``Invoice.payment_account`` from the payment methods already on file.
-"""
-
 import django.db.models.deletion
 from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0100_retire_undeposited_clearing'),
     ]

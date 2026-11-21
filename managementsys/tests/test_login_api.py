@@ -1,4 +1,3 @@
-"""Integration tests for the auth endpoints (real DB, real DRF stack)."""
 import pytest
 from django.urls import reverse
 
@@ -23,7 +22,7 @@ class TestLoginEndpoint:
         assert body["user"]["id"] == user.id
 
         user.refresh_from_db()
-        assert user.auth_token == body["token"]            # token persisted
+        assert user.auth_token == body["token"]
         assert AuditLog.objects.filter(action="LOGIN", performed_by=user).exists()
 
     def test_wrong_pin_is_401_and_issues_no_token(self, api):
@@ -64,14 +63,10 @@ class TestLoginEndpoint:
 @pytest.mark.django_db
 class TestBearerAuth:
     def test_valid_token_authorizes_protected_endpoint(self, auth_api):
-        # /api/auth/users/ is readable; the point is the request is accepted.
         res = auth_api.get(reverse("auth-users"))
         assert res.status_code == 200
 
     def test_logout_audits_but_intentionally_keeps_token_alive(self, auth_api, auth_user):
-        # By design (see LogoutView), the token is NOT cleared so other clients
-        # sharing it (e.g. the WPF cashier app) stay authenticated. Logout only
-        # writes an audit record.
         from managementsys.models import AuditLog
 
         token_before = auth_user.auth_token

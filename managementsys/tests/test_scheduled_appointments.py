@@ -1,12 +1,3 @@
-"""Integration tests for the scheduled-appointment endpoints.
-
-Covers the booking lifecycle (create → reschedule → cancel), the FHIR-derived
-validation rules, and the check-in bridge into the walk-in ActivePatient queue.
-
-The timezone tests are the important ones: settings.TIME_ZONE is UTC while the
-clinic runs on Asia/Jakarta, and a wrong offset is the most common cause of a
-SatuSehat rejection. See docs/satusehat-appointment-page-design.md.
-"""
 from datetime import timedelta, timezone as dt_timezone
 
 import pytest
@@ -34,7 +25,6 @@ def patient(db):
 
 
 def _slot(days=1, hour=10):
-    """A future Jakarta-local slot, returned as (start, end) aware datetimes."""
     start = (timezone.now().astimezone(JAKARTA_TZ) + timedelta(days=days)).replace(
         hour=hour, minute=0, second=0, microsecond=0)
     return start, start + timedelta(minutes=30)
@@ -72,7 +62,6 @@ class TestAppointmentCreate:
         assert appointment.status == "booked"
         assert appointment.patient_id == patient.patient_no
         assert appointment.practitioner_id == doctor.id
-        # Reserved for the sync phase — must stay untouched by this flow.
         assert appointment.ihs_appointment_id is None
         assert appointment.sync_status == "not_synced"
 
@@ -105,7 +94,6 @@ class TestAppointmentCreate:
         body = _payload(patient, doctor, room)
         body.pop("end_at")
         res = auth_api.post(reverse("scheduled-appointments"), body, format="json")
-        # FHIR invariant app-2/app-3: a booked slot carries start and end.
         assert res.status_code == 400
         assert "end_at" in res.data
 
@@ -143,8 +131,6 @@ class TestAppointmentCreate:
 
 @pytest.mark.django_db
 class TestTimezoneHandling:
-    """The clinic is Asia/Jakarta; the DB stores UTC. Offsets must survive both ways."""
-
     def test_emitted_datetimes_carry_jakarta_offset(self, auth_api, patient, doctor, room):
         res = auth_api.post(
             reverse("scheduled-appointments"),
@@ -166,7 +152,6 @@ class TestTimezoneHandling:
         )
         assert res.status_code == 201, res.content
 
-        # 10:00 WIB is 03:00 UTC — the naive string must not be taken as UTC.
         appointment = Appointment.objects.get(pk=res.data["id"])
         assert appointment.start_at.astimezone(dt_timezone.utc).hour == 3
         assert res.data["start_at"].startswith(start.strftime("%Y-%m-%dT10:00:00"))
@@ -181,12 +166,9 @@ class TestTimezoneHandling:
             format="json",
         )
         assert res.status_code == 201, res.content
-        # Sent as 03:00Z, must read back as 10:00+07:00 — same instant.
         assert res.data["start_at"].startswith(start.strftime("%Y-%m-%dT10:00:00"))
 
     def test_date_filter_uses_jakarta_day_boundaries(self, auth_api, patient, doctor, room):
-        # 08:00 WIB is 01:00 UTC the same day; 23:00 WIB is 16:00 UTC. Both must
-        # land on the Jakarta date, not the UTC one.
         early_start, early_end = _slot(days=2, hour=8)
         late_start, late_end = _slot(days=2, hour=23)
         url = reverse("scheduled-appointments")
@@ -243,7 +225,6 @@ class TestAppointmentUpdate:
         assert res.data["start_at"].startswith(new_start.strftime("%Y-%m-%dT14:00:00"))
 
     def test_patch_allows_correcting_into_the_past(self, auth_api, patient, doctor, room):
-        """The future-start rule applies on create only — edits fix mistakes."""
         created = auth_api.post(
             reverse("scheduled-appointments"),
             _payload(patient, doctor, room),
@@ -295,7 +276,6 @@ class TestCheckIn:
         assert appointment.status == "arrived"
         assert appointment.linked_active_patient_id is not None
 
-        # A booking with a practitioner enters the queue as a consult (status 1).
         active = ActivePatient.objects.get(pk=appointment.linked_active_patient_id)
         assert active.patient_no_id == patient.patient_no
         assert active.status == 1
@@ -380,7 +360,6 @@ class TestSatuSehatReadiness:
             _payload(None, doctor_without_nik, None, guest_name="Tamu Siti"),
             format="json",
         )
-        # Informational only — an unready booking is still accepted.
         assert res.status_code == 201, res.content
         readiness = res.data["satusehat_readiness"]
         assert readiness["ready"] is False

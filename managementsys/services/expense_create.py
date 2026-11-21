@@ -1,14 +1,3 @@
-"""The single expense-creation code path.
-
-``views.accounting_page.ExpenseListCreateView.post`` (the manager-facing form)
-and the beautician petty-cash flow (``views.beautician_expense_page``) both
-end here. Two divergent ways to write an ``Expense`` + its ``ExpenseItem``
-rows is exactly the failure mode the beautician-expense design explicitly
-warns against — see docs/stock-movement-patient-activity-design.md §4,
-"Reuse, do not re-implement." Neither caller talks to the posting engine
-directly; both just write an ordinary Expense and let the journal preview/
-commit pick it up, same as any hand-entered one.
-"""
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
@@ -26,25 +15,6 @@ def _safe_decimal(val) -> Decimal:
 def create_expense(*, expense_date, payment_method, payment_account, payment_memo,
                     notes, amount_paid, items, actor, source='general', status_override=None,
                     branch=None):
-    """Write one Expense + its ExpenseItem lines and audit-log it.
-
-    ``items`` is a list of dicts with at least ``account`` (a ChartOfAccounts
-    pk) and ``amount``; ``description`` and ``alias`` (an ExpenseAlias
-    instance, or None) are optional. Runs in its own transaction so a caller
-    that is not already inside one still gets atomicity.
-
-    ``branch`` is the location the cost belongs to. The manager form passes
-    the accounting branch selection (a head-office user may book a cost against
-    either clinic); the beautician flow passes their own. None means group-wide
-    — a shared overhead that no single branch should carry — and is a
-    legitimate value, not a missing one.
-
-    ``status_override`` lets the beautician flow force ``status='paid'``
-    directly — petty cash is spent the moment it is logged, there is no
-    payable — without this function having to infer intent from
-    ``amount_paid`` vs. the computed total the way ``refresh_status()`` does
-    for a hand-entered expense that may be partially paid.
-    """
     with transaction.atomic():
         expense = Expense.objects.create(
             expense_date=expense_date,
@@ -81,10 +51,6 @@ def create_expense(*, expense_date, payment_method, payment_account, payment_mem
             expense.refresh_status()
         expense.save(update_fields=['total_amount', 'status'])
 
-        # Phase 2/3: the accrual double-entry (Dr expense/cogs accounts, Cr AP
-        # or payment account) is deferred, same as every other expense — this
-        # row sits posting_status='unposted' with zero LedgerEntry rows until
-        # a journal run sweeps its expense_date.
 
         AuditLog.objects.create(
             performed_by=actor,

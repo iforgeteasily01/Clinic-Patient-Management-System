@@ -1,18 +1,3 @@
-"""Read and amend the finalized medical-record archive.
-
-Two things live here that the drafting flow (``medical_record_draft.py``) does
-not do:
-
-* **Paging and sorting.** The archive is five-figure sized, so the list endpoint
-  never returns everything at once. It answers a *page*, newest first by
-  default, and the search page drives the ordering from its column headers.
-* **Amending a finalized record.** A finalized MedRec is a signed clinical
-  document; only a ``superuser`` or a ``doctor`` may change one, and every
-  change is written to :class:`~managementsys.models.AuditLog` field by field
-  with its before/after values. A later reader relies on the clinical content,
-  so "who changed what" has to survive the edit.
-"""
-
 from django.db.models import Value
 from django.db.models.functions import StrIndex, Substr
 from rest_framework.response import Response
@@ -22,13 +7,11 @@ from ..auth_backend import IsAppAuthenticated
 from ..models import AppUser, AuditLog, MedRec
 from ..api.serializers import MedRecHistorySerializer
 
-#: Roles allowed to amend a finalized record.
 EDITOR_ROLES = ('superuser', 'doctor')
 
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 500
 
-#: Fields an amendment may touch, in the order they are reported to the log.
 EDITABLE_FIELDS = [
     'subjective', 'objective', 'assessment', 'assessment_codes', 'plan',
     'sabun', 'toner',
@@ -37,10 +20,6 @@ EDITABLE_FIELDS = [
     'treatment',
 ]
 
-#: ``sort`` query value -> queryset ordering. ``medrec_id`` embeds the visit
-#: date but sorts by *patient* first (``MR-<patient_no>-<YYYYMMDD>-<n>``), so it
-#: cannot stand in for a date sort; ``visit_date`` gets the extracted date, with
-#: medrec_id as the tie-break.
 SORT_FIELDS = {
     'visit_date': ('date_key', 'medrec_id'),
     'medrec_id': ('medrec_id',),
@@ -71,13 +50,6 @@ def _int_param(params, name, default, minimum, maximum):
 
 
 def _with_date_key(qs):
-    """Annotate ``date_key`` = the ``YYYYMMDD`` run inside ``medrec_id``.
-
-    ``MR-`` is a fixed literal prefix written by ``MedRec.save``, so stripping
-    three characters and taking the eight after the next ``-`` lands on the
-    date without a regex — and as a zero-padded ISO-ordered string it sorts
-    chronologically as text.
-    """
     return (
         qs.annotate(_tail=Substr('medrec_id', 4))
           .annotate(date_key=Substr('_tail', StrIndex('_tail', Value('-')) + 1, 8))
@@ -85,20 +57,6 @@ def _with_date_key(qs):
 
 
 class MedRecHistoryListView(APIView):
-    """``GET /api/medical-records/history/``
-
-    Filters (all optional, all combinable): ``patient_name``, ``patient_no``,
-    ``medrec_id``, ``date`` (``YYYY-MM-DD``), ``include_drafts``.
-
-    Ordering: ``sort`` (a key of :data:`SORT_FIELDS`) and ``dir``
-    (``asc``/``desc``, default ``desc`` — so a blank search reads newest first).
-
-    Paging: ``page`` (1-based) and ``page_size`` (capped at
-    :data:`MAX_PAGE_SIZE`). The response is always the envelope below, never a
-    bare list — a caller that wants a whole patient's chart asks for a large
-    ``page_size`` rather than getting the archive by accident.
-    """
-
     def get(self, request):
         params = request.query_params
         include_drafts = params.get('include_drafts', '').lower() == 'true'
@@ -119,7 +77,6 @@ class MedRecHistoryListView(APIView):
         if medrec_id:
             qs = qs.filter(medrec_id__icontains=medrec_id)
         if date:
-            # date in YYYY-MM-DD -> convert to YYYYMMDD for medrec_id substring match
             date_compact = date.replace('-', '')
             qs = qs.filter(medrec_id__contains=date_compact)
 
@@ -154,8 +111,6 @@ class MedRecHistoryListView(APIView):
 
 
 class MedRecHistoryDetailView(APIView):
-    """``GET`` one record; ``PATCH`` to amend it (superuser/doctor only)."""
-
     permission_classes = [IsAppAuthenticated]
 
     def get(self, request, medrec_id):
@@ -192,8 +147,6 @@ class MedRecHistoryDetailView(APIView):
             setattr(record, field, after)
             changes.append((field, before, after))
 
-        # Nothing moved: return the record but write no log row. An audit trail
-        # that records non-edits makes the real ones harder to find.
         if not changes:
             return Response(MedRecHistorySerializer(record).data)
 
@@ -215,7 +168,6 @@ class MedRecHistoryDetailView(APIView):
 
 
 def _abbrev(value, limit=80):
-    """One field value, whitespace-collapsed and clipped so a log row stays readable."""
     text = '(empty)' if value in ('', None, []) else str(value)
     text = ' '.join(text.split())
     return text if len(text) <= limit else text[:limit - 1] + '…'

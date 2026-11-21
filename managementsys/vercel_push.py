@@ -1,8 +1,3 @@
-"""
-vercel_push.py
-Pushes clinic events to the Vercel ingest endpoint in a background thread
-so it never blocks or slows down the main Django request.
-"""
 import json
 import logging
 import os
@@ -20,7 +15,6 @@ VERCEL_INGEST_SECRET = os.environ.get('VERCEL_INGEST_SECRET', '')
 
 
 def _post(payload: dict):
-    """Internal: perform the HTTP POST. Runs in a background thread."""
     if not VERCEL_INGEST_SECRET:
         logger.warning('[vercel_push] VERCEL_INGEST_SECRET not set — skipping push.')
         return
@@ -40,15 +34,10 @@ def _post(payload: dict):
             if resp.status != 200:
                 logger.warning('[vercel_push] Unexpected status %s', resp.status)
     except Exception as exc:
-        # Never let a push failure affect the main request
         logger.warning('[vercel_push] Push failed: %s', exc)
 
 
 def push(event_type: str, patient_name: str | None, patient_no: str | None, payload: dict):
-    """
-    Fire-and-forget push to Vercel.
-    Called from Django signals — returns immediately, sends in background.
-    """
     data = {
         'event_type':   event_type,
         'timestamp':    datetime.now(timezone.utc).isoformat(),

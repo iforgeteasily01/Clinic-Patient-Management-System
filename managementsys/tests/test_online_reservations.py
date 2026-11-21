@@ -1,15 +1,3 @@
-"""Tests for the online reservation bridge.
-
-Three things carry the design and are each pinned here:
-
-* **Phone matching never guesses.** Free-text numbers on both sides are
-  normalised, and two hits are handed to a human rather than resolved.
-* **The import is idempotent.** The Vercel endpoint re-delivers anything
-  unacked, so a redelivery must not produce a second appointment.
-* **The appointment it writes is SatuSehat-shaped**, with both ends of the slot
-  and a booked status — the same invariants test_scheduled_appointments.py
-  enforces on the manual path.
-"""
 from datetime import timedelta, timezone as dt_timezone
 from unittest.mock import patch
 
@@ -45,8 +33,6 @@ def _row(external_id=1, phone='628123456789', name='Siti Rahma', **overrides):
     return row
 
 
-# ── Phone matching ───────────────────────────────────────────────────────────
-
 @pytest.mark.django_db
 class TestPhoneMatching:
     @pytest.mark.parametrize('stored', [
@@ -71,7 +57,6 @@ class TestPhoneMatching:
         assert candidates == []
 
     def test_two_patients_on_one_number_is_never_resolved(self):
-        """A wrong link writes a stranger's visit into somebody's chart."""
         a = Patient.objects.create(name='Siti Rahma', phone_number='08123456789')
         b = Patient.objects.create(name='Siti R.', phone_number='628123456789')
         status, matched, candidates = reservation_sync.match_patient('08123456789')
@@ -80,8 +65,6 @@ class TestPhoneMatching:
         assert sorted(candidates) == sorted([a.patient_no, b.patient_no])
 
     def test_unusable_number_is_its_own_outcome(self):
-        # A landline is not "no patient found" — it is a number reception has
-        # to look at, and the two need different handling.
         status, matched, _ = reservation_sync.match_patient('0217654321')
         assert status == ReservationRequest.MATCH_INVALID
         assert matched is None
@@ -92,8 +75,6 @@ class TestPhoneMatching:
         status, _, _ = reservation_sync.match_patient('628123456789')
         assert status == ReservationRequest.MATCH_UNMATCHED
 
-
-# ── Import ───────────────────────────────────────────────────────────────────
 
 @pytest.mark.django_db
 class TestImport:
@@ -114,12 +95,9 @@ class TestImport:
         assert appointment.patient_id == patient.patient_no
         assert appointment.contact_phone == '628123456789'
         assert appointment.service_type == 'Facial'
-        # FHIR app-2/app-3: a booked slot carries both ends.
         assert appointment.end_at is not None
         assert appointment.end_at > appointment.start_at
-        # And the instant survives the round trip through +07:00.
         assert appointment.start_at.astimezone(JAKARTA_TZ).hour == start.hour
-        # Sync fields stay reserved for the sync phase.
         assert appointment.ihs_appointment_id is None
         assert appointment.sync_status == 'not_synced'
 
@@ -128,7 +106,6 @@ class TestImport:
         assert row_obj.match_status == ReservationRequest.MATCH_UNMATCHED
         assert row_obj.appointment.patient_id is None
         assert row_obj.appointment.guest_name == 'Dewi Putri'
-        # The only way to reach them, so it must be on the appointment itself.
         assert row_obj.appointment.contact_phone == '628123456789'
 
     def test_redelivery_does_not_book_the_slot_twice(self):
@@ -141,12 +118,6 @@ class TestImport:
         assert Appointment.objects.count() == 1
 
     def test_a_past_slot_still_imports(self):
-        """The serializer refuses past start times; the poller must not.
-
-        A booking made at 09:58 for 10:00 can easily reach the clinic after the
-        slot has begun, and dropping it would lose a patient who is already on
-        their way.
-        """
         past = timezone.now().astimezone(JAKARTA_TZ) - timedelta(hours=2)
         row_obj, created = reservation_sync.import_reservation(_row(start=past))
         assert created is True
@@ -162,8 +133,6 @@ class TestImport:
         assert row_obj.appointment.patient_id is None
 
 
-# ── One pass ─────────────────────────────────────────────────────────────────
-
 @pytest.mark.django_db
 class TestRunOnce:
     def test_acks_only_what_committed(self):
@@ -176,8 +145,6 @@ class TestRunOnce:
         assert result['failed'] == []
         sent = acked.call_args[0][0]
         assert {a['id'] for a in sent} == {1, 2}
-        # The appointment number goes back so the Vercel admin page can show
-        # that a booking really landed.
         assert all(a['appointment_no'].startswith('APT-') for a in sent)
 
     def test_one_bad_row_does_not_strand_the_batch(self):
@@ -188,7 +155,6 @@ class TestRunOnce:
 
         assert result['imported'] == 2
         assert [f['id'] for f in result['failed']] == [2]
-        # The failure is left unacked deliberately, so it comes back next minute.
         assert {a['id'] for a in acked.call_args[0][0]} == {1, 3}
 
     def test_offline_clinic_raises_rather_than_losing_bookings(self):
@@ -201,8 +167,6 @@ class TestRunOnce:
         assert ReservationRequest.objects.count() == 0
 
 
-# ── Inbox endpoints ──────────────────────────────────────────────────────────
-
 @pytest.fixture
 def imported(db):
     return reservation_sync.import_reservation(_row())[0]
@@ -211,7 +175,6 @@ def imported(db):
 @pytest.mark.django_db
 class TestInboxEndpoints:
     def test_inbox_defaults_to_what_needs_work(self, auth_api, imported):
-        # Matched *and* acknowledged, so it should fall out of the default view.
         settled = reservation_sync.import_reservation(
             _row(external_id=2, phone='628222222222'))[0]
         settled.match_status = ReservationRequest.MATCH_MATCHED
@@ -241,14 +204,11 @@ class TestInboxEndpoints:
         imported.appointment.refresh_from_db()
         assert imported.match_status == ReservationRequest.MATCH_MATCHED
         assert imported.matched_patient_id == patient.patient_no
-        # The chart is the subject once one is attached.
         assert imported.appointment.patient_id == patient.patient_no
         assert imported.appointment.guest_name is None
-        # Linking counts as looking at it.
         assert imported.acknowledged_at is not None
 
     def test_cannot_repoint_a_booking_already_in_the_queue(self, auth_api, imported):
-        """ActivePatient was created against whoever the row said it was."""
         active = ActivePatient.objects.create(
             guest_name='Siti Rahma', status=1, consult_status=False)
         imported.appointment.linked_active_patient = active
@@ -275,7 +235,6 @@ class TestInboxEndpoints:
         assert res.status_code == 200
         imported.refresh_from_db()
         assert imported.acknowledged_at is not None
-        # A guest booking stays a guest booking — acknowledging is not linking.
         assert imported.matched_patient_id is None
         assert imported.appointment.patient_id is None
 
@@ -289,11 +248,8 @@ class TestInboxEndpoints:
         assert 'connection refused' in res.data['error']
 
 
-# ── The bridge into the queue ────────────────────────────────────────────────
-
 @pytest.mark.django_db
 def test_an_online_booking_checks_in_through_the_ordinary_door(auth_api):
-    """One code path puts somebody in the queue, whatever booked them."""
     patient = Patient.objects.create(name='Siti Rahma', phone_number='08123456789')
     row_obj = reservation_sync.import_reservation(_row())[0]
 
@@ -307,6 +263,4 @@ def test_an_online_booking_checks_in_through_the_ordinary_door(auth_api):
     assert row_obj.appointment.status == 'arrived'
     active = ActivePatient.objects.get(pk=res.data['active_patient']['id'])
     assert active.patient_no_id == patient.patient_no
-    # No practitioner on a web booking, so it goes straight to the treatment
-    # queue, exactly as a treatment-only walk-in does.
     assert active.status == 3

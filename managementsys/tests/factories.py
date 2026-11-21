@@ -1,9 +1,3 @@
-"""factory_boy builders for the test suite.
-
-Keep factories minimal — only fields required for a row to save. Tests override
-whatever they assert on. Money values use whole rupiah; FIFO batch unit cost is
-``value / quantity_initial``.
-"""
 import factory
 from django.utils import timezone
 
@@ -31,7 +25,7 @@ class BranchFactory(factory.django.DjangoModelFactory):
 class AppUserFactory(factory.django.DjangoModelFactory):
     class Meta:
         model = AppUser
-        skip_postgeneration_save = True  # the pin hook saves explicitly
+        skip_postgeneration_save = True
 
     display_name = factory.Sequence(lambda n: f"Cashier {n}")
     role = "cashier"
@@ -39,7 +33,6 @@ class AppUserFactory(factory.django.DjangoModelFactory):
 
     @factory.post_generation
     def pin(obj, create, extracted, **kwargs):
-        """Set a hashed PIN (default 123456). Usage: AppUserFactory(pin='654321')."""
         obj.set_pin(extracted or "123456")
         if create:
             obj.save()
@@ -67,8 +60,6 @@ class InventoryItemFactory(factory.django.DjangoModelFactory):
 
 
 class InventoryBatchFactory(factory.django.DjangoModelFactory):
-    """A FIFO batch. Default: 100 units worth 500000 -> 5000/unit COGS."""
-
     class Meta:
         model = InventoryBatch
 

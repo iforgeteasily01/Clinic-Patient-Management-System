@@ -11,11 +11,6 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument('display_name', type=str, help='Display name for the user')
         parser.add_argument('pin', type=str, help='6-digit numeric PIN')
-        # Choices come from the model, not a literal list. The literal that used
-        # to be here said `['admin']`, which is not one of AppUser.ROLE_CHOICES —
-        # Django does not enforce choices at the database level, so every user
-        # this command created carried a role no permission check recognises and
-        # was silently locked out of every role-gated screen.
         parser.add_argument(
             '--role', type=str, default='superuser',
             choices=[value for value, _ in AppUser.ROLE_CHOICES],

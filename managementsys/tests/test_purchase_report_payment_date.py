@@ -1,10 +1,3 @@
-"""The purchase report carries each invoice's settlement date.
-
-A purchase is settled in instalments, each PurchasePayment with its own date,
-so there is no single payment date on PurchaseInvoice. The report files an
-invoice under its *newest* payment, and an invoice with no payment rows reports
-an empty date rather than guessing at the purchase date.
-"""
 import datetime
 import io
 
@@ -45,8 +38,6 @@ def purchases(db):
     supplier  = Supplier.objects.create(name='PT Contoh')
     warehouse = WarehouseFactory(code='G1')
     item      = InventoryItemFactory()
-    # Two instalments, deliberately out of chronological insert order so a
-    # "last row wins" implementation would pick the wrong one.
     paid = _invoice(
         supplier, warehouse, item,
         internal_id='PI-PAID', purchase_date=datetime.date(2026, 11, 1),
@@ -72,9 +63,7 @@ def test_json_report_carries_last_payment_date(auth_api, purchases):
     assert res.status_code == 200, res.content
     headers = {g['header']['No Transaksi']: g['header'] for g in res.json()['groups']}
 
-    # The newest of the two instalments, not the most recently inserted row.
     assert headers['PI-PAID']['Tgl. Bayar'] == '2026-11-10'
-    # Never falls back to the purchase date.
     assert headers['PI-UNPAID']['Tgl. Bayar'] == ''
     assert headers['PI-UNPAID']['Tanggal'] == '2026-11-03'
 

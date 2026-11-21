@@ -3,13 +3,11 @@ import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0050_merge_20260605_0111'),
     ]
 
     operations = [
-        # ── Supplier ───────────────────────────────────────────────────────────
         migrations.CreateModel(
             name='Supplier',
             fields=[
@@ -24,7 +22,6 @@ class Migration(migrations.Migration):
             options={'ordering': ['name']},
         ),
 
-        # ── PurchaseInvoice ────────────────────────────────────────────────────
         migrations.CreateModel(
             name='PurchaseInvoice',
             fields=[
@@ -62,7 +59,6 @@ class Migration(migrations.Migration):
             options={'ordering': ['-purchase_date', '-created_at']},
         ),
 
-        # ── PurchaseInvoiceItem ────────────────────────────────────────────────
         migrations.CreateModel(
             name='PurchaseInvoiceItem',
             fields=[
@@ -86,7 +82,6 @@ class Migration(migrations.Migration):
             options={'ordering': ['id']},
         ),
 
-        # ── AccountTransfer ────────────────────────────────────────────────────
         migrations.CreateModel(
             name='AccountTransfer',
             fields=[
@@ -116,7 +111,6 @@ class Migration(migrations.Migration):
             options={'ordering': ['-transfer_date', '-created_at']},
         ),
 
-        # ── Extend LedgerEntry ─────────────────────────────────────────────────
         migrations.AddField(
             model_name='ledgerentry',
             name='source_type',

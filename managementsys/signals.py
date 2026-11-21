@@ -1,13 +1,3 @@
-"""
-signals.py
-Django signal handlers that push events to Vercel after:
-  - A patient checks in      (ActivePatient created)
-  - A treatment session starts (TreatmentSession created)
-  - An invoice is created    (Invoice created)
-
-Plus one integrity guard: dropping guest-only PatientNote rows before the visit
-they hang off is deleted (see below).
-"""
 from django.db.models.signals import post_save, pre_delete
 from django.dispatch import receiver
 
@@ -15,35 +5,18 @@ from .models import ActivePatient, Invoice, PatientNote, TreatmentSession
 from .vercel_push import push
 
 
-# ── Guest note cleanup ────────────────────────────────────────────────────────
-
 @receiver(pre_delete, sender=ActivePatient)
 def on_active_patient_deleted(sender, instance, **kwargs):
-    """Delete notes that would be left with no subject at all.
-
-    ``PatientNote.active_patient`` is SET_NULL, and PatientNote carries a
-    CheckConstraint requiring patient_no OR active_patient. For a walk-in guest
-    the note has no patient_no, so the SET_NULL that Django runs while deleting
-    the visit would produce a row violating that constraint — an IntegrityError
-    right in the middle of checkout (``BillingCompleteView``) or queue-clearing.
-
-    Notes that also carry a patient_no keep their subject and are left alone;
-    they simply lose the visit link, which is what SET_NULL is for.
-    """
     PatientNote.objects.filter(
         active_patient_id=instance.pk, patient_no__isnull=True,
     ).delete()
 
 
-# ── Patient check-in ──────────────────────────────────────────────────────────
-
 @receiver(post_save, sender=ActivePatient)
 def on_active_patient_created(sender, instance, created, **kwargs):
-    """Push a checkin event the moment a patient arrives."""
     if not created:
         return
 
-    # Resolve patient name (registered patient or walk-in guest)
     if instance.patient_no_id and instance.patient_no:
         patient_name = instance.patient_no.name
         patient_no   = instance.patient_no.patient_no
@@ -59,11 +32,8 @@ def on_active_patient_created(sender, instance, created, **kwargs):
     )
 
 
-# ── Treatment session starts ──────────────────────────────────────────────────
-
 @receiver(post_save, sender=TreatmentSession)
 def on_treatment_session_created(sender, instance, created, **kwargs):
-    """Push an in_treatment event when a beautician starts a session."""
     if not created:
         return
 
@@ -89,15 +59,11 @@ def on_treatment_session_created(sender, instance, created, **kwargs):
     )
 
 
-# ── Invoice completed ─────────────────────────────────────────────────────────
-
 @receiver(post_save, sender=Invoice)
 def on_invoice_created(sender, instance, created, **kwargs):
-    """Push an invoice_completed event when an invoice is saved."""
     if not created:
         return
 
-    # Resolve patient
     if instance.patient_no_id and instance.patient_no:
         patient_name = instance.patient_no.name
         patient_no   = instance.patient_no.patient_no
@@ -105,18 +71,12 @@ def on_invoice_created(sender, instance, created, **kwargs):
         patient_name = None
         patient_no   = None
 
-    # Resolve payment method name. payment_method is the legacy field the
-    # dashboard has always read; payment_account (design doc §3) is the newer
-    # direct cash/bank reference, so fall back to its name rather than send
-    # the dashboard a blank when only payment_account was set.
     payment_method_name = None
     if instance.payment_method_id and instance.payment_method:
         payment_method_name = instance.payment_method.name
     elif instance.payment_account_id and instance.payment_account:
         payment_method_name = instance.payment_account.name
 
-    # Build line items from related InvoiceItems
-    # Use prefetch if available, otherwise hit DB (signal context may not have prefetch)
     try:
         items = [
             {

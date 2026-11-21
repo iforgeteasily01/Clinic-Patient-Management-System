@@ -1,10 +1,3 @@
-"""Migration 0089 — BCA/Mandiri account unification.
-
-Builds the pre-migration COA shape (six per-instrument asset accounts, six
-payment methods, some prior ledger history), runs the migration's forward
-function against the live app registry, and checks that the money moved without
-disturbing anything already in the books.
-"""
 import importlib
 from datetime import date
 from decimal import Decimal
@@ -22,13 +15,11 @@ from managementsys.models import (
 
 from .factories import ChartOfAccountsFactory, PaymentMethodFactory
 
-# Module name starts with a digit, so it cannot be a plain import statement.
 migration = importlib.import_module(
     'managementsys.migrations.0089_unify_bank_accounts'
 )
 
 
-# account_number -> (name, starting balance)
 INSTRUMENTS = {
     1100002: ('Transfer BCA',   Decimal('15114009.07')),
     1100003: ('Debit BCA',      Decimal('183458200.00')),
@@ -44,11 +35,6 @@ MANDIRI_TOTAL = sum(INSTRUMENTS[n][1] for n in (1100005, 1100006, 1100007))
 
 @pytest.fixture
 def bank_coa(db):
-    """The pre-0089 cash group: head, six instrument accounts, six methods.
-
-    Each account also carries one prior debit ledger row equal to its balance,
-    standing in for the sales history that must not be touched.
-    """
     head = ChartOfAccountsFactory(
         account_number=1100000, name='Cash & Payment Accounts',
         account_type='asset', is_head=True, is_system=True,
@@ -68,7 +54,6 @@ def bank_coa(db):
             account=account, date=HISTORY_DATE, description=f'Penjualan {name}',
             entry_type='debit', amount=balance, source_type='invoice',
         )
-        # Balancing revenue leg, so the fixture ledger starts balanced.
         LedgerEntry.objects.create(
             account=revenue, date=HISTORY_DATE, description=f'Penjualan {name}',
             entry_type='credit', amount=balance, source_type='invoice',
@@ -115,7 +100,6 @@ def test_all_six_methods_resolve_to_two_accounts(bank_coa):
         'Transfer BCA': 1100002, 'Debit BCA': 1100002, 'Kredit BCA': 1100002,
         'QRIS Mandiri': 1100005, 'Debit Mandiri': 1100005, 'Kredit Mandiri': 1100005,
     }
-    # Names and rows survive — only the GL account they settle to changed.
     assert PaymentMethod.objects.filter(
         name__in=[name for name, _ in INSTRUMENTS.values()]
     ).count() == 6
@@ -128,8 +112,6 @@ def test_trial_balance_unchanged(bank_coa):
     dr_after, cr_after = trial_balance()
 
     moved = BCA_TOTAL - INSTRUMENTS[1100002][1] + MANDIRI_TOTAL - INSTRUMENTS[1100005][1]
-    # Two-legged transfers: debits and credits grow by the same amount, so the
-    # books stay balanced even though both totals move.
     assert dr_after - dr_before == moved
     assert cr_after - cr_before == moved
     assert dr_after == cr_after

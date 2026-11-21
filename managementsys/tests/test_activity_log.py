@@ -1,12 +1,3 @@
-"""Automatic activity logging and the read API it feeds.
-
-Two things are load-bearing here and neither is obvious from the code:
-
-* the middleware must **never** be able to fail a request, and
-* it must **never** store a PIN.
-
-Both get a test of their own.
-"""
 import pytest
 
 from managementsys.activity_log import _redact, describe
@@ -14,8 +5,6 @@ from managementsys.models import AuditLog
 
 from .factories import AppUserFactory
 
-
-# ── describe(): URL → (action, entity, id) ─────────────────────────────────
 
 class TestDescribe:
     @pytest.mark.parametrize('method,path,expected', [
@@ -30,7 +19,6 @@ class TestDescribe:
         assert describe(method, path) == expected
 
     def test_a_trailing_verb_beats_the_method(self):
-        """POST .../void is a VOID. Calling it a CREATE would be a lie in the log."""
         action, entity, entity_id = describe('POST', '/api/invoices/12/void/')
         assert action == 'VOID'
         assert entity == 'Invoice'
@@ -41,8 +29,6 @@ class TestDescribe:
         assert action == 'CREATE'
         assert entity == 'WidgetFrobnicators'
 
-
-# ── Redaction ──────────────────────────────────────────────────────────────
 
 class TestRedaction:
     def test_masks_anything_credential_shaped(self):
@@ -55,11 +41,9 @@ class TestRedaction:
 
     def test_long_lists_are_trimmed_not_stored_whole(self):
         out = _redact({'items': [{'i': n} for n in range(50)]})
-        assert len(out['items']) == 6           # 5 items + the "... more" marker
+        assert len(out['items']) == 6
         assert '45 more' in out['items'][-1]
 
-
-# ── The middleware, end to end ─────────────────────────────────────────────
 
 @pytest.mark.django_db
 class TestMiddlewareRecords:
@@ -75,7 +59,6 @@ class TestMiddlewareRecords:
         assert row.status_code is not None
 
     def test_a_failed_request_is_logged_as_a_failure(self, auth_api):
-        """A 400 is exactly the case somebody will come looking for later."""
         auth_api.post('/api/invoices/create/', {'items': []}, format='json')
 
         row = AuditLog.objects.filter(source=AuditLog.SOURCE_HTTP).first()
@@ -88,7 +71,6 @@ class TestMiddlewareRecords:
         assert not AuditLog.objects.filter(source=AuditLog.SOURCE_HTTP).exists()
 
     def test_login_is_left_to_the_view(self, api, db):
-        """LoginView writes its own richer LOGIN row; two rows for one event is noise."""
         user = AppUserFactory(pin='654321')
         api.post('/api/auth/login/', {'user_id': user.id, 'pin': '654321'}, format='json')
 
@@ -103,7 +85,6 @@ class TestMiddlewareRecords:
             assert '999999' not in str(row.metadata)
 
     def test_a_logging_failure_does_not_fail_the_request(self, auth_api, monkeypatch):
-        """The log is a bystander. If it breaks, the clinic keeps working."""
         import managementsys.activity_log as module
 
         def boom(*args, **kwargs):
@@ -119,8 +100,6 @@ class TestMiddlewareRecords:
         auth_api.post('/api/patients/new/', {}, format='json')
         assert not AuditLog.objects.filter(source=AuditLog.SOURCE_HTTP).exists()
 
-
-# ── The read API ───────────────────────────────────────────────────────────
 
 @pytest.fixture
 def manager_api(api, db):
@@ -146,7 +125,6 @@ class TestActivityLogApi:
                                 status_code=400, method='PATCH', path='/api/invoices/9/')
 
     def test_a_cashier_is_refused(self, auth_api):
-        """auth_user is a cashier. The log is every actor's movements."""
         assert auth_api.get(self.URL).status_code == 403
 
     def test_anonymous_is_refused(self, api):
@@ -189,12 +167,9 @@ class TestActivityLogApi:
         assert body['total_rows'] == 3
 
 
-# ── Health / status ────────────────────────────────────────────────────────
-
 @pytest.mark.django_db
 class TestSystemEndpoints:
     def test_health_needs_no_token(self, api):
-        """The launcher polls this before anyone has logged in."""
         response = api.get('/api/system/health/')
         assert response.status_code == 200
         assert response.json()['status'] == 'ok'

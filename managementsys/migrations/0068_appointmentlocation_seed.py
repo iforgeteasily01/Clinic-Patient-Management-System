@@ -1,7 +1,5 @@
 from django.db import migrations
 
-# Starter rooms so the booking form's location dropdown is usable on first run.
-# ihs_id stays null until each room is registered as a SatuSehat Location.
 SEED_LOCATIONS = [
     ('Ruang Konsultasi 1', 'K1'),
     ('Ruang Konsultasi 2', 'K2'),
@@ -26,7 +24,6 @@ def unseed_locations(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0067_appointmentlocation_doctors_ihs_id_doctors_nik_and_more'),
     ]

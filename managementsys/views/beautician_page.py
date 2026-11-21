@@ -3,7 +3,6 @@ from django.http import HttpResponse
 from django.db.models import Q
 
 
-
 def GetActivePatientForBeautician(status_input: int):
     if(status_input <= 2 and status_input > 0):
         list_patient = ActivePatient.objects.filter(status = status_input)
@@ -12,8 +11,6 @@ def GetActivePatientForBeautician(status_input: int):
         print("Patient has finished treatment")
 
 
-
-#since patient_id is unique, then using filter shouldn't ha
 def UpdatePatientTreatment(id_input: str, target_status = int):
     ActivePatient.objects.filter(patient_id = id_input).update(status = target_status)
 

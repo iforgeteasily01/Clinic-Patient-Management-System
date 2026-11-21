@@ -1,13 +1,3 @@
-"""Free any beautician stuck at available=False with no patient actually in
-treatment (status 4). Safe to run repeatedly / on a schedule.
-
-`Beauticians.available` is a denormalized flag toggled at session start/end —
-see BeauticianAdminStatusSerializer.get_current_session's `is_stuck` logic,
-which this mirrors. The relevant write paths now reset it on every way a
-session can end, but this sweep is a backstop for anything that reaches the
-flag outside those paths (manual DB edits, data imported before this fix, a
-future code path that forgets to call `_release_beauticians`).
-"""
 from django.core.management.base import BaseCommand
 
 from managementsys.models import Beauticians

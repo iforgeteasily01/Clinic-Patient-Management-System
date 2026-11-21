@@ -1,24 +1,3 @@
-"""GET /api/reports/stock-movement/ and its .xlsx twin.
-
-Classifies every stockable InventoryItem into fast / normal / slow / dead /
-never_sold, using the tunable windows on ReportSettings. See
-docs/stock-movement-patient-activity-design.md §2 for the exact rules — the
-classification order (never_sold -> dead -> slow -> fast -> normal) and the
-inclusive tie handling at the fast-window percentile cut are both load-bearing
-and reproduced here verbatim, not reinvented.
-
-Movement means a sale (a non-voided InvoiceItem). StockOutLog rows (wastage,
-internal issue, treatment consumption) are not movement — an item burned
-through internal use is not selling — but the report still surfaces the most
-recent stock-out date as a separate column so the operator can tell "dead but
-consumed internally" from "dead and untouched".
-
-Performance: this never queries per item. Three aggregate queries (lifetime
-last-sale + slow-window quantity, fast-window quantity, stock valuation) plus
-one small stock-out aggregate, joined in Python over dicts keyed by item_id —
-see module functions below. The catalog is a few thousand rows; that is fine,
-one query per item is not.
-"""
 import datetime
 import io
 from decimal import Decimal
@@ -46,10 +25,6 @@ _ALLOWED_ORDERINGS = {
     'stock_value', '-stock_value',
 }
 
-# 'qty_sold'/'-qty_sold' sorts by the fast-window quantity — the response has
-# no single "qty_sold" column (it splits fast/slow windows out deliberately),
-# and the fast window is the metric a "which items are moving right now"
-# report defaults to.
 _SORT_FIELD = {
     'code': 'code', 'name': 'name',
     'qty_sold': 'qty_sold_fast_window',
@@ -73,15 +48,6 @@ def _parse_as_of(request):
 
 
 def _classify(days_since_last_sale, in_fast_window, is_top_percentile, *, slow_days, dead_days):
-    """The order in the design doc, reproduced exactly: never_sold -> dead ->
-    slow -> fast -> normal. Dead/slow are checked before the ranking branch so
-    a stale item can never be pulled back into 'fast' by a coincidental old
-    sale — by construction an item in the fast window has days_since <=
-    stock_fast_window_days, which ReportSettings validation guarantees is
-    shorter than the slow window, so this ordering is never actually
-    ambiguous; it is kept explicit anyway because that guarantee lives in a
-    different file (api/serializers.py ReportSettingsSerializer).
-    """
     if days_since_last_sale is None:
         return 'never_sold'
     if days_since_last_sale >= dead_days:
@@ -94,12 +60,6 @@ def _classify(days_since_last_sale, in_fast_window, is_top_percentile, *, slow_d
 
 
 def _build_rows(request):
-    """Shared by the JSON view and the .xlsx export.
-
-    Returns (as_of, thresholds_dict, rows, error_response_or_None). ``rows``
-    covers every bucket — callers filter by ?bucket themselves, since the
-    summary needs the unfiltered set and the JSON `results` page does not.
-    """
     as_of, err = _parse_as_of(request)
     if err:
         return None, None, None, Response({'error': err}, status=status.HTTP_400_BAD_REQUEST)
@@ -125,7 +85,6 @@ def _build_rows(request):
     fast_start = _local_midnight(as_of - datetime.timedelta(days=fast_window_days - 1))
     slow_start = _local_midnight(as_of - datetime.timedelta(days=slow_days - 1))
 
-    # ── Query 1: lifetime last-sale date + slow-window quantity, per item ──
     sale_lines = InvoiceItem.objects.filter(invoice__is_voided=False, invoice__datetime__lt=as_of_end)
     if warehouse_id:
         sale_lines = sale_lines.filter(invoice__warehouse_id=warehouse_id)
@@ -138,17 +97,14 @@ def _build_rows(request):
         )
     }
 
-    # ── Query 2: fast-window quantity, per item ──
     fast = {
         r['item_id']: r['qty_fast']
         for r in sale_lines.filter(invoice__datetime__gte=fast_start)
                             .values('item_id').annotate(qty_fast=Sum('quantity'))
     }
 
-    # ── Query 3: stock on hand + value, per item (shared with StockLevelView) ──
     valuation = stock_valuation_by_item(warehouse_id=warehouse_id)
 
-    # ── Small extra aggregate: most recent internal stock-out, per item ──
     stockout_logs = StockOutLog.objects.all()
     if warehouse_id:
         stockout_logs = stockout_logs.filter(warehouse_id=warehouse_id)
@@ -157,10 +113,6 @@ def _build_rows(request):
         for r in stockout_logs.values('item_id').annotate(last_out=Max('out_date'))
     }
 
-    # ── Percentile ranking over items with non-zero sales in the fast window ──
-    # Ties at the cut line are resolved inclusively: every item with the same
-    # quantity as the last "fast" item is also fast, so two identical items
-    # never land in different buckets.
     ranked = sorted(
         ((iid, qty) for iid, qty in fast.items() if qty and qty > 0),
         key=lambda pair: (-pair[1], pair[0]),
@@ -168,7 +120,6 @@ def _build_rows(request):
     n_ranked = len(ranked)
     cutoff_qty = None
     if n_ranked:
-        # Ceiling division: rank 1 of 50 at top_percent=20 -> ranks 1..10.
         cutoff_count = min(max(-(-(n_ranked * fast_top_percent) // 100), 1), n_ranked)
         cutoff_qty = ranked[cutoff_count - 1][1]
     rank_by_item = {iid: idx + 1 for idx, (iid, _qty) in enumerate(ranked)}
@@ -308,8 +259,6 @@ class StockMovementReportView(APIView):
         })
 
 
-# ── .xlsx export ─────────────────────────────────────────────────────────────
-
 _EXPORT_COLUMNS = [
     'Kode', 'Nama', 'Kategori', 'Satuan', 'Stok', 'Nilai Stok',
     'Terjual (Fast Window)', 'Terjual (Slow Window)',
@@ -340,12 +289,6 @@ def _row_to_excel(r):
 
 
 def _build_workbook(as_of, rows, ordering):
-    """One Summary sheet + one sheet per bucket, built from the same
-    ``_write_banner``/``_write_table_header``/``_write_data_row``/``_autosize``
-    primitives ``reports_page._report_to_xlsx`` uses. That function itself
-    isn't reusable verbatim here — it builds exactly one sheet — so this
-    mirrors its finalization pattern instead of calling it.
-    """
     wb = openpyxl.Workbook()
     period_label = f'per {as_of.isoformat()}'
 
@@ -380,8 +323,6 @@ def _build_workbook(as_of, rows, ordering):
 
 
 class StockMovementExportView(APIView):
-    """GET /api/reports/stock-movement/export/ — same params, returns .xlsx."""
-
     def get(self, request):
         as_of, _thresholds, rows, err = _build_rows(request)
         if err:

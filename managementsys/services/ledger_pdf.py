@@ -1,23 +1,3 @@
-"""Server-side PDF rendering for the COA ledger — Feature C of
-``docs/DESIGN_expense_redesign_and_coa_print.md`` §4.
-
-Why this lives in ``services/`` and not in a view: reportlab imports are heavy
-and the layout vocabulary (flowables, table styles, canvases) has nothing to do
-with HTTP. The view parses/validates query params, pulls the rows from
-``financial_reports_utils.ledger_rows_with_balance()`` and hands the finished
-data here; this module never touches the request and never walks a balance.
-
-Why reportlab and not WeasyPrint: WeasyPrint needs GTK/Cairo/Pango system
-libraries. This project runs on Windows with no Docker (root ``CLAUDE.md``),
-where that install is genuinely painful. reportlab is pure Python.
-
-Reusability
------------
-``report_header()``, ``NumberedCanvas`` and the ``format_*`` helpers are
-deliberately free of any ledger-specific knowledge — the Trial Balance and Cash
-Flow reports have no print path yet and should build on exactly these pieces
-rather than growing a second header block that drifts out of sync.
-"""
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO
@@ -31,10 +11,6 @@ from reportlab.platypus import (
     CondPageBreak, LongTable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle,
 )
 
-# ── Locale ───────────────────────────────────────────────────────────────────
-# Hardcoded on purpose: the server locale is not guaranteed to be id_ID and a
-# report that silently renders "August" on one machine and "Agustus" on another
-# is worse than no report.
 MONTHS_ID = [
     'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
     'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
@@ -44,14 +20,10 @@ MONTHS_ID_SHORT = [
     'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des',
 ]
 
-# Fallback when SiteConfig has no clinic_name set. SiteConfig.clinic_name is the
-# real source (see resolve_clinic_name below) — this only covers a fresh install
-# where the admin has not filled in the receipt settings yet.
-# TODO: remove once SiteConfig.clinic_name is enforced non-blank at setup.
 DEFAULT_CLINIC_NAME = 'Klinik'
 
 ZERO = Decimal('0')
-EMPTY = '—'  # em dash, stands in for a zero/absent amount
+EMPTY = '—'
 
 _FONT = 'Helvetica'
 _FONT_BOLD = 'Helvetica-Bold'
@@ -70,15 +42,7 @@ ENTRY_TYPE_LABELS = {
 }
 
 
-# ── Formatting helpers (single source of truth) ──────────────────────────────
-
 def format_amount(value):
-    """Indonesian money formatting: 1234567.5 -> '1.234.567,50'.
-
-    The ONE place thousands/decimal separators are decided. Returns the em-dash
-    placeholder for None so callers never have to special-case a missing value;
-    a genuine zero still renders as '0,00'.
-    """
     if value is None:
         return EMPTY
     try:
@@ -91,42 +55,36 @@ def format_amount(value):
 
 
 def _amount_cell(value):
-    """Debit/Kredit cell: blank amounts and zeros read as '—', not '0,00'."""
     if value is None or Decimal(value) == ZERO:
         return EMPTY
     return format_amount(value)
 
 
 def format_date_long(d):
-    """05 Agustus 2026"""
     if not d:
         return ''
     return f'{d.day:02d} {MONTHS_ID[d.month - 1]} {d.year}'
 
 
 def format_date_short(d):
-    """05 Agu 2026"""
     if not d:
         return ''
     return f'{d.day:02d} {MONTHS_ID_SHORT[d.month - 1]} {d.year}'
 
 
 def format_date_cell(d):
-    """05/08 — the narrow Tgl column; the year lives in the period header."""
     if not d:
         return ''
     return f'{d.day:02d}/{d.month:02d}'
 
 
 def format_month_long(d):
-    """Agustus 2026"""
     if not d:
         return ''
     return f'{MONTHS_ID[d.month - 1]} {d.year}'
 
 
 def format_datetime(dt):
-    """05 Agu 2026 14:22"""
     if not dt:
         return ''
     return f'{format_date_short(dt)} {dt.hour:02d}:{dt.minute:02d}'
@@ -143,28 +101,15 @@ def period_label(date_from, date_to):
 
 
 def resolve_clinic_name():
-    """Clinic name for the report banner.
-
-    Source of truth is ``SiteConfig.clinic_name`` (the singleton behind the
-    receipt/branding settings — the same field ``reports_page.py`` prints on the
-    Excel reports). Read-only on purpose: ``SiteConfig.get_solo()`` would
-    get_or_create, and printing a report should never write a row.
-    """
     try:
         from ..models import SiteConfig
         cfg = SiteConfig.objects.only('clinic_name').first()
-    except Exception:  # pragma: no cover - DB unavailable / app not loaded
+    except Exception:  # pragma: no cover
         cfg = None
     return (getattr(cfg, 'clinic_name', '') or '').strip() or DEFAULT_CLINIC_NAME
 
 
 def ledger_ref(entry):
-    """The Ref column: whatever identifier the row actually carries.
-
-    Built here rather than read off ``LedgerEntrySerializer`` because the PDF
-    wants one short human string, not four nullable fields. Order matters —
-    an entry has at most one of these relations, so first hit wins.
-    """
     inv = getattr(entry, 'invoice', None)
     if inv is not None:
         return str(getattr(inv, 'invoice_number', '') or f'INV-{inv.pk}')
@@ -184,17 +129,7 @@ def ledger_ref(entry):
     return ''
 
 
-# ── Generic building blocks (shared with future reports) ─────────────────────
-
 class NumberedCanvas(pdf_canvas.Canvas):
-    """Two-pass page numbering: 'Hal. 3 dari 7'.
-
-    A page footer cannot know the total page count while that page is being
-    laid out, so every page state is buffered and only flushed in ``save()``,
-    once the total is known. Standard reportlab recipe; kept generic so the
-    Trial Balance / Cash Flow PDFs can pass the same ``canvasmaker``.
-    """
-
     _FOOTER_MARGIN_X = 15 * mm
     _FOOTER_MARGIN_Y = 10 * mm
 
@@ -234,15 +169,6 @@ _STYLE_CELL = ParagraphStyle('cell', fontName=_FONT, fontSize=7.5, leading=9.5, 
 
 
 def report_header(clinic, title, subtitle='', meta=(), warning='', width=None):
-    """Flowables for the banner every printed report shares.
-
-    ``meta`` is a sequence of ``(label, value)`` pairs rendered as an aligned
-    two-column block ("Akun : Bank BCA"); blank values are dropped. ``warning``
-    renders in red directly under the subtitle — reserved for facts that change
-    how the numbers should be read, not for decoration.
-
-    Ledger-agnostic: pass whatever label/value pairs the report needs.
-    """
     flow = [Paragraph(clinic or DEFAULT_CLINIC_NAME, _STYLE_CLINIC)]
     if title:
         flow.append(Paragraph(title, _STYLE_TITLE))
@@ -271,10 +197,7 @@ def report_header(clinic, title, subtitle='', meta=(), warning='', width=None):
     return flow
 
 
-# ── Ledger-specific layout ───────────────────────────────────────────────────
-
 _COLUMNS = ['Tgl', 'Keterangan', 'Ref', 'Debit', 'Kredit', 'Saldo']
-# Proportions of the printable width, with and without the Saldo column.
 _WIDTHS_WITH_SALDO = [0.075, 0.360, 0.145, 0.130, 0.130, 0.160]
 _WIDTHS_NO_SALDO = [0.075, 0.480, 0.165, 0.140, 0.140]
 
@@ -325,16 +248,12 @@ def _entry_row(entry, show_running):
 
 
 def _escape(text):
-    """Paragraph parses a mini-HTML dialect — a stray '&' or '<' in a memo
-    would otherwise blow up the whole render."""
     return (
         str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     )
 
 
 def _banner_row(label, amount, n_cols, italic=False):
-    """A full-width label + one right-aligned amount in the last column,
-    laid out on the ledger's own grid so it lines up with the table above."""
     row = [label] + [''] * (n_cols - 1)
     row[-1] = format_amount(amount)
     style = [
@@ -353,11 +272,6 @@ def _banner_row(label, amount, n_cols, italic=False):
 
 
 def _group_rows(rows, group_by):
-    """-> [(label_or_None, [rows])] in ascending order.
-
-    ``rows`` is already ascending (ledger_rows_with_balance guarantees it), so a
-    simple run-length grouping preserves order without re-sorting.
-    """
     if group_by not in ('day', 'month'):
         return [(None, list(rows))]
 
@@ -374,23 +288,6 @@ def _group_rows(rows, group_by):
 
 
 def build_ledger_pdf(account, rows, opening, closing, totals, opts) -> bytes:
-    """Render one account's ledger to PDF bytes.
-
-    ``account``  ChartOfAccounts (needs ``name`` and ``account_number``)
-    ``rows``     ascending LedgerEntry list, each with ``running_balance``
-    ``opening``  natural-signed balance before ``date_from``
-    ``closing``  natural-signed balance after the last entry in the window
-    ``totals``   mapping with ``debit``/``credit`` (a 2-tuple also works)
-    ``opts``     mapping; every key optional —
-                 ``date_from``, ``date_to``, ``entry_type``, ``title``,
-                 ``subtitle``, ``group_by`` (none|day|month),
-                 ``page_break`` (none|group), ``show_opening``,
-                 ``show_running``, ``show_subtotals``,
-                 ``orientation`` (portrait|landscape), ``printed_by``,
-                 ``printed_at``, ``unposted_count``, ``clinic_name``.
-
-    The caller owns validation. This function renders whatever it is given.
-    """
     o = dict(opts or {})
     date_from = o.get('date_from')
     date_to = o.get('date_to')
@@ -435,7 +332,7 @@ def build_ledger_pdf(account, rows, opening, closing, totals, opts) -> bytes:
     story = report_header(
         clinic, title, subtitle,
         meta=[
-            ('Akun', account.name),                       # name first, deliberately
+            ('Akun', account.name),
             ('No. Akun', account.account_number),
             ('Periode', period_label(date_from, date_to)),
             ('Filter', ENTRY_TYPE_LABELS.get(o.get('entry_type') or '', 'Semua transaksi')),
@@ -458,8 +355,6 @@ def build_ledger_pdf(account, rows, opening, closing, totals, opts) -> bytes:
         for label, grows in _group_rows(rows, group_by):
             block = []
             if label:
-                # Keep a group heading off the very bottom of a page — a heading
-                # stranded above a page break reads as an empty group.
                 block += [
                     CondPageBreak(24 * mm),
                     Paragraph(f'—— {_escape(label)} ——', _STYLE_GROUP),
@@ -490,8 +385,6 @@ def build_ledger_pdf(account, rows, opening, closing, totals, opts) -> bytes:
 
     for i, block in enumerate(blocks):
         if i:
-            # A fresh flowable per gap: platypus mutates flowables during layout,
-            # so one shared instance cannot be reused across the story.
             story.append(PageBreak() if page_break == 'group' else Spacer(1, 10))
         story.extend(block)
 
@@ -527,7 +420,5 @@ def build_ledger_pdf(account, rows, opening, closing, totals, opts) -> bytes:
     ftable.setStyle(TableStyle(foot_style))
     story.append(ftable)
 
-    # multiBuild + NumberedCanvas: the canvas buffers pages so the footer can
-    # print a total that is only known once the last page is laid out.
     doc.multiBuild(story, canvasmaker=NumberedCanvas)
     return buf.getvalue()

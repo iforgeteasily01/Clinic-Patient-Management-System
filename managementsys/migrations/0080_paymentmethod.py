@@ -1,17 +1,8 @@
-"""Introduce the PaymentMethod model.
-
-Phase 1 of the accounting redesign: "how the customer paid" becomes its own
-entity instead of being a direct FK to ChartOfAccounts. This migration only
-adds the new model and new (nullable, temporary) FK columns alongside the
-existing ones — 0081 backfills PaymentMethod rows and repoints the values,
-and 0082 drops the old columns / renames the new ones into place.
-"""
 from django.db import migrations, models
 import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0079_coa_backfill_orphan_parents'),
     ]

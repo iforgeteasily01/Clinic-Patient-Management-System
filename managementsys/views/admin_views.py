@@ -179,7 +179,6 @@ class BeauticianListCreateAdminView(generics.ListCreateAPIView):
     queryset = Beauticians.objects.all().order_by('beautician_name')
 
     def get_serializer_class(self):
-        # Use rich status serializer for reads; plain one for writes
         if self.request.method == 'GET':
             return BeauticianAdminStatusSerializer
         return BeauticiansSerializer
@@ -221,11 +220,6 @@ class BeauticianDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
 
 
 class BeauticianReleaseView(APIView):
-    """
-    POST /api/admin/beauticians/<pk>/release/
-    Force-releases a beautician who is stuck (available=False but patient is no longer
-    in active treatment). Sets available=True and logs the action.
-    """
     def post(self, request, pk):
         try:
             beautician = Beauticians.objects.get(id=pk)
@@ -292,15 +286,11 @@ class AppUserDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
         instance.delete()
 
 
-# ── Chart of Accounts ──────────────────────────────────────────────────────
-
 class ChartOfAccountsListCreateView(generics.ListCreateAPIView):
     serializer_class = ChartOfAccountsSerializer
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
-        # Treatment / item counts per category, so the COA page can show how
-        # much each per-category account actually covers without an N+1.
         counts = {}
         for cat_id, is_service, total in (
             InventoryItem.objects
@@ -329,8 +319,6 @@ class ChartOfAccountsListCreateView(generics.ListCreateAPIView):
         )
         range_param = self.request.query_params.get('range', '').strip()
         if range_param == 'cash':
-            # Return sub-accounts of the system cash head (account 1100000).
-            # This is the authoritative filter for POS payment method accounts.
             qs = qs.filter(parent__account_number=1100000, is_head=False)
         elif range_param == 'inventory':
             qs = qs.filter(account_number__gte=1200000, account_number__lte=1299999)
@@ -379,20 +367,6 @@ class ChartOfAccountsDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 
 class AccountLedgerView(APIView):
-    """GET /api/admin/accounts/<pk>/ledger/
-
-    Query params (all optional):
-      date_from   YYYY-MM-DD
-      date_to     YYYY-MM-DD
-      entry_type  'debit' | 'credit'
-
-    Entries come back ASCENDING (oldest first) — a running-balance ledger has
-    to read top-down — each carrying `balance`, the account's balance after
-    that entry. `opening_balance` is the natural-signed balance before
-    `date_from` (0 when no `date_from`); `closing_balance` is the balance after
-    every entry in the window, regardless of the `entry_type` display filter.
-    """
-
     def get(self, request, pk):
         try:
             account = ChartOfAccounts.objects.get(pk=pk)
@@ -408,17 +382,11 @@ class AccountLedgerView(APIView):
             branch_ids=read_branch_ids(request),
         )
 
-        # LedgerEntrySerializer is shared with other endpoints, so `balance` is
-        # not a serializer field — zip it onto the serialized dicts instead.
-        # `rows` and `.data` are the same list in the same order.
         entries = LedgerEntrySerializer(rows, many=True).data
         for row, entry in zip(rows, entries):
             entry['balance'] = str(row.running_balance)
 
         return Response({
-            # Full account serializer, not a hand-rolled dict: the ledger page
-            # is where an account's linkage (the treatment category or vendor
-            # it serves) is shown now that the COA list dropped that column.
             'account': ChartOfAccountsSerializer(account).data,
             'entries': entries,
             'opening_balance': str(opening),
@@ -428,11 +396,6 @@ class AccountLedgerView(APIView):
         })
 
 
-# ── Ledger print (PDF) ───────────────────────────────────────────────────────
-
-# A full-history print of a busy cash account materialises every row twice —
-# once as data, once as a platypus flowable. Cap the window rather than let a
-# stray click OOM the server.
 MAX_LEDGER_PRINT_DAYS = 366
 
 _BOOL_TRUE = {'1', 'true', 'yes', 'on', 't', 'y'}
@@ -447,8 +410,6 @@ def _bad(message):
 
 
 def _param_date(raw, name):
-    """-> (date|None, error|None). Blank is None, garbage is an error — never a
-    silent fallback to 'today' or 'all time'."""
     raw = (raw or '').strip()
     if not raw:
         return None, None
@@ -459,9 +420,6 @@ def _param_date(raw, name):
 
 
 def _param_enum(raw, allowed, name):
-    """-> (value, error|None). An unrecognised value is a 400, so a typo in the
-    query string can never quietly print a different report than the one asked
-    for."""
     value = (raw or '').strip().lower()
     if value not in allowed:
         shown = ', '.join(repr(a) for a in allowed)
@@ -481,26 +439,6 @@ def _param_bool(raw, name, default=True):
 
 
 class AccountLedgerPrintView(APIView):
-    """GET /api/admin/accounts/<pk>/ledger/print/ → application/pdf
-
-    The printable twin of ``AccountLedgerView``. Both read the same rows from
-    ``ledger_rows_with_balance()``, so the PDF and the screen can never
-    disagree about a balance.
-
-    Query params — see docs/DESIGN_expense_redesign_and_coa_print.md §4.2:
-      date_from, date_to   YYYY-MM-DD, both required
-      entry_type           '' | debit | credit          (default '')
-      title                str                          (default 'Buku Besar')
-      subtitle             str                          (default '')
-      group_by             none | day | month           (default none)
-      page_break           none | group                 (default none)
-      show_opening / show_running / show_subtotals  bool (default true)
-      orientation          portrait | landscape         (default portrait)
-
-    Served ``inline`` so the browser opens it in a tab the user can Ctrl+P,
-    rather than dropping a file in Downloads.
-    """
-
     def get(self, request, pk):
         try:
             account = ChartOfAccounts.objects.get(pk=pk)
@@ -563,17 +501,12 @@ class AccountLedgerPrintView(APIView):
             branch_ids=read_branch_ids(request),
         )
 
-        # An accountant printing an incomplete ledger with no warning is the
-        # worst failure mode this endpoint has.
         unposted_count = len(unposted_dates_in_range(date_from, date_to))
 
         actor = _actor(request)
         title = (q.get('title') or 'Buku Besar').strip()[:_MAX_TITLE_LEN] or 'Buku Besar'
         subtitle = (q.get('subtitle') or '').strip()[:_MAX_SUBTITLE_LEN]
 
-        # Imported here, not at module scope: reportlab is a heavy third-party
-        # dependency and a missing/broken install should take down this one
-        # endpoint, not every admin route that shares this module.
         from ..services.ledger_pdf import build_ledger_pdf
 
         pdf = build_ledger_pdf(
@@ -603,8 +536,6 @@ class AccountLedgerPrintView(APIView):
         response['Content-Length'] = str(len(pdf))
         return response
 
-
-# ── Payment Methods ──────────────────────────────────────────────────────────
 
 class PaymentMethodListCreateView(generics.ListCreateAPIView):
     serializer_class = PaymentMethodSerializer
@@ -655,8 +586,6 @@ class PaymentMethodDetailView(generics.RetrieveUpdateDestroyAPIView):
         instance.delete()
 
 
-# ── Treatment Categories ────────────────────────────────────────────────────
-
 class TreatmentCategoryListCreateView(generics.ListCreateAPIView):
     queryset = TreatmentCategory.objects.all()
     serializer_class = TreatmentCategorySerializer
@@ -698,8 +627,6 @@ class TreatmentCategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 
 class TreatmentCategoryAuditAccountsView(APIView):
-    """GET — return every category with per-account presence flags."""
-
     def get(self, request):
         cats = TreatmentCategory.objects.select_related('revenue_account').order_by('name')
         results = []
@@ -715,12 +642,6 @@ class TreatmentCategoryAuditAccountsView(APIView):
 
 
 class TreatmentCategoryProvisionAccountsView(APIView):
-    """POST — create missing COA accounts for all (or specified) categories.
-
-    Body (optional): { "category_ids": [1, 2, 3] }
-    Omit body / send empty list to provision ALL categories that need it.
-    """
-
     def post(self, request):
         category_ids = request.data.get('category_ids') or []
         qs = TreatmentCategory.objects.select_related('revenue_account')
@@ -745,11 +666,7 @@ class TreatmentCategoryProvisionAccountsView(APIView):
         return Response({'provisioned': provisioned, 'count': len(provisioned)})
 
 
-# ── Excel template + import ───────────────────────────────────────────────────
-
 class TreatmentTemplateView(APIView):
-    """GET — download a blank .xlsx template for bulk treatment import."""
-
     def get(self, request):
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -802,23 +719,8 @@ class TreatmentTemplateView(APIView):
 
 
 class TreatmentImportView(APIView):
-    """
-    POST multipart/form-data with file=<xlsx>
-    Columns (row 1 = header, skipped):
-      code | name | category | price | active
-    active: yes/true/1 → True; no/false/0 → False; blank → True
-
-    ?preview=true  — parse only, no DB writes.
-      Returns { rows: [{row, code, name, category, price, active, action, error}] }
-      action: 'create' | 'update' | 'error'
-
-    Normal POST — commits all valid rows.
-      Returns { created, updated, errors: [{row, message}] }
-    """
-
     @staticmethod
     def _parse_rows(ws_rows):
-        """Parse worksheet rows (skipping header) into a list of dicts."""
         result = []
         for i, row in enumerate(ws_rows[1:], start=2):
             padded = list(row) + [None] * 5
@@ -876,7 +778,6 @@ class TreatmentImportView(APIView):
 
         parsed = self._parse_rows(ws_rows)
 
-        # ── Preview mode ────────────────────────────────────────────────────
         if request.query_params.get('preview') == 'true':
             existing_codes = set(
                 Treatment.objects.filter(
@@ -903,7 +804,6 @@ class TreatmentImportView(APIView):
                 })
             return Response({'rows': rows}, status=status.HTTP_200_OK)
 
-        # ── Commit mode ──────────────────────────────────────────────────────
         created = updated = 0
         errors = []
 
@@ -938,8 +838,6 @@ class TreatmentImportView(APIView):
 
         return Response({'created': created, 'updated': updated, 'errors': errors}, status=status.HTTP_200_OK)
 
-
-# ── Treatment Packages ─────────────────────────────────────────────────────
 
 class TreatmentPackageListCreateAdminView(generics.ListCreateAPIView):
     queryset = TreatmentPackage.objects.prefetch_related('items__treatment').order_by('name')
@@ -981,16 +879,12 @@ class TreatmentPackageDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
         instance.delete()
 
 
-
 class TreatmentPackageSyncView(generics.ListAPIView):
-    """Read-only active package list — accessible to all authenticated users for POS sync."""
     queryset = TreatmentPackage.objects.filter(active=True).prefetch_related('items__treatment').order_by('name')
     serializer_class = TreatmentPackageSerializer
 
 
 class SiteConfigView(APIView):
-    """GET/PUT the singleton clinic receipt configuration."""
-
     def get(self, request):
         return Response(SiteConfigSerializer(SiteConfig.get_solo()).data)
 
@@ -1003,17 +897,7 @@ class SiteConfigView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-# ── Report Settings ──────────────────────────────────────────────────────────
-
 class ReportSettingsView(APIView):
-    """GET/PATCH the singleton report classification thresholds (design §1).
-
-    GET is open to any authenticated user — the stock-movement and
-    patient-activity reports need to read it just to render bucket labels.
-    PATCH is restricted to superuser/manager, same convention as every other
-    admin-settings write in this file.
-    """
-
     def get(self, request):
         return Response(ReportSettingsSerializer(ReportSettings.get_solo()).data)
 
@@ -1028,17 +912,7 @@ class ReportSettingsView(APIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
-# ── Expense Aliases (beautician petty-cash naming layer, design §4) ──────────
-
 class ExpenseAliasListCreateView(APIView):
-    """
-    GET  /api/admin/expense-aliases/  ?scope=beautician|general  ?active_only=1  ?q=
-         Open to any authenticated user — the beautician-facing picker needs
-         to read this list too (see views/beautician_expense_page.py, which
-         hits the narrower /api/beautician/expense-aliases/ instead).
-    POST /api/admin/expense-aliases/  — superuser/manager only.
-    """
-
     def get(self, request):
         qs = ExpenseAlias.objects.select_related('account')
         scope = request.query_params.get('scope', '').strip()
@@ -1068,8 +942,6 @@ class ExpenseAliasListCreateView(APIView):
 
 
 class ExpenseAliasDetailView(APIView):
-    """GET/PUT/DELETE /api/admin/expense-aliases/<pk>/ — write ops superuser/manager only."""
-
     def _get(self, pk):
         try:
             return ExpenseAlias.objects.select_related('account').get(pk=pk)
@@ -1108,11 +980,6 @@ class ExpenseAliasDetailView(APIView):
         if instance is None:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        # An alias with posted history behind it (design §4): SET_NULL on
-        # ExpenseItem.alias means a hard delete wouldn't even break anything
-        # referentially, but it would still erase the "which friendly name did
-        # the beautician pick" provenance for a year of expenses. Deactivate
-        # instead and say so; hard-delete only when genuinely unused.
         if instance.expense_items.exists():
             instance.is_active = False
             instance.save(update_fields=['is_active'])

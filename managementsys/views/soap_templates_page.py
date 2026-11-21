@@ -83,8 +83,6 @@ _HEADER_FONT = Font(bold=True, color='FFFFFF')
 
 
 class SoapTemplateExportView(APIView):
-    """GET — download all SOAP templates as an .xlsx file."""
-
     def get(self, request):
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -118,8 +116,6 @@ class SoapTemplateExportView(APIView):
 
 
 class SoapTemplateTemplateDownloadView(APIView):
-    """GET — download a blank sample .xlsx showing the expected import format."""
-
     def get(self, request):
         from django.http import HttpResponse
 
@@ -160,16 +156,6 @@ class SoapTemplateTemplateDownloadView(APIView):
 
 
 class SoapTemplateImportView(APIView):
-    """
-    POST multipart/form-data with file=<xlsx>
-    Columns (row 1 = header, skipped):
-      field | title | body | sort_order
-    field must be one of: subjective, objective, assessment, plan
-    sort_order defaults to 0 if blank.
-    Existing templates matched by (field + title) are updated; new ones created.
-    Returns { created, updated, errors: [{row, message}] }
-    """
-
     def post(self, request):
         uploaded = request.FILES.get('file')
         if not uploaded:

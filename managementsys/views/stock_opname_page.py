@@ -24,7 +24,6 @@ def _actor(request):
 
 
 def _serialize_session_detail(session):
-    """Serialise one session including all item lines. Expects items pre-fetched."""
     items = list(session.items.all())
     return {
         'id': session.id,
@@ -57,7 +56,6 @@ def _serialize_session_detail(session):
 
 
 def _detail_qs(pk):
-    """Single-session queryset with all related data pre-fetched, items sorted by code."""
     return (
         StockOpnameSession.objects
         .select_related('created_by', 'warehouse')
@@ -74,14 +72,6 @@ def _detail_qs(pk):
 
 
 def _save_items(session, warehouse_id, items_data, merge=False):
-    """
-    Upsert opname items for a session.
-
-    When merge=True (collaborative saves), a zero incoming value does not
-    overwrite an existing non-zero value — only filled-in (> 0) values win.
-    This lets multiple users fill in different portions without clobbering
-    each other's work.
-    """
     if not items_data:
         return
     wh_id = int(warehouse_id)
@@ -236,10 +226,8 @@ class StockOpnameCompleteView(APIView):
         loss_item_ids = {int(row['item_id']) for row in items_data if row.get('is_loss')}
 
         with transaction.atomic():
-            # Merge counts — non-zero values from any contributor win.
             _save_items(session, warehouse_id, items_data, merge=True)
 
-            # Apply is_loss decisions from this final submission.
             session.items.filter(item_id__in=loss_item_ids).update(is_loss=True)
             session.items.exclude(item_id__in=loss_item_ids).update(is_loss=False)
 
@@ -285,8 +273,6 @@ class StockOpnameCompleteView(APIView):
         )
         return Response(_serialize_session_detail(_detail_qs(pk)))
 
-
-# ── Stock Opname Template ──────────────────────────────────────────────────
 
 class StockOpnameTemplateView(APIView):
     def get(self, request):
@@ -420,12 +406,6 @@ class StockOpnameTemplateView(APIView):
         }, status=201)
 
     def patch(self, request):
-        """Reorder an existing template from a drag-and-drop edit.
-
-        Body: { warehouse_id, sections: [{ name, item_ids: [..] }, ..] }
-        The incoming order of sections and of item_ids within each section
-        defines section_order / item_order. Items are rewritten wholesale.
-        """
         warehouse_id = request.data.get('warehouse_id')
         sections = request.data.get('sections')
         if not warehouse_id or sections is None:
@@ -436,7 +416,6 @@ class StockOpnameTemplateView(APIView):
         except StockOpnameTemplate.DoesNotExist:
             return Response({'error': 'Template tidak ditemukan untuk gudang ini.'}, status=404)
 
-        # Only keep item_ids that still exist, preserving the submitted order.
         requested_ids = [
             int(iid)
             for sec in sections

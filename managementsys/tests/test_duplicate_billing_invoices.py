@@ -1,13 +1,3 @@
-"""Safety properties of the duplicate-invoice cleanup.
-
-The POS invoices a visit and then clears the billing queue. When the caller omitted
-``?skip_invoice=1`` the queue billed the same treatments again, leaving a phantom
-invoice with no cashier and no payment method — 47 of them, Rp 23.6M.
-
-Voiding a real sale is far worse than leaving a phantom, so the exclusions below are
-load-bearing. An earlier draft of the cleanup voided 195 invoices including iPos
-imports and *both* halves of matched pairs; these tests exist so that cannot recur.
-"""
 from datetime import datetime, timezone as dt_timezone
 from decimal import Decimal
 from io import StringIO
@@ -57,11 +47,6 @@ class TestVoidDuplicateBillingInvoices:
         assert not paid.is_voided
 
     def test_never_voids_both_halves_of_a_pair(self, patient, gl_accounts):
-        """Two paid invoices with identical lines must both survive.
-
-        The earlier draft matched each against the other and voided both,
-        erasing revenue the patient had actually paid.
-        """
         first = _invoice('INV-20260620-1', patient, payment=gl_accounts['cash_method'])
         second = _invoice('INV-20260620-2', patient, payment=gl_accounts['cash_method'])
 
@@ -82,7 +67,6 @@ class TestVoidDuplicateBillingInvoices:
         assert not paid.is_voided
 
     def test_one_payment_absorbs_only_one_duplicate(self, patient, gl_accounts):
-        """Two phantoms against a single payment: the second needs a human."""
         _invoice('INV-20260620-1', patient, payment=gl_accounts['cash_method'])
         first = _invoice('INV-20260620-2', patient, payment=gl_accounts['legacy_clearing_method'])
         second = _invoice('INV-20260620-3', patient, payment=gl_accounts['legacy_clearing_method'])
@@ -94,7 +78,6 @@ class TestVoidDuplicateBillingInvoices:
         assert not second.is_voided
 
     def test_keeps_a_phantom_with_no_counterpart(self, patient, gl_accounts):
-        """Treatment given but never rung up — real uncollected revenue."""
         orphan = _invoice('INV-20260620-2', patient, payment=gl_accounts['legacy_clearing_method'])
 
         output = _run(apply=True)
@@ -136,12 +119,6 @@ class TestVoidDuplicateBillingInvoices:
 
 @pytest.mark.django_db
 class TestBillingCompleteDuplicateGuard:
-    """The endpoint must refuse to bill a visit that is already invoiced.
-
-    ``?skip_invoice=1`` is the intended signal, but a caller forgetting it is
-    exactly how the 47 phantoms were created, so the data is checked too.
-    """
-
     def test_guard_rejects_a_second_invoice_for_the_same_treatments(
             self, auth_api, gl_accounts, patient):
         from managementsys.models import ActivePatient, Beauticians, Treatment, TreatmentSession
@@ -157,7 +134,6 @@ class TestBillingCompleteDuplicateGuard:
             beautician=Beauticians.objects.create(beautician_name='B'))
         session.treatments.add(treatment)
 
-        # The POS already invoiced this visit.
         _invoice('INV-POS-1', patient, payment=gl_accounts['cash_method'],
                  lines=(('Light Peel', '1', '300000'),), when=timezone.now())
 

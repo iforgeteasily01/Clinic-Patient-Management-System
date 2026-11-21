@@ -1,16 +1,3 @@
-"""
-ensure_category_accounts
-========================
-Backfills the missing revenue GL account for every TreatmentCategory (which
-is also the item_category used by InventoryItem). As of Phase 3, COGS/expense
-are no longer per-category accounts — those postings now come from the
-Expense model instead.
-
-Usage:
-    python manage.py ensure_category_accounts
-    python manage.py ensure_category_accounts --dry-run
-"""
-
 from django.core.management.base import BaseCommand
 from django.db.models import Max
 

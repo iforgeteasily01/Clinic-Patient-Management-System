@@ -1,17 +1,3 @@
-"""Branch endpoints: the picker's catalog, and the settings CRUD behind it.
-
-Two audiences, two permission levels:
-
-  * ``GET /api/branches/`` — every authenticated user. Returns only the
-    branches *that user* may select, plus the resolved current selection, so
-    the client's combobox can be rendered straight from one response and can
-    never offer an option the server would reject.
-  * ``/api/admin/branches/`` — superuser/manager. Full CRUD.
-
-Deletion is guarded here rather than left to the FK's PROTECT so the operator
-gets a sentence instead of a 500: a branch with any history is deactivated, not
-removed.
-"""
 from django.db.models import Q
 from rest_framework import generics, status
 from rest_framework.response import Response
@@ -29,13 +15,6 @@ def _actor(request):
 
 
 class BranchListView(APIView):
-    """What this user may switch between, and what they are on right now.
-
-    ``allow_all`` tells the client whether to render the 'Semua Cabang' option.
-    It is advisory only — ``services.branches`` re-checks the role on every
-    request that carries a branch header.
-    """
-
     def get(self, request):
         user = _actor(request)
         qs = Branch.objects.filter(is_active=True)
@@ -55,25 +34,11 @@ class BranchListView(APIView):
 
 
 class ReceiptIdentityView(APIView):
-    """The header a receipt printed *here* should carry.
-
-    Separate from ``/api/admin/site-config/`` on purpose. That endpoint is the
-    settings editor: it must keep returning the stored group-wide values so the
-    Receipt Settings page edits what it displays. This one returns the
-    *resolved* header — group legal name, branch address and phone, falling back
-    to SiteConfig wherever the branch left a field blank.
-
-    Locked to the caller's own branch, like the POS it feeds: a receipt states
-    where the patient physically was, which is never a dropdown.
-    """
-
     def get(self, request):
         cfg = SiteConfig.get_solo()
         branch = home_branch(_actor(request))
         return Response({
             **receipt_identity(branch, cfg),
-            # Not part of the location identity, but the receipt needs them and
-            # a second round trip for two strings is not worth it.
             'receipt_header_extra': cfg.receipt_header_extra,
             'receipt_footer': cfg.receipt_footer,
             'branch_id': branch.pk if branch else None,
@@ -90,9 +55,6 @@ class BranchListCreateAdminView(generics.ListCreateAPIView):
         return qs
 
     def perform_create(self, serializer):
-        # The very first branch is the default whether or not the form said so;
-        # a database with branches but no default would leave every user with
-        # no home to fall back to.
         is_first = not Branch.objects.exists()
         instance = serializer.save(is_default=serializer.validated_data.get('is_default', False) or is_first)
         AuditLog.objects.create(
@@ -149,12 +111,6 @@ class BranchDetailAdminView(generics.RetrieveUpdateDestroyAPIView):
 
 
 def _usage_counts(branch):
-    """Non-zero history counts keyed by an Indonesian label, for the error text.
-
-    Deliberately a handful of representative relations rather than all fifteen:
-    the operator needs to know the branch is in use and roughly how, not an
-    exhaustive audit.
-    """
     counts = {
         'transaksi penjualan': branch.invoices.count(),
         'rekam medis':         branch.medrecs.count(),

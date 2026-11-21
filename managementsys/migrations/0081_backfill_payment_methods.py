@@ -1,12 +1,3 @@
-"""Backfill PaymentMethod rows from the ChartOfAccounts rows they replace.
-
-For every distinct ChartOfAccounts row referenced by Invoice.payment_method
-(old FK) or PurchaseInvoice.payment_account, create one PaymentMethod whose
-``linked_account`` is that account, named after it. Every Invoice / PurchaseInvoice
-row is then repointed at the new PaymentMethod via the temporary
-``payment_method_new`` column added in 0080. 0082 drops the old columns and
-renames the new ones into their final place.
-"""
 from django.db import migrations
 
 
@@ -48,14 +39,10 @@ def backfill(apps, schema_editor):
 
 
 def noop(apps, schema_editor):
-    # Data backfill only; the columns it populated are dropped by 0082, and
-    # 0080's reverse already removes payment_method_new, so there is nothing
-    # left to undo here.
     pass
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0080_paymentmethod'),
     ]

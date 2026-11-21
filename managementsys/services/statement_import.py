@@ -1,33 +1,8 @@
-"""Parse a bank statement export into signed statement lines.
-
-Indonesian banks export wildly different spreadsheets, so this deliberately does
-**not** try to be clever about any one of them. It looks for a header row by
-name, accepts the handful of column spellings that actually turn up, and reports
-anything it cannot read as a per-row problem the operator sees before importing.
-
-Two-phase, like every other import in this codebase: ``parse`` returns rows for
-review and writes nothing; the view writes only what the operator confirmed.
-
-Sign convention
----------------
-Everything comes out as one signed number — **positive money in, negative money
-out** — because that is what makes the matching arithmetic in
-``bank_reconciliation`` plain subtraction. Three input shapes are supported and
-all collapse to it:
-
-  * separate debit/credit (or *masuk*/*keluar*) columns
-  * a single signed amount column
-  * an amount column plus a direction column (DB/CR, D/K)
-
-The ambiguous case — a single *unsigned* amount column with no direction — is
-rejected rather than guessed. Guessing here silently reverses half a statement.
-"""
 import csv
 import io
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
-# Header spellings seen in the wild, lowercased and stripped of punctuation.
 DATE_HEADERS = {
     'tanggal', 'tgl', 'date', 'transaction date', 'tanggal transaksi',
     'posting date', 'tgl transaksi',
@@ -48,7 +23,6 @@ DIRECTION_HEADERS = {'dk', 'd/k', 'db/cr', 'tipe', 'type', 'jenis', 'arah'}
 DEBIT_MARKERS = {'d', 'db', 'dr', 'debit', 'debet', 'k', 'keluar', 'out'}
 CREDIT_MARKERS = {'c', 'cr', 'k', 'kredit', 'credit', 'masuk', 'in'}
 
-# 'k' means kredit in some exports and keluar in others, so it is never decisive.
 AMBIGUOUS_MARKERS = {'k'}
 
 DATE_FORMATS = [
@@ -58,7 +32,7 @@ DATE_FORMATS = [
 
 
 class StatementParseError(Exception):
-    """The file as a whole could not be read. Per-row problems are not errors."""
+    pass
 
 
 def _norm(value):
@@ -82,12 +56,6 @@ def _parse_date(value):
 
 
 def _parse_amount(value):
-    """A number out of whatever the bank wrote, or None.
-
-    Handles both Indonesian (1.234.567,89) and English (1,234,567.89) grouping
-    by deciding from which separator appears last, and strips currency prefixes
-    and parenthesised negatives.
-    """
     if value in (None, ''):
         return None
     if isinstance(value, (int, float, Decimal)):
@@ -109,7 +77,6 @@ def _parse_amount(value):
     last_dot = text.rfind('.')
     last_comma = text.rfind(',')
     if last_comma > last_dot:
-        # Indonesian: dots group, comma is the decimal point.
         text = text.replace('.', '').replace(',', '.')
     else:
         text = text.replace(',', '')
@@ -122,13 +89,12 @@ def _parse_amount(value):
 
 
 def _rows_from_file(upload):
-    """Every cell row from an .xlsx or .csv upload, as lists."""
     name = (getattr(upload, 'name', '') or '').lower()
 
     if name.endswith(('.xlsx', '.xlsm', '.xls')):
         try:
             import openpyxl
-        except ImportError as exc:  # pragma: no cover - openpyxl is a hard dep
+        except ImportError as exc:  # pragma: no cover
             raise StatementParseError('Pembaca Excel tidak tersedia di server.') from exc
         try:
             wb = openpyxl.load_workbook(upload, data_only=True, read_only=True)
@@ -157,11 +123,6 @@ def _rows_from_file(upload):
 
 
 def _find_header(rows):
-    """(index, {role: column}) for the first row that looks like a header.
-
-    Statements routinely carry several lines of account-holder preamble above
-    the table, so the header is searched for rather than assumed to be row 1.
-    """
     for index, row in enumerate(rows[:30]):
         mapping = {}
         for col, cell in enumerate(row):
@@ -194,7 +155,6 @@ def _find_header(rows):
 
 
 def _signed(row, mapping):
-    """(amount, problem) for one row, already signed. Amount is None on failure."""
     def cell(role):
         col = mapping.get(role)
         return row[col] if col is not None and col < len(row) else None
@@ -217,8 +177,6 @@ def _signed(row, mapping):
 
     direction = _norm(cell('direction'))
     if direction:
-        # 'k' is kredit in some exports and keluar in others, so it never
-        # decides on its own -- see AMBIGUOUS_MARKERS.
         if direction in AMBIGUOUS_MARKERS:
             return None, ('Arah transaksi "K" ambigu (kredit atau keluar). '
                           'Gunakan kolom Debit/Kredit terpisah.')
@@ -231,22 +189,12 @@ def _signed(row, mapping):
     if amount == 0:
         return None, 'Jumlah nol.'
     if amount > 0:
-        # An unsigned amount column with no direction cannot be read. Guessing
-        # silently reverses half a statement -- see the module docstring.
         return None, ('Kolom jumlah tidak bertanda dan tidak ada kolom arah. '
                       'Gunakan kolom Debit/Kredit terpisah atau jumlah bertanda.')
     return amount, None
 
 
 def parse(upload, *, date_from=None, date_to=None):
-    """Read a statement file into review rows. Writes nothing.
-
-    Returns ``{'rows': [...], 'summary': {...}}``. Each row carries ``ok``, and
-    when False, ``problem`` — a sentence explaining what could not be read.
-    Out-of-period rows are marked ``out_of_period`` rather than dropped, so an
-    operator who picked the wrong file finds out from the preview instead of
-    from an empty import.
-    """
     rows = _rows_from_file(upload)
     if not rows:
         raise StatementParseError('File kosong.')
@@ -268,8 +216,6 @@ def parse(upload, *, date_from=None, date_to=None):
         amount, problem = _signed(row, mapping)
 
         if parsed_date is None:
-            # A statement's totals row has no date and no readable amount; it is
-            # noise, not a problem worth showing.
             if amount is None:
                 continue
             problem = problem or 'Tanggal tidak dapat dibaca.'

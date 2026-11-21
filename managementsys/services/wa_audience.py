@@ -1,25 +1,3 @@
-"""Audience segments for a WhatsApp blast.
-
-A segment answers "who should get this", and every one of them is filtered
-through the same three gates before a message is composed:
-
-1. **Opt-in.** ``Patient.wa_opt_in`` must be True. Not configurable, not
-   overridable from the UI — a broadcast list the patient never joined is the
-   thing consent exists to prevent.
-2. **A usable number.** The phone must normalize to an Indonesian mobile
-   (services/whatsapp_gateway.normalize_phone). A patient with a landline or a
-   typo'd number is dropped, not guessed at.
-3. **Cooldown.** Anyone already sent a blast inside
-   ``WhatsAppSettings.per_patient_cooldown_days`` is excluded, however they
-   qualified. Two segments overlapping is normal; two messages in one day is
-   how a number gets reported.
-
-Each gate reports how many it removed, so the UI can say "412 match, 38 opted
-in, 5 messaged recently, 33 will be sent" instead of silently shipping 33.
-
-Windows are Jakarta clinic days and a visit is a non-voided invoice — the same
-two conventions as views/crm_dashboard.py, for the same reason.
-"""
 from __future__ import annotations
 
 import datetime
@@ -36,8 +14,6 @@ from ..models import (
 from .patient_activity import classify
 from .whatsapp_gateway import normalize_phone, to_chat_id
 
-# The catalog. `key` is what the API takes, `window_days` is None for segments
-# that are not a plain recency window. Order is the order the UI renders.
 SEGMENTS = [
     {
         'key': 'recent',
@@ -92,7 +68,6 @@ NEW_PATIENT_DAYS = 30
 
 
 def today_jkt():
-    """Today as a Jakarta clinic day. Public: whatsapp_page shares it."""
     return timezone.now().astimezone(JAKARTA_TZ).date()
 
 
@@ -101,7 +76,6 @@ def _day_start(d):
 
 
 def _visited_between(start, end_exclusive):
-    """Patient ids with a non-voided invoice in a half-open Jakarta day range."""
     return set(
         Invoice.objects
         .filter(is_voided=False, patient_no__isnull=False,
@@ -111,19 +85,13 @@ def _visited_between(start, end_exclusive):
     )
 
 
-# ── Segment resolution ─────────────────────────────────────────────────────
-
 def _segment_patient_ids(segment, today):
-    """Patient ids matching ``segment``, before any of the three gates."""
     tomorrow = today + datetime.timedelta(days=1)
 
     if segment == 'recent':
         return _visited_between(today - datetime.timedelta(days=6), tomorrow)
 
     if segment == 'last_week':
-        # 8-14 days ago, deliberately excluding the last 7: this segment exists
-        # to reach people the 'recent' follow-up has already had, so overlapping
-        # it would message the same patients twice in a fortnight.
         return _visited_between(
             today - datetime.timedelta(days=14),
             today - datetime.timedelta(days=6),
@@ -136,9 +104,6 @@ def _segment_patient_ids(segment, today):
         return _visited_between(today - datetime.timedelta(days=89), tomorrow)
 
     if segment == 'new':
-        # First-ever visit inside the window. Computed as "visited recently" minus
-        # "ever visited before the window" rather than with Min() over all
-        # invoices, which would scan the whole table.
         window_start = today - datetime.timedelta(days=NEW_PATIENT_DAYS - 1)
         recent = _visited_between(window_start, tomorrow)
         earlier = set(
@@ -171,7 +136,6 @@ def _segment_patient_ids(segment, today):
 
 
 def _next_birthday(birth_date, today):
-    """Next occurrence of a birthday on or after today; 29 Feb observed 1 Mar."""
     def occurrence(year):
         try:
             return birth_date.replace(year=year)
@@ -182,15 +146,7 @@ def _next_birthday(birth_date, today):
     return this_year if this_year >= today else occurrence(today.year + 1)
 
 
-# ── The three gates ────────────────────────────────────────────────────────
-
 def resolve(segment, settings_obj, *, today=None, limit=None):
-    """-> (recipients, counts)
-
-    ``recipients`` is a list of dicts ready to compose a message against.
-    ``counts`` explains the funnel from raw match to sendable, so the operator
-    can see *why* a 400-patient segment produced 33 messages.
-    """
     today = today or today_jkt()
     matched_ids = _segment_patient_ids(segment, today)
     matched = len(matched_ids)
@@ -198,7 +154,6 @@ def resolve(segment, settings_obj, *, today=None, limit=None):
     if not matched_ids:
         return [], _counts(0, 0, 0, 0, 0)
 
-    # Gate 1 + 2 in one query: opted in, and a phone worth trying.
     candidates = list(
         Patient.objects
         .filter(patient_no__in=matched_ids, wa_opt_in=True)
@@ -215,7 +170,6 @@ def resolve(segment, settings_obj, *, today=None, limit=None):
             with_number.append((patient, chat_id))
     bad_number = opted_in - len(with_number)
 
-    # Gate 3: cooldown. One query for everyone rather than per patient.
     cooldown_days = settings_obj.per_patient_cooldown_days or 0
     recently_messaged = set()
     if cooldown_days:
@@ -242,8 +196,6 @@ def resolve(segment, settings_obj, *, today=None, limit=None):
     in_cooldown = len(with_number) - len(recipients)
     eligible = len(recipients)
 
-    # The daily cap is applied last so `eligible` reports the true size of the
-    # audience and the trim is visible as its own number.
     if limit is not None and len(recipients) > limit:
         recipients = recipients[:limit]
 
@@ -262,7 +214,6 @@ def _counts(matched, opted_in, bad_number, in_cooldown, eligible):
 
 
 def segment_catalog(settings_obj, *, today=None):
-    """The catalog with a live eligible-count per segment, for the picker."""
     today = today or today_jkt()
     out = []
     for spec in SEGMENTS:

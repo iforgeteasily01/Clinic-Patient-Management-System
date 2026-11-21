@@ -1,23 +1,3 @@
-"""Bank reconciliation endpoints.
-
-    GET/POST /api/accounting/reconciliations/            list / start a period
-    GET/PATCH/DELETE /api/accounting/reconciliations/<pk>/
-    GET  .../<pk>/workspace/                             lines + candidates + summary
-    POST .../<pk>/import/preview/                        read a statement file
-    POST .../<pk>/import/confirm/                        write the reviewed rows
-    POST .../<pk>/auto-match/                            match the unambiguous ones
-    POST .../<pk>/lines/<line_pk>/match/                 match one, by hand
-    POST .../<pk>/lines/<line_pk>/unmatch/
-    POST .../<pk>/lines/<line_pk>/ignore/
-    POST .../<pk>/complete/                              close and stamp
-    POST .../<pk>/reopen/
-
-Two-phase import, the same shape as every other import here: preview reads the
-file and writes nothing, confirm writes only the rows the operator kept.
-
-None of this posts to the ledger. A discrepancy is fixed by entering the missing
-transaction through the normal path — see services/bank_reconciliation.py.
-"""
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
@@ -58,7 +38,6 @@ def _get(pk):
 
 
 def _serialize_summary(figures):
-    """Decimals to strings. The client formats; it never does the arithmetic."""
     return {
         k: (str(v) if isinstance(v, Decimal) else v)
         for k, v in figures.items()
@@ -66,12 +45,6 @@ def _serialize_summary(figures):
 
 
 class ReconciliationListCreateView(APIView):
-    """
-    GET  ?account=&status=&date_from=&date_to=
-    POST { account, statement_start, statement_end, opening_balance,
-           closing_balance, notes? }
-    """
-
     def get(self, request):
         qs = (BankReconciliation.objects
               .select_related('account', 'branch', 'created_by', 'completed_by')
@@ -109,9 +82,6 @@ class ReconciliationListCreateView(APIView):
 
         branch = write_branch(request)
 
-        # Overlapping periods on the same account and branch would let the same
-        # transaction be cleared twice, which is the one thing the clearing
-        # stamp exists to prevent.
         clash = BankReconciliation.objects.filter(
             account=account, branch=branch,
             statement_start__lte=end, statement_end__gte=start,
@@ -147,7 +117,6 @@ class ReconciliationListCreateView(APIView):
 
 
 class ReconciliationDetailView(APIView):
-
     def get(self, request, pk):
         obj = _get(pk)
         if obj is None:
@@ -164,9 +133,6 @@ class ReconciliationDetailView(APIView):
             return Response({'error': 'Rekonsiliasi ini sudah diselesaikan.'},
                             status=status.HTTP_400_BAD_REQUEST)
 
-        # Only the statement figures and the notes are editable. The account and
-        # the period are what the matches were made against, so changing either
-        # would leave matches pointing at rows outside their own period.
         for field in ('opening_balance', 'closing_balance'):
             if field in request.data:
                 setattr(obj, field, _decimal(request.data[field]))
@@ -201,14 +167,6 @@ class ReconciliationDetailView(APIView):
 
 
 class ReconciliationWorkspaceView(APIView):
-    """Everything the matching screen needs, in one round trip.
-
-    Deliberately one endpoint rather than three: the statement lines, the book
-    entries and the summary are only meaningful together, and fetching them
-    separately means the screen can render a summary that disagrees with the
-    rows above it.
-    """
-
     def get(self, request, pk):
         obj = _get(pk)
         if obj is None:
@@ -239,8 +197,6 @@ class ReconciliationWorkspaceView(APIView):
 
 
 class ReconciliationImportPreviewView(APIView):
-    """Read an uploaded statement and hand it back for review. Writes nothing."""
-
     def post(self, request, pk):
         obj = _get(pk)
         if obj is None:
@@ -268,14 +224,6 @@ class ReconciliationImportPreviewView(APIView):
 
 
 class ReconciliationImportConfirmView(APIView):
-    """Write the reviewed rows, then run the automatic matcher over them.
-
-    Auto-matching runs here rather than being a separate step the operator has
-    to know to take: an import that lands 200 lines and matches none of them
-    looks broken, and the matcher is safe by construction — it refuses anything
-    ambiguous.
-    """
-
     def post(self, request, pk):
         obj = _get(pk)
         if obj is None:
@@ -295,9 +243,6 @@ class ReconciliationImportConfirmView(APIView):
         created = 0
         with transaction.atomic():
             if replace:
-                # Re-importing a corrected file is a normal thing to do, and
-                # leaving the old rows behind would double every amount. Matches
-                # go with them; the auto-matcher rebuilds what it can.
                 obj.lines.all().delete()
 
             start_order = obj.lines.count()
@@ -336,8 +281,6 @@ class ReconciliationImportConfirmView(APIView):
 
 
 class ReconciliationAutoMatchView(APIView):
-    """Re-run the matcher — after entering a missing transaction, say."""
-
     def post(self, request, pk):
         obj = _get(pk)
         if obj is None:
@@ -355,13 +298,6 @@ class ReconciliationAutoMatchView(APIView):
 
 
 class ReconciliationLineActionView(APIView):
-    """match / unmatch / ignore for one statement line.
-
-    One view over three actions because they share every precondition and all
-    three return the same payload — the line plus the recomputed summary, so the
-    screen never has to guess what a match did to the difference.
-    """
-
     def post(self, request, pk, line_pk, action):
         obj = _get(pk)
         if obj is None:
@@ -386,9 +322,6 @@ class ReconciliationLineActionView(APIView):
                 if obj.is_locked:
                     raise recon.ReconciliationError(
                         {'error': 'Rekonsiliasi ini sudah diselesaikan.'})
-                # Ignoring implies unmatching: a line set aside is one the
-                # operator has decided is not part of this reconciliation, and
-                # leaving a stale match on it would keep clearing a book row.
                 line.is_ignored = bool(request.data.get('ignored', True))
                 if line.is_ignored:
                     line.ledger_entry = None
@@ -408,7 +341,6 @@ class ReconciliationLineActionView(APIView):
 
 
 class ReconciliationCompleteView(APIView):
-
     def post(self, request, pk):
         obj = _get(pk)
         if obj is None:
@@ -432,7 +364,6 @@ class ReconciliationCompleteView(APIView):
 
 
 class ReconciliationReopenView(APIView):
-
     def post(self, request, pk):
         obj = _get(pk)
         if obj is None:

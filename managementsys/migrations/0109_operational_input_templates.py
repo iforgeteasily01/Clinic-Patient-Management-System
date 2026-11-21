@@ -1,14 +1,8 @@
-"""Operational input templates + recorded period entries.
-
-Planning-only tables: nothing here is a journal document. See
-``views/admin_operations_page.py`` for why that boundary matters.
-"""
 import django.db.models.deletion
 from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0108_taxrule_taxrulebracket_taxrulecomponent'),
     ]

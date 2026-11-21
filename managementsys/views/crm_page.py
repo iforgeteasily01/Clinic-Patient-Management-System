@@ -16,9 +16,6 @@ from ..services.patient_activity import classify
 
 logger = logging.getLogger(__name__)
 
-# Valid ?activity= values. Filtered as date ranges on crm_profile__last_visit_date
-# below rather than by calling classify() per row — same cutoffs, one query
-# instead of a full table scan in Python.
 _ACTIVITY_BUCKETS = {'active', 'lapsing', 'inactive', 'never'}
 
 ALLOWED_ORDERINGS = {
@@ -38,17 +35,6 @@ ALLOWED_ORDERINGS = {
 
 
 def refresh_crm_profile(patient):
-    """Recompute and persist the CRM stats for a single Patient instance.
-
-    Voided invoices are excluded — they represent reversed sales and should not
-    count toward spend, visit count, or last-visit date.
-
-    Refunds are subtracted from spend but **not** from the visit count. A
-    patient who bought something and later brought part of it back still came
-    in, twice; erasing the visit would misreport how often the clinic sees them
-    and could silently demote a loyalty tier. Spend is different — money given
-    back was never spend — so lifetime value nets out the refunds.
-    """
     agg = Invoice.objects.filter(patient_no=patient, is_voided=False).aggregate(
         total_spend=Sum('grand_total'),
         total_visits=Count('id'),
@@ -64,12 +50,8 @@ def refresh_crm_profile(patient):
         invoice__is_voided=False,
         is_voided=False,
     ).aggregate(total=Sum('total_refund'))['total'] or Decimal('0')
-    # Never negative: a refund larger than recorded spend is a data problem, and
-    # a negative lifetime value would place the patient below every tier
-    # threshold in a way no one could explain.
     total_spend = max(total_spend - refunded, Decimal('0'))
 
-    # Highest tier where both thresholds are met (ordered by sort_order desc)
     best_tier = (
         PatientTier.objects
         .filter(
@@ -90,8 +72,6 @@ def refresh_crm_profile(patient):
         },
     )
 
-
-# ── CRM Patient views ──────────────────────────────────────────────────────
 
 PAGE_SIZE_CHOICES = {10, 25, 50, 100}
 DEFAULT_PAGE_SIZE = 25
@@ -132,7 +112,7 @@ class PatientCRMListView(APIView):
                 )
             elif activity == 'inactive':
                 qs = qs.filter(crm_profile__last_visit_date__lt=inactive_cutoff)
-            else:  # 'never' — registered but no non-voided invoice yet
+            else:
                 qs = qs.filter(
                     Q(crm_profile__isnull=True) | Q(crm_profile__last_visit_date__isnull=True)
                 )
@@ -141,7 +121,6 @@ class PatientCRMListView(APIView):
         if ordering in ALLOWED_ORDERINGS:
             qs = qs.order_by(ALLOWED_ORDERINGS[ordering])
 
-        # Pagination
         try:
             page_size = int(request.GET.get('page_size', DEFAULT_PAGE_SIZE))
         except (ValueError, TypeError):
@@ -162,7 +141,7 @@ class PatientCRMListView(APIView):
             'count': total,
             'page': page,
             'page_size': page_size,
-            'num_pages': max(1, -(-total // page_size)),  # ceiling division
+            'num_pages': max(1, -(-total // page_size)),
             'results': [_serialize_crm_row(p, as_of=as_of, settings_obj=settings_obj) for p in patients],
         })
 
@@ -182,7 +161,6 @@ class PatientCRMDetailView(APIView):
 
         data = _serialize_crm_row(patient)
 
-        # Auto-applicable promotions this patient qualifies for
         today = date.today()
         promo_qs = (
             Promotion.objects
@@ -191,7 +169,6 @@ class PatientCRMDetailView(APIView):
             .filter(Q(valid_until__isnull=True) | Q(valid_until__gte=today))
         )
 
-        # Filter by tier requirement
         crm = getattr(patient, 'crm_profile', None)
         patient_tier_order = crm.tier.sort_order if (crm and crm.tier_id) else -1
         eligible_promos = []
@@ -209,8 +186,6 @@ class PatientCRMDetailView(APIView):
         data['auto_promotions'] = eligible_promos
         return Response(data)
 
-
-# ── Tier CRUD ──────────────────────────────────────────────────────────────
 
 class PatientTierListCreateView(APIView):
     permission_classes = [AllowAny]
@@ -295,8 +270,6 @@ class PatientTierDetailView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-# ── Internal serializers ───────────────────────────────────────────────────
-
 def _serialize_tier(t, *, patient_count):
     return {
         'id': t.id,
@@ -310,15 +283,6 @@ def _serialize_tier(t, *, patient_count):
 
 
 def _serialize_crm_row(patient, *, as_of=None, settings_obj=None):
-    """Shared by the CRM list and the CRM detail view — ``activity_bucket``
-    goes through ``services.patient_activity.classify`` so this row can never
-    disagree with the patient-activity report about which bucket a patient is
-    in (design doc §5).
-
-    ``as_of``/``settings_obj`` are optional so a caller serializing many rows
-    (the list view) can compute them once and pass them down instead of this
-    function re-fetching ``ReportSettings.get_solo()`` per row.
-    """
     as_of = as_of or date.today()
     settings_obj = settings_obj or ReportSettings.get_solo()
     crm = getattr(patient, 'crm_profile', None)

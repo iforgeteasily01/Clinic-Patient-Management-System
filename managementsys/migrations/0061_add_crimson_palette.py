@@ -14,7 +14,6 @@ def add_crimson(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0060_refresh_palettes'),
     ]

@@ -1,15 +1,3 @@
-"""Server health and status, for the server-manager desktop app.
-
-Two endpoints with deliberately different access levels:
-
-- ``/api/system/health/`` is **unauthenticated and cheap**. The launcher polls
-  it while waiting for Django to come up, before anyone has logged in, so
-  requiring a token would defeat the purpose. It answers only "am I alive, and
-  can I reach the database" — nothing about the clinic is in the payload.
-- ``/api/system/status/`` needs a superuser/manager token and carries the
-  numbers the dashboard shows.
-"""
-
 import platform
 import sys
 import time
@@ -28,13 +16,10 @@ from ..models import ActivePatient, AuditLog, Invoice, JournalDayLog, Patient
 
 READER_ROLES = ('superuser', 'manager')
 
-#: Process start, captured at import. Django imports this module once per worker,
-#: so it is the age of *this* server process — exactly what the dashboard wants.
 _PROCESS_STARTED_AT = time.time()
 
 
 def _probe(alias):
-    """Round-trip a trivial query. Returns ``(ok, latency_ms, error)``."""
     started = time.monotonic()
     try:
         with connections[alias].cursor() as cursor:
@@ -46,12 +31,6 @@ def _probe(alias):
 
 
 class SystemHealthView(APIView):
-    """``GET /api/system/health/`` — liveness probe, no auth.
-
-    Returns 200 when the process is up and the default database answers, 503
-    when it does not, so a caller can branch on the status code alone without
-    parsing the body.
-    """
     authentication_classes = []
     permission_classes = [AllowAny]
 
@@ -69,11 +48,6 @@ class SystemHealthView(APIView):
 
 
 class SystemStatusView(APIView):
-    """``GET /api/system/status/`` — the dashboard payload.
-
-    Everything here is a cheap aggregate; the view is polled, so nothing in it
-    may scan a large table without an index.
-    """
     permission_classes = [IsAppAuthenticated]
 
     def get(self, request):
@@ -90,8 +64,6 @@ class SystemStatusView(APIView):
         databases = {
             'default': {'ok': db_ok, 'latency_ms': db_latency, 'error': db_error},
         }
-        # The iPos link is optional — a clinic without the legacy database still
-        # runs fine, so its absence is reported, not treated as a failure.
         for alias in ('external', 'ipos'):
             if alias in settings.DATABASES:
                 ok, latency, error = _probe(alias)

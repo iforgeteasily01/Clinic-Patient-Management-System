@@ -1,24 +1,3 @@
-"""
-Import historical data from the legacy iPos PostgreSQL database into CPMS.
-
-Usage:
-    python manage.py import_ipos_data --dry-run              # preview only
-    python manage.py import_ipos_data --phase services       # services → Treatments
-    python manage.py import_ipos_data --phase inventory      # items → InventoryItem + InventoryBatch
-    python manage.py import_ipos_data --phase sales          # transactions → Invoice + InvoiceItem
-    python manage.py import_ipos_data --phase all            # everything
-
-    python manage.py import_ipos_data --phase sales --from-date 2025-01-01
-
-Mapping notes:
-  - iPos kodesupel  ==  CPMS patient_no  (the iPos sync copies codes verbatim)
-  - iPos kodeitem   ==  CPMS InventoryItem.code / Treatment.code  (1:1 codes)
-  - Invoice number  :   IPOS-{notransaksi}  (identifies legacy records; avoids counter collision)
-  - payment_method  :   null  (CPMS COA has no payment accounts yet)
-  - cashier         :   null
-  - warehouse       :   first active Warehouse found in CPMS (WH-01)
-"""
-
 from __future__ import annotations
 
 import re
@@ -26,8 +5,6 @@ import sys
 from datetime import date, datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
-# iPos stores datetimes as local Jakarta time (GMT+7) without timezone info.
-# Attaching this offset lets Django convert correctly to UTC on save.
 TZ_JAKARTA = timezone(timedelta(hours=7))
 
 from django.core.management.base import BaseCommand, CommandError
@@ -46,10 +23,7 @@ from managementsys.models import (
 )
 from managementsys.views.crm_page import refresh_crm_profile
 
-# ── Treatment category auto-assignment ────────────────────────────────────────
-# Checked against the item name (lowercase).  First match wins.
 CATEGORY_RULES: list[tuple[str, str]] = [
-    # pattern            category name
     (r'injeksi|infus|vaksin|suntik|kil\b', 'Injeksi'),
     (r'botox|filler|rejuran|nucleofil|placenta|skin\s*booster|collagen\s*simul', 'Injeksi'),
     (r'peel|peeling|mela.peel|tca|mask\s*peel', 'Peeling'),
@@ -77,7 +51,6 @@ def _guess_category(name: str) -> str:
 
 
 def _ipos_conn():
-    """Open a raw psycopg2 connection to the iPos database using Django's external DB config."""
     cfg = connections['external'].settings_dict
     import psycopg2
     return psycopg2.connect(
@@ -95,8 +68,6 @@ def _dec(v) -> Decimal:
     except InvalidOperation:
         return Decimal('0')
 
-
-# ── Command ────────────────────────────────────────────────────────────────────
 
 class Command(BaseCommand):
     help = 'Import legacy iPos data (services, inventory, sales) into CPMS.'
@@ -143,7 +114,6 @@ class Command(BaseCommand):
 
         self.stdout.write(self.style.SUCCESS('\nDone.'))
 
-    # ── Phase 1 — Services → Treatment ────────────────────────────────────────
 
     def _import_services(self, conn):
         self.stdout.write('\n=== Phase 1: Services -> Treatments ===')
@@ -159,12 +129,10 @@ class Command(BaseCommand):
 
         self.stdout.write(f'  iPos service items: {len(rows)}')
 
-        # Build category cache (create missing ones)
         cat_cache: dict[str, TreatmentCategory] = {
             tc.name: tc for tc in TreatmentCategory.objects.all()
         }
 
-        # Existing treatment codes to skip
         existing_codes = set(Treatment.objects.values_list('code', flat=True))
 
         created = skipped = errors = 0
@@ -179,7 +147,6 @@ class Command(BaseCommand):
             cat_name = _guess_category(namaitem or kodeitem)
 
             if not self.dry:
-                # Get or create TreatmentCategory
                 if cat_name not in cat_cache:
                     tc = TreatmentCategory.objects.create(name=cat_name)
                     cat_cache[cat_name] = tc
@@ -202,7 +169,6 @@ class Command(BaseCommand):
                     errors += 1
                     self.stderr.write(f'    ERROR {kodeitem!r}: {e}')
             else:
-                # Dry run — report what would be created
                 if cat_name not in cat_cache:
                     self.stdout.write(f'    Would create category: {cat_name!r}')
                     cat_cache[cat_name] = None  # type: ignore[assignment]
@@ -217,13 +183,11 @@ class Command(BaseCommand):
             f'{skipped} skipped, {errors} errors'
         )
 
-    # ── Phase 2 — Physical goods → InventoryItem + opening InventoryBatch ─────
 
     def _import_inventory(self, conn):
         self.stdout.write('\n=== Phase 2: Inventory items + opening stock ===')  # noqa
         cur = conn.cursor()
 
-        # All physical goods
         cur.execute("""
             SELECT i.kodeitem, i.namaitem, i.hargajual1, i.hargapokok, i.satuan,
                    COALESCE(s_gd.stok, 0)  AS stok_gd,
@@ -255,7 +219,6 @@ class Command(BaseCommand):
 
             if kodeitem in existing_codes:
                 items_skipped += 1
-                # Still create opening batch if stock exists and not dry run
                 if total_stock > 0 and not self.dry:
                     try:
                         item = InventoryItem.objects.get(code=kodeitem)
@@ -317,7 +280,6 @@ class Command(BaseCommand):
             f'{items_skipped} skipped, {batch_created} batches, {errors} errors'
         )
 
-    # ── Phase 3 — Sales → Invoice + InvoiceItem ───────────────────────────────
 
     def _import_sales(self, conn):
         self.stdout.write('\n=== Phase 3: Sales -> Invoices ===')
@@ -327,23 +289,19 @@ class Command(BaseCommand):
             self.stderr.write('  ERROR: No active warehouse. Create one first.')
             return
 
-        # Build lookup: iPos kodeitem → CPMS InventoryItem pk
         item_map: dict[str, InventoryItem] = {
             item.code: item
             for item in InventoryItem.objects.all()
         }
-        # Build patient set for fast membership check
         patient_set: set[str] = set(
             Patient.objects.values_list('patient_no', flat=True)
         )
 
-        # Existing IPOS invoice numbers to skip (idempotent re-runs)
         existing_inv_nos: set[str] = set(
             Invoice.objects.filter(invoice_number__startswith='IPOS-')
                            .values_list('invoice_number', flat=True)
         )
 
-        # Build date filter
         date_filter = ''
         date_params: list = []
         if self.from_date:
@@ -376,7 +334,6 @@ class Command(BaseCommand):
                 inv_skipped += 1
                 continue
 
-            # Resolve patient — iPos kodesupel = CPMS patient_no directly
             patient: Patient | None = None
             if kodesupel and kodesupel in patient_set:
                 try:
@@ -384,7 +341,6 @@ class Command(BaseCommand):
                 except Patient.DoesNotExist:
                     pass
 
-            # Fetch line items
             cur2 = conn.cursor()
             cur2.execute("""
                 SELECT d.kodeitem, i.namaitem, d.jumlah, d.harga, d.total
@@ -395,7 +351,6 @@ class Command(BaseCommand):
             lines = cur2.fetchall()
             cur2.close()
 
-            # Attach Jakarta timezone so Django stores the correct UTC value
             tanggal_aware = tanggal.replace(tzinfo=TZ_JAKARTA) if tanggal else None
 
             if self.dry:
@@ -425,7 +380,7 @@ class Command(BaseCommand):
                         warehouse=warehouse,
                         notes=(keterangan or '').strip()[:500],
                     )
-                    inv.save()  # uses custom save() for invoice_number — overridden by pre-set value
+                    inv.save()
                     existing_inv_nos.add(inv_no)
                     inv_created += 1
                     if patient:

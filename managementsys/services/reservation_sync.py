@@ -1,18 +1,3 @@
-"""
-Collects online bookings from the public reservation form.
-
-The clinic backend runs on a LAN with no public address, so the Vercel app
-cannot push to it the way Django pushes events out (``vercel_push.py``). The
-direction is reversed: this module polls ``GET /api/reservation-sync``, writes
-what it finds, and only then acks — so a crash mid-import costs a redelivery,
-never a booking.
-
-Nothing here talks to SatuSehat. It fills the FHIR-shaped ``Appointment``
-fields correctly (status, both ends of the slot, service coding) so the future
-sync stays a mapping walk, which is the same contract
-``views/appointments_scheduled.py`` already keeps.
-"""
-
 import json
 import logging
 import urllib.error
@@ -33,10 +18,8 @@ DEFAULT_TIMEOUT = 15
 
 
 class ReservationSyncError(Exception):
-    """The Vercel endpoint could not be reached, or answered badly."""
+    pass
 
-
-# ── Transport ────────────────────────────────────────────────────────────────
 
 def _endpoint():
     base = (getattr(settings, 'CPMS_VERCEL_URL', '') or '').rstrip('/')
@@ -73,13 +56,10 @@ def _request(method, query='', body=None):
             '%s %s returned HTTP %s: %s' % (method, url, exc.code, detail)
         ) from exc
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
-        # A clinic that lost its internet is the normal case, not an incident:
-        # the rows stay queued on Vercel and the next poll collects them.
         raise ReservationSyncError('%s %s failed: %s' % (method, url, exc)) from exc
 
 
 def fetch_pending(limit=None):
-    """Every booking Vercel still has queued. Returns (rows, more)."""
     query = ('?limit=%d' % int(limit)) if limit else ''
     payload = _request('GET', query=query)
     rows = payload.get('reservations')
@@ -89,30 +69,13 @@ def fetch_pending(limit=None):
 
 
 def ack(acks):
-    """Mark rows collected. ``acks`` is [{'id': int, 'appointment_no': str|None}]."""
     if not acks:
         return 0
     payload = _request('POST', body={'acks': acks})
     return int(payload.get('acked', 0))
 
 
-# ── Patient matching ─────────────────────────────────────────────────────────
-
 def match_patient(raw_phone):
-    """Resolve a booking phone number to a patient record.
-
-    Returns ``(match_status, patient_or_None, candidate_patient_nos)``.
-
-    ``Patient.phone_number`` is free text — the book holds ``08123456789``,
-    ``0812-3456-789`` and ``+628123456789`` for the same number — so no SQL
-    predicate matches all of them. Both sides are normalised in Python instead,
-    over a scan of two small columns. At clinic scale that is a few
-    milliseconds once a minute, and it is *exact* where a LIKE would be a guess.
-
-    Two matches are never collapsed into one. A wrong link writes a stranger's
-    visit into somebody's medical record — far worse than a row a human has to
-    look at.
-    """
     normalized = normalize_phone(raw_phone)
     if not normalized:
         return ReservationRequest.MATCH_INVALID, None, []
@@ -139,19 +102,11 @@ def match_patient(raw_phone):
     )
 
 
-# ── Import ───────────────────────────────────────────────────────────────────
-
 def _default_duration():
     return int(getattr(settings, 'CPMS_RESERVATION_DURATION_MINUTES', 30))
 
 
 def _default_branch():
-    """The branch an online booking is filed under.
-
-    Unset means null, which Appointment already allows and which
-    ``filter_by_branch`` keeps visible under any branch selection — a booking
-    nobody can see would be worse than one filed group-wide.
-    """
     branch_id = getattr(settings, 'CPMS_RESERVATION_BRANCH_ID', None)
     if not branch_id:
         return None
@@ -159,7 +114,6 @@ def _default_branch():
 
 
 def _parse_start(row):
-    """Prefer the WIB form; both carry an explicit offset, so either is exact."""
     raw = row.get('reserved_at_wib') or row.get('reserved_at')
     start = parse_datetime(raw) if raw else None
     if start is None:
@@ -170,12 +124,6 @@ def _parse_start(row):
 
 
 def import_reservation(row):
-    """Write one booking. Returns ``(ReservationRequest, created)``.
-
-    Idempotent on ``external_id``, which is the whole story for redeliveries:
-    the poll endpoint keeps handing a row back until it is acked, and a second
-    delivery must not produce a second appointment.
-    """
     external_id = row.get('id')
     if not isinstance(external_id, int):
         raise ValueError('reservation has no integer id: %r' % (row,))
@@ -193,8 +141,6 @@ def import_reservation(row):
 
     appointment = Appointment.objects.create(
         patient=patient,
-        # A matched booking keeps the typed name too: the patient wrote it, and
-        # reception uses it to confirm the link is the right one.
         guest_name=None if patient else name,
         practitioner=None,
         location=None,
@@ -206,9 +152,6 @@ def import_reservation(row):
         contact_phone=phone,
         reason='',
         start_at=start_at,
-        # FHIR invariants app-2/app-3: a booked appointment carries both ends.
-        # The public form books a slot rather than a duration, so this is the
-        # slot length — reception lengthens it if the visit needs more.
         end_at=start_at + timedelta(minutes=_default_duration()),
         status='booked',
         note='Reservasi online atas nama %s (%s).' % (name, phone),
@@ -232,15 +175,7 @@ def import_reservation(row):
     return request_row, True
 
 
-# ── One pass ─────────────────────────────────────────────────────────────────
-
 def run_once(limit=None):
-    """Fetch, import and ack one batch. Returns a summary dict.
-
-    Import failures are per row: one malformed booking must not strand the rest
-    of the batch behind it. A failed row is left unacked, so it comes back next
-    minute and stays visible in the log rather than disappearing.
-    """
     rows, more = fetch_pending(limit)
 
     imported, duplicates, failed, acks = 0, 0, [], []
@@ -269,8 +204,6 @@ def run_once(limit=None):
             ),
         })
 
-    # Acked only once the writes have committed. Rows in `failed` stay queued
-    # on Vercel deliberately.
     acked = ack(acks) if acks else 0
 
     return {

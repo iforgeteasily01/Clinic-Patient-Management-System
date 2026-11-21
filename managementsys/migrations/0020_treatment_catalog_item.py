@@ -19,7 +19,6 @@ def create_catalog_items(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0019_treatmentcategory'),
     ]

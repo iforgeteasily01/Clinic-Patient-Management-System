@@ -1,24 +1,3 @@
-"""
-provision_supplier_ap_accounts
-==============================
-One-shot / idempotent setup for the per-vendor Accounts Payable structure on a
-fresh or production database. Equivalent to migration 0073 but runnable on
-demand with a printed roster.
-
-It does three things:
-  1. Ensures the AP control account (2100000) under the Liabilities head and the
-     Opening Balance Equity offset account (3900000) under the Equity head exist.
-  2. Ensures every Supplier has its own AP sub-account (2100001..) linked.
-  3. With --backfill, posts the OUTSTANDING balance of each unpaid/partial
-     (non-voided) purchase invoice as Cr AP-vendor / Dr Opening Balance Equity.
-     Idempotent: an invoice that already carries a saldo-awal AP entry is
-     skipped, so re-running never double-posts.
-
-Usage:
-    python manage.py provision_supplier_ap_accounts
-    python manage.py provision_supplier_ap_accounts --backfill
-    python manage.py provision_supplier_ap_accounts --backfill --dry-run
-"""
 from decimal import Decimal
 
 from django.core.management.base import BaseCommand
@@ -68,7 +47,6 @@ class Command(BaseCommand):
         if dry_run:
             self.stdout.write(self.style.WARNING('DRY RUN — no changes will be saved.\n'))
 
-        # ── 1 + 2. Control/OBE accounts and per-vendor AP accounts ────────────
         newly_linked = []
         with transaction.atomic():
             control = Supplier._ensure_ap_control_account()
@@ -93,11 +71,9 @@ class Command(BaseCommand):
         else:
             self.stdout.write('\nAll suppliers already have an AP account.')
 
-        # ── 3. Optional outstanding backfill ─────────────────────────────────
         if backfill:
             self._backfill(obe, dry_run)
 
-        # ── Roster ────────────────────────────────────────────────────────────
         self.stdout.write(self.style.SUCCESS('\nVendor AP accounts:'))
         for s in Supplier.objects.select_related('ap_account').order_by('name'):
             if s.ap_account_id:
@@ -123,7 +99,6 @@ class Command(BaseCommand):
             balance_due = (inv.total_amount or ZERO) - (inv.amount_paid or ZERO)
             if balance_due <= 0:
                 continue
-            # Idempotency: skip if a saldo-awal AP entry already exists.
             already = LedgerEntry.objects.filter(
                 purchase_invoice=inv,
                 description__startswith=SALDO_AWAL_PREFIX,

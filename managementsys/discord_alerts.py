@@ -1,10 +1,3 @@
-"""
-discord_alerts.py
-Sends HTTP error reports (404, 5xx, unhandled exceptions) to a Discord channel
-via an incoming webhook, in a background thread so it never blocks the request.
-
-Configured entirely from settings / .env — see DISCORD_* keys in CPMS/settings.py.
-"""
 import json
 import logging
 import threading
@@ -17,15 +10,12 @@ from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-# Discord embed colours (decimal)
-COLOR_RED    = 0xE74C3C   # 5xx / exceptions
-COLOR_ORANGE = 0xE67E22   # 404 and other 4xx
+COLOR_RED    = 0xE74C3C
+COLOR_ORANGE = 0xE67E22
 
-# Discord hard limits
 MAX_DESCRIPTION = 4000
 MAX_FIELD_VALUE = 1000
 
-# key -> last-sent unix timestamp, used to throttle repeats
 _last_sent: dict[str, float] = {}
 _lock = threading.Lock()
 
@@ -36,7 +26,6 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def _post(payload: dict):
-    """Internal: perform the HTTP POST. Runs in a background thread."""
     url = getattr(settings, 'DISCORD_WEBHOOK_URL', '')
     try:
         body = json.dumps(payload).encode('utf-8')
@@ -50,12 +39,10 @@ def _post(payload: dict):
             if resp.status not in (200, 204):
                 logger.warning('[discord_alerts] Unexpected status %s', resp.status)
     except Exception as exc:
-        # Never let an alert failure affect the main request
         logger.warning('[discord_alerts] Alert failed: %s', exc)
 
 
 def _should_send(dedupe_key: str) -> bool:
-    """Throttle: at most one alert per dedupe_key per DISCORD_ALERT_COOLDOWN seconds."""
     cooldown = getattr(settings, 'DISCORD_ALERT_COOLDOWN', 60)
     if cooldown <= 0:
         return True
@@ -65,7 +52,6 @@ def _should_send(dedupe_key: str) -> bool:
         if now - last < cooldown:
             return False
         _last_sent[dedupe_key] = now
-        # keep the dict from growing forever
         if len(_last_sent) > 500:
             for key in [k for k, v in _last_sent.items() if now - v > cooldown * 10]:
                 _last_sent.pop(key, None)
@@ -74,10 +60,6 @@ def _should_send(dedupe_key: str) -> bool:
 
 def send_alert(title: str, description: str = '', fields: dict | None = None,
                color: int = COLOR_RED, dedupe_key: str | None = None):
-    """
-    Fire-and-forget alert to Discord. Returns immediately, sends in background.
-    Safe to call from anywhere — silently does nothing if no webhook is configured.
-    """
     url = getattr(settings, 'DISCORD_WEBHOOK_URL', '')
     if not url:
         return
@@ -106,12 +88,7 @@ def send_alert(title: str, description: str = '', fields: dict | None = None,
     threading.Thread(target=_post, args=(payload,), daemon=True).start()
 
 
-# --------------------------------------------------------------------------- #
-# Middleware
-# --------------------------------------------------------------------------- #
-
 def _parse_status_spec(spec: str) -> list[tuple[int, int]]:
-    """'404,500-599' -> [(404, 404), (500, 599)]"""
     ranges = []
     for part in str(spec).split(','):
         part = part.strip()
@@ -126,15 +103,6 @@ def _parse_status_spec(spec: str) -> list[tuple[int, int]]:
 
 
 class DiscordErrorAlertMiddleware:
-    """
-    Reports failing responses and unhandled exceptions to Discord.
-
-    Catches both:
-      - any response whose status code matches DISCORD_ALERT_STATUSES
-        (covers DRF-handled errors, which never reach process_exception)
-      - unhandled exceptions raised by a view, with full traceback
-    """
-
     def __init__(self, get_response):
         self.get_response = get_response
         self.statuses = _parse_status_spec(
@@ -202,6 +170,5 @@ class DiscordErrorAlertMiddleware:
             color=COLOR_RED,
             dedupe_key=f'exc:{type(exception).__name__}:{request.path}',
         )
-        # Suppress the duplicate 500 alert from __call__ for this same request
         request._discord_alert_sent = True
-        return None  # let Django's normal error handling continue
+        return None

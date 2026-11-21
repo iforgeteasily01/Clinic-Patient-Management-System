@@ -2,7 +2,6 @@ from django.db import migrations, models
 
 
 def _combine(a, b):
-    """Merge the old Pagi/Malam values into one, without losing data."""
     a = (a or '').strip()
     b = (b or '').strip()
     if a and b:
@@ -19,13 +18,11 @@ def forwards(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0070_siteconfig_logo'),
     ]
 
     operations = [
-        # 1. Add the new single-line + obat detail fields.
         migrations.AddField(
             model_name='medrec',
             name='sabun',
@@ -46,9 +43,7 @@ class Migration(migrations.Migration):
             name='obat2_detail',
             field=models.TextField(default='', null=True),
         ),
-        # 2. Combine existing Pagi/Malam data into the new single fields.
         migrations.RunPython(forwards, migrations.RunPython.noop),
-        # 3. Drop the now-redundant Pagi/Malam split for sabun & toner.
         migrations.RemoveField(model_name='medrec', name='sabun_pagi'),
         migrations.RemoveField(model_name='medrec', name='sabun_malam'),
         migrations.RemoveField(model_name='medrec', name='toner_pagi'),

@@ -1,11 +1,3 @@
-"""Transfers move money between cash/bank accounts, and only between those.
-
-A transfer is a move of funds between two places money physically sits. Moving
-value anywhere else — writing down inventory, reclassifying an expense — is a
-manual adjustment or a correction journal, and must not be expressible as a
-transfer. Posting stays deferred: the two legs land when the journal run sweeps
-the transfer date, not at creation.
-"""
 from decimal import Decimal
 
 import pytest
@@ -50,7 +42,6 @@ class TestTransferPostsOnJournalRun:
                               amount=5000, date='2026-08-01').status_code == 201
         transfer = AccountTransfer.objects.latest('id')
 
-        # Deferred: nothing in the ledger, no balance moved.
         assert transfer.posting_status == 'unposted'
         assert LedgerEntry.objects.filter(transfer=transfer).count() == 0
 

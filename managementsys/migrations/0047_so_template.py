@@ -3,7 +3,6 @@ import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0045_stockopnamesession_warehouse'),
         ('managementsys', '0046_treatmentcategory_expense_account'),

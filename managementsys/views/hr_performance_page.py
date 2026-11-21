@@ -26,7 +26,6 @@ def _parse_date_range(request):
 
 
 def _dt_range(date_from, date_to):
-    """Return an inclusive datetime range (start of date_from → end of date_to)."""
     start = make_aware(tz_datetime(date_from.year, date_from.month, date_from.day, 0, 0, 0))
     end   = make_aware(tz_datetime(date_to.year,   date_to.month,   date_to.day,  23, 59, 59))
     return start, end
@@ -45,8 +44,7 @@ def _beautician_performance(date_from, date_to):
         .prefetch_related('treatments')
     )
 
-    # Aggregate in Python to handle M2M treatments easily
-    beautician_map = {}  # id → dict
+    beautician_map = {}
 
     for session in sessions:
         b = session.beautician
@@ -63,7 +61,6 @@ def _beautician_performance(date_from, date_to):
         entry = beautician_map[b.id]
         entry['sessions_count'] += 1
 
-        # Unique patients — use patient_no if available, else active_patient pk
         if session.patient_no_id:
             entry['patient_ids'].add(('p', session.patient_no_id))
         elif session.active_patient_id:
@@ -102,7 +99,6 @@ def _beautician_performance(date_from, date_to):
 def _doctor_performance(date_from, date_to):
     start, end = _dt_range(date_from, date_to)
 
-    # MedRec → ActivePatient (via active_visit OneToOne reverse) → visit_time
     medrecs = (
         MedRec.objects
         .filter(
@@ -183,7 +179,6 @@ class StaffPerformanceDailyView(APIView):
         staff_id = int(staff_id)
         start, end = _dt_range(date_from, date_to)
 
-        # Build a zero-filled day map
         day_map = {}
         cur = date_from
         while cur <= date_to:
@@ -214,7 +209,7 @@ class StaffPerformanceDailyView(APIView):
                 for v in day_map.values()
             ])
 
-        else:  # doctor
+        else:
             medrecs = MedRec.objects.filter(
                 doctor_id=staff_id,
                 active_visit__visit_time__gte=start,

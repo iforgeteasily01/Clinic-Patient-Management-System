@@ -6,4 +6,4 @@ class ManagementsysConfig(AppConfig):
     name = 'managementsys'
 
     def ready(self):
-        import managementsys.signals  # noqa: F401 — registers signal handlers
+        import managementsys.signals  # noqa: F401

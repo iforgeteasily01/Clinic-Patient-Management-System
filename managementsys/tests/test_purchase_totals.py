@@ -3,8 +3,6 @@ from decimal import Decimal
 from django.test import TestCase
 
 
-# ── Pure calculation helpers (mirror accounting_page.py logic) ─────────────────
-
 def _safe_decimal(val) -> Decimal:
     try:
         return Decimal(str(val))
@@ -13,24 +11,6 @@ def _safe_decimal(val) -> Decimal:
 
 
 def compute_purchase_totals(items: list, additional_costs: list):
-    """
-    Replicates the server-side calculation in PurchaseInvoiceListCreateView.post.
-
-    items: list of dicts with keys:
-        quantity, unit_cost, total_discount, line_type ('stock'|'expense')
-
-    additional_costs: list of dicts with keys:
-        name, modifier ('add'|'subtract'), amount_type ('cash'|'percent'), amount
-
-    Returns:
-        {
-            'items_subtotal': Decimal,   # sum of adjusted item subtotals
-            'net_adjustment': Decimal,   # net effect of additional costs
-            'grand_total': Decimal,
-            'per_unit_adj': Decimal,     # adjustment per stock unit
-            'parsed': list of dict with 'base_unit_cost' and 'actual_unit_cost',
-        }
-    """
     parsed = []
     items_subtotal = Decimal('0')
     total_units = Decimal('0')
@@ -105,12 +85,8 @@ def compute_purchase_totals(items: list, additional_costs: list):
     }
 
 
-# ── Tests ──────────────────────────────────────────────────────────────────────
-
 class PurchaseItemDiscountTests(TestCase):
-
     def test_no_discount_no_additional(self):
-        """Basic: 10 items × 10000, no discount, no additional costs."""
         result = compute_purchase_totals(
             items=[{'quantity': 10, 'unit_cost': 10000,
                     'total_discount': 0, 'line_type': 'stock'}],
@@ -124,7 +100,6 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(item['actual_unit_cost'], Decimal('10000'))
 
     def test_row_discount_reduces_unit_cost(self):
-        """10 items × 10000 with total_discount=10000 → actual unit cost = 9000."""
         result = compute_purchase_totals(
             items=[{'quantity': 10, 'unit_cost': 10000,
                     'total_discount': 10000, 'line_type': 'stock'}],
@@ -136,21 +111,16 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(item['actual_unit_cost'], Decimal('9000'))
 
     def test_discount_cannot_exceed_gross(self):
-        """total_discount > gross is capped at gross → actual cost = 0."""
         result = compute_purchase_totals(
             items=[{'quantity': 5, 'unit_cost': 1000,
                     'total_discount': 9999999, 'line_type': 'stock'}],
             additional_costs=[],
         )
         item = result['parsed'][0]
-        self.assertEqual(item['total_discount'], Decimal('5000'))   # capped
+        self.assertEqual(item['total_discount'], Decimal('5000'))
         self.assertEqual(item['base_unit_cost'], Decimal('0'))
 
     def test_cash_addition_distributed_per_unit(self):
-        """
-        Single item: 10 units × 10000, discount 10000 → base = 9000.
-        Additional cost: +5000 cash → per_unit_adj = 500 → actual = 9500.
-        """
         result = compute_purchase_totals(
             items=[{'quantity': 10, 'unit_cost': 10000,
                     'total_discount': 10000, 'line_type': 'stock'}],
@@ -165,7 +135,6 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(item['actual_unit_cost'], Decimal('9500'))
 
     def test_cash_subtraction_distributed_per_unit(self):
-        """Additional discount -5000 on 10 units reduces unit cost by 500."""
         result = compute_purchase_totals(
             items=[{'quantity': 10, 'unit_cost': 10000,
                     'total_discount': 0, 'line_type': 'stock'}],
@@ -177,7 +146,6 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(item['actual_unit_cost'], Decimal('9500'))
 
     def test_percent_addition(self):
-        """10% additional on items_subtotal=100000 → +10000 → grand_total=110000."""
         result = compute_purchase_totals(
             items=[{'quantity': 10, 'unit_cost': 10000,
                     'total_discount': 0, 'line_type': 'stock'}],
@@ -190,7 +158,6 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(item['actual_unit_cost'], Decimal('11000'))
 
     def test_percent_subtraction(self):
-        """5% off 100000 = -5000 → grand_total = 95000."""
         result = compute_purchase_totals(
             items=[{'quantity': 10, 'unit_cost': 10000,
                     'total_discount': 0, 'line_type': 'stock'}],
@@ -201,10 +168,6 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(result['grand_total'], Decimal('95000'))
 
     def test_percent_applied_to_running_total(self):
-        """
-        Cash +10000 then 10% of new total.
-        items_subtotal=100000, +10000 cash → running=110000, then 10%=11000 → grand=121000.
-        """
         result = compute_purchase_totals(
             items=[{'quantity': 10, 'unit_cost': 10000,
                     'total_discount': 0, 'line_type': 'stock'}],
@@ -219,11 +182,6 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(result['net_adjustment'], Decimal('21000'))
 
     def test_multi_item_equal_per_unit_distribution(self):
-        """
-        Item A: 10 × 1000, Item B: 5 × 2000. Additional +1500 cash.
-        total_units = 15, per_unit_adj = 100.
-        Item A actual = 1100, Item B actual = 2100.
-        """
         result = compute_purchase_totals(
             items=[
                 {'quantity': 10, 'unit_cost': 1000,
@@ -242,7 +200,6 @@ class PurchaseItemDiscountTests(TestCase):
                          ['actual_unit_cost'], Decimal('2100'))
 
     def test_expense_line_not_included_in_unit_distribution(self):
-        """Expense-type lines do not receive per_unit_adj."""
         result = compute_purchase_totals(
             items=[
                 {'quantity': 10, 'unit_cost': 1000,
@@ -253,16 +210,13 @@ class PurchaseItemDiscountTests(TestCase):
             additional_costs=[
                 {'name': 'Fee', 'modifier': 'add', 'amount_type': 'cash', 'amount': 1000}],
         )
-        # Only 10 stock units; expense unit is not in total_units
         self.assertEqual(result['total_units'], Decimal('10'))
         self.assertEqual(result['per_unit_adj'], Decimal('100'))
-        # Expense line's actual_unit_cost is unchanged (no adj applied)
         expense_item = result['parsed'][1]
         self.assertEqual(
             expense_item['actual_unit_cost'], expense_item['unit_cost'])
 
     def test_zero_quantity_item_no_division_error(self):
-        """Zero-quantity item should not raise ZeroDivisionError."""
         result = compute_purchase_totals(
             items=[{'quantity': 0, 'unit_cost': 5000,
                     'total_discount': 0, 'line_type': 'stock'}],
@@ -272,7 +226,6 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(item['actual_unit_cost'], Decimal('5000'))
 
     def test_additional_cost_with_zero_amount_skipped(self):
-        """Additional cost entries with amount=0 are ignored."""
         result = compute_purchase_totals(
             items=[{'quantity': 5, 'unit_cost': 2000,
                     'total_discount': 0, 'line_type': 'stock'}],
@@ -285,7 +238,6 @@ class PurchaseItemDiscountTests(TestCase):
         self.assertEqual(result['grand_total'], Decimal('10000'))
 
     def test_grand_total_equals_items_subtotal_plus_net_adjustment(self):
-        """Invariant: grand_total == items_subtotal + net_adjustment."""
         result = compute_purchase_totals(
             items=[
                 {'quantity': 3, 'unit_cost': 5000,

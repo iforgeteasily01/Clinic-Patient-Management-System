@@ -10,17 +10,10 @@ from ..models import ActivePatient, AppUser, Patient, PatientNote
 
 
 def _parse_date_param(params, key):
-    """Parse a YYYY-MM-DD query param, or None when absent.
-
-    A malformed value is a client bug, so it 400s rather than silently
-    returning every note ever written.
-    """
     raw = (params.get(key) or '').strip()
     if not raw:
         return None
     try:
-        # Returns None when unparseable, raises when well-formed but impossible
-        # (2026-13-01). Both are the same client mistake.
         value = parse_date(raw)
     except ValueError:
         value = None
@@ -33,18 +26,6 @@ class PatientNoteListCreateView(generics.ListCreateAPIView):
     serializer_class = PatientNoteSerializer
 
     def get_queryset(self):
-        """Notes for one subject, optionally narrowed to a date or range.
-
-        Subject filters (at least one is required, otherwise an empty list is
-        returned rather than an error — several callers mount the panel before
-        a patient is picked):
-            ?patient_no=J000001         registered patient
-            ?active_patient_id=42       a visit (the only handle a guest has)
-        Supplying both ORs them: a registered patient's visit collects notes
-        written against either handle.
-
-        Date filters: ?date=, ?date_from=, ?date_to=, ?today=1.
-        """
         params = self.request.query_params
 
         patient_no = (params.get('patient_no') or '').strip()
@@ -80,13 +61,6 @@ class PatientNoteListCreateView(generics.ListCreateAPIView):
         return qs.select_related('author_user').order_by('-date', '-created_at')
 
     def create(self, request, *args, **kwargs):
-        """Create a note against a patient, a visit, or both.
-
-        Either ``patient_no`` or ``active_patient_id`` must be supplied — the
-        second is what makes walk-in guests (who have no Patient row) work.
-        When a visit belongs to a registered patient both links are stored, so
-        the note survives the visit row being deleted at checkout.
-        """
         patient_no = (request.data.get('patient_no') or '').strip()
         raw_visit = request.data.get('active_patient_id')
 
@@ -122,9 +96,6 @@ class PatientNoteListCreateView(generics.ListCreateAPIView):
         if not serializer.validated_data.get('date'):
             save_kwargs['date'] = timezone.localdate()
 
-        # Attribution is server-owned: the client cannot claim an author or a
-        # role. author_role is snapshotted here because the user may later be
-        # re-roled or deleted.
         actor = request.user if isinstance(request.user, AppUser) else None
         if actor is not None:
             save_kwargs['author_user'] = actor
@@ -141,13 +112,6 @@ class PatientNoteDetailView(generics.RetrieveUpdateDestroyAPIView):
     queryset = PatientNote.objects.select_related('author_user')
 
     def _assert_can_modify(self, note):
-        """Only the author, a manager, or a superuser may change a note.
-
-        Legacy rows have no author_user (attribution was free text before this
-        endpoint stamped it), so those are manager/superuser-only. Kept in step
-        with PatientNoteSerializer.get_can_edit, which drives the webapp's
-        edit/delete buttons.
-        """
         user = self.request.user
         if not isinstance(user, AppUser):
             raise PermissionDenied('Authentication required.')

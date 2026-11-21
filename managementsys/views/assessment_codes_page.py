@@ -68,8 +68,6 @@ class AssessmentCodeDetailView(generics.RetrieveUpdateDestroyAPIView):
 
 
 class AssessmentCodeTemplateDownloadView(APIView):
-    """GET — download a blank sample .xlsx with ICD-10 import format and example rows."""
-
     def get(self, request):
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -108,15 +106,6 @@ class AssessmentCodeTemplateDownloadView(APIView):
 
 
 class AssessmentCodeImportPreviewView(APIView):
-    """Parse uploaded .xlsx and return rows for user review — no DB writes.
-
-    Expected columns (row 1 = header, skipped):
-      A: Code        — ICD-10 code, e.g. L70.0
-      B: Description — human-readable label
-      C: Category    — 1 / "Common" or 2 / "Uncommon" (default: Common)
-      D: Active      — TRUE/1/Yes or FALSE/0/No (default: True)
-    """
-
     def post(self, request):
         uploaded = request.FILES.get('file')
         if not uploaded:
@@ -170,8 +159,6 @@ class AssessmentCodeImportPreviewView(APIView):
 
 
 class AssessmentCodeImportConfirmView(APIView):
-    """Bulk create / update assessment codes from previewed rows."""
-
     def post(self, request):
         rows = request.data.get('rows', [])
         if not rows:

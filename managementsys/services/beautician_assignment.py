@@ -1,15 +1,3 @@
-"""
-Who is looking after a visit, and when that changes hands.
-
-`BeauticianAssignment` is the source of truth for the *current* beautician on a
-visit; `TreatmentSession.beautician` records who started each session and is
-never rewritten. See the model docstring for why.
-
-Busy/free (`Beauticians.available`) is derived from the open assignments of
-visits still in treatment (status 4). A visit started before assignments
-existed has none, so for those the session's beautician still counts — the
-migration backfills live visits, this keeps anything it missed correct.
-"""
 from django.db import transaction
 from django.utils import timezone
 
@@ -29,7 +17,6 @@ def open_assignment(active_patient):
 
 
 def busy_beautician_ids(exclude_visit=None):
-    """Beauticians holding a visit that is in treatment right now."""
     live = ActivePatient.objects.filter(status=IN_TREATMENT)
     if exclude_visit is not None:
         live = live.exclude(pk=exclude_visit.pk)
@@ -58,14 +45,6 @@ def _free_unless_busy(beautician_ids, exclude_visit=None):
 
 
 def assign(active_patient, beautician, *, actor=None, reason='', branch=None):
-    """
-    Make `beautician` the one looking after this visit.
-
-    Returns (assignment, previous). `previous` is the assignment that was
-    closed, or None when nothing changed hands — the first assignment, or the
-    same beautician again (adding treatments mid-visit), which is a no-op so
-    the history only records real hand-overs.
-    """
     with transaction.atomic():
         current = open_assignment(active_patient)
         if current is not None and current.beautician_id == beautician.id:
@@ -90,18 +69,11 @@ def assign(active_patient, beautician, *, actor=None, reason='', branch=None):
         Beauticians.objects.filter(pk=beautician.pk).update(available=False)
 
         if current is not None and current.beautician_id:
-            # The outgoing beautician is free again unless another patient in
-            # treatment still holds them.
             _free_unless_busy([current.beautician_id])
         return assignment, current
 
 
 def release(active_patient):
-    """
-    The visit is leaving treatment (finished, dismissed, billed, cleared):
-    close its open assignment and free everyone tied to it who is not holding
-    another patient in treatment.
-    """
     tied = set(
         TreatmentSession.objects.filter(active_patient=active_patient)
         .exclude(beautician__isnull=True)

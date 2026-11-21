@@ -1,35 +1,3 @@
-"""WhatsApp gateway settings, session pairing, and CRM blasts.
-
-The gateway is OpenWA (github.com/rmyndharis/OpenWA) running as its own Node
-service; see services/whatsapp_gateway.py for the route map. Django holds the
-connection settings, decides *who* gets a message, and keeps the record of what
-was sent. It never speaks to WhatsApp itself.
-
-How a blast runs
-----------------
-OpenWA's ``send-bulk`` is asynchronous: it accepts up to 100 messages, returns a
-``batchId`` immediately, and delivers them in the background with a delay
-between each. So there is no background worker on the Django side either —
-
-    POST /api/whatsapp/blasts/        writes every recipient row, dispatches
-                                      the first batch, returns
-    GET  /api/whatsapp/blasts/<id>/   syncs that batch from the gateway, and
-                                      dispatches the next one when it drains
-
-The page polls the detail endpoint while a blast is running, which is what
-advances it. A blast therefore survives a Django restart: the state is entirely
-in the two tables plus the gateway, and the next poll picks it up.
-
-Guard rails, all enforced here and not in the browser
------------------------------------------------------
-* opt-in, usable number, and per-patient cooldown (services/wa_audience.py)
-* a daily cap across all blasts
-* quiet hours in Jakarta local time
-* the session must actually be paired (``status == 'ready'``)
-
-None of them are overridable from the UI. A blast is easy to fire and expensive
-to take back.
-"""
 from __future__ import annotations
 
 import datetime
@@ -67,9 +35,6 @@ from ..services.whatsapp_gateway import (
 
 logger = logging.getLogger(__name__)
 
-# A blast preview never renders more than this many rows. The counts are exact;
-# the list is a sample, because a 2000-recipient preview helps nobody and costs
-# 2000 template renders.
 PREVIEW_ROWS = 50
 
 
@@ -81,14 +46,10 @@ def _now_jkt():
     return timezone.now().astimezone(JAKARTA_TZ)
 
 
-# ── Settings ───────────────────────────────────────────────────────────────
-
 def _serialize_settings(s):
     return {
         'enabled': s.enabled,
         'base_url': s.base_url,
-        # Never the key itself. The operator needs to know whether one is set
-        # and roughly which, not to be able to read it back out of the browser.
         'api_key_set': bool(s.api_key),
         'api_key_hint': f'…{s.api_key[-4:]}' if len(s.api_key) >= 4 else '',
         'session_id': s.session_id,
@@ -124,16 +85,12 @@ class WhatsAppSettingsView(APIView):
             s.base_url = (payload['base_url'] or '').strip().rstrip('/')
         if 'session_name' in payload:
             name = (payload['session_name'] or '').strip()
-            # OpenWA's CreateSessionDto: 3-50 chars, letters/digits/hyphen only.
             if name and not _valid_session_name(name):
                 errors['session_name'] = ('3-50 karakter, hanya huruf, angka, dan tanda hubung.')
             else:
                 s.session_name = name
         if 'api_key' in payload:
             key = (payload['api_key'] or '').strip()
-            # An empty string means "leave it alone", not "clear it" — the form
-            # never receives the current key, so submitting the form unchanged
-            # would otherwise wipe it. Clearing is an explicit action below.
             if key:
                 s.api_key = key
         if payload.get('clear_api_key'):
@@ -175,14 +132,7 @@ def _valid_session_name(name):
     return 3 <= len(name) <= 50 and all(c.isalnum() or c == '-' for c in name)
 
 
-# ── Connection status & pairing ────────────────────────────────────────────
-
 class WhatsAppStatusView(APIView):
-    """GET /api/whatsapp/status/
-
-    Never raises: an unreachable gateway is the normal state before setup, and
-    the settings page has to be able to render and say so.
-    """
     permission_classes = [AllowAny]
 
     def get(self, request):
@@ -215,7 +165,6 @@ class WhatsAppStatusView(APIView):
         try:
             session = client.get_session(s.session_id)
         except GatewayError as exc:
-            # A 404 here means the session was deleted on the gateway side.
             out['session_status'] = 'missing' if exc.status == 404 else 'error'
             out['gateway_error'] = str(exc)
             return Response(out)
@@ -236,12 +185,6 @@ class WhatsAppStatusView(APIView):
 
 
 class WhatsAppSessionView(APIView):
-    """POST /api/whatsapp/session/<action>/ — create | start | stop | logout | qr
-
-    Pairing is inherently a sequence of gateway calls, and folding them into one
-    endpoint per action keeps the settings page from having to know OpenWA's
-    session lifecycle.
-    """
     permission_classes = [AllowAny]
 
     def post(self, request, action):
@@ -253,9 +196,6 @@ class WhatsAppSessionView(APIView):
                 if not s.session_name:
                     return Response({'detail': 'Nama sesi belum diatur.'},
                                     status=http.HTTP_400_BAD_REQUEST)
-                # Reuse a session of the same name if the gateway already has
-                # one — creating a duplicate is a 409 and leaves the operator
-                # stuck with no way forward from the UI.
                 existing = next(
                     (x for x in client.list_sessions() if x.get('name') == s.session_name),
                     None,
@@ -286,13 +226,6 @@ class WhatsAppSessionView(APIView):
 
 
 class WhatsAppTestMessageView(APIView):
-    """POST /api/whatsapp/test-message/  {to?, text?}
-
-    Bypasses opt-in and cooldown by design: it goes to a number the operator
-    typed on the settings page, not to a patient, and its whole purpose is to
-    prove the pairing works before anyone trusts it with a real audience. It is
-    still refused when the session is not ready.
-    """
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -330,10 +263,7 @@ class WhatsAppTestMessageView(APIView):
         return Response({'sent': True, 'chat_id': chat_id, 'result': result})
 
 
-# ── Audience segments ──────────────────────────────────────────────────────
-
 class WhatsAppSegmentsView(APIView):
-    """GET /api/whatsapp/segments/ — the picker, with a live count per segment."""
     permission_classes = [AllowAny]
 
     def get(self, request):
@@ -352,15 +282,7 @@ def _sent_today():
     return WhatsAppBlastRecipient.objects.filter(status='sent', sent_at__gte=start).count()
 
 
-# ── Blast preview & send ───────────────────────────────────────────────────
-
 def _resolve_body(payload):
-    """-> (body, template, error_response)
-
-    A blast carries either a template id or a literal body. The template's text
-    is snapshotted at send time so editing it later cannot rewrite what patients
-    were told.
-    """
     template = None
     template_id = payload.get('template_id')
     if template_id:
@@ -390,12 +312,6 @@ def _render_for(recipient, body, today):
 
 
 class WhatsAppBlastPreviewView(APIView):
-    """POST /api/whatsapp/blasts/preview/  {segment, template_id|body}
-
-    Resolves the audience and renders a sample without sending anything or
-    writing a row. The counts it returns are the same ones the send path
-    enforces, so the preview cannot promise a number the send will not honour.
-    """
     permission_classes = [AllowAny]
 
     def post(self, request):
@@ -441,7 +357,6 @@ class WhatsAppBlastPreviewView(APIView):
 
 
 def _send_blockers(s):
-    """Reasons a send would be refused right now, as operator-facing strings."""
     blockers = []
     if not s.enabled:
         blockers.append('Integrasi WhatsApp dinonaktifkan di Pengaturan.')
@@ -461,7 +376,6 @@ def _send_blockers(s):
 
 
 def _in_quiet_hours(hour, start, end):
-    """Quiet from ``start`` to ``end``, wrapping past midnight when start > end."""
     if start == end:
         return False
     if start < end:
@@ -493,7 +407,6 @@ class WhatsAppBlastListCreateView(APIView):
             return Response({'detail': blockers[0], 'blocked': blockers},
                             status=http.HTTP_409_CONFLICT)
 
-        # The session must be paired *now*, not when the page was loaded.
         client = client_from_settings(s)
         try:
             session = client.get_session(s.session_id)
@@ -545,12 +458,6 @@ class WhatsAppBlastListCreateView(APIView):
 
 
 def _dispatch_next_batch(blast, settings_obj, client):
-    """Hand the next <=BULK_MAX pending recipients to the gateway.
-
-    Returns True when a batch went out. A blast with nothing pending left is
-    marked completed here — this is the only place that transition happens, so
-    it cannot be reached with recipients still unsent.
-    """
     pending = list(
         blast.recipients.filter(status='pending', batch_id='').order_by('id')[:BULK_MAX]
     )
@@ -586,11 +493,6 @@ def _dispatch_next_batch(blast, settings_obj, client):
 
 
 class WhatsAppBlastDetailView(APIView):
-    """GET /api/whatsapp/blasts/<pk>/ — syncs from the gateway, then returns.
-
-    Polling this is what advances a blast: it reconciles the current batch and
-    dispatches the next one once that batch drains.
-    """
     permission_classes = [AllowAny]
 
     def get(self, request, pk):
@@ -611,9 +513,6 @@ def _sync(blast):
     try:
         status_payload = client.batch_status(s.session_id, blast.batch_id)
     except GatewayError as exc:
-        # A sync failure is not a blast failure — the gateway may be briefly
-        # restarting while the batch is still queued inside it. Record it and
-        # let the next poll try again.
         blast.error = str(exc)
         blast.save(update_fields=['error', 'updated_at'])
         return
@@ -653,7 +552,6 @@ def _sync(blast):
             blast.save(update_fields=['status', 'updated_at'])
             blast.recipients.filter(status='pending').update(status='cancelled')
             return
-        # Batch drained — move on to the next chunk, or finish.
         _dispatch_next_batch(blast, s, client_from_settings(s))
     else:
         blast.sent_count, blast.failed_count = counts
@@ -694,9 +592,6 @@ class WhatsAppBlastCancelView(APIView):
             except GatewayError as exc:
                 logger.warning('[whatsapp] cancel of %s failed: %s', blast.batch_id, exc)
 
-        # Cancel locally regardless: anything still pending must never be
-        # dispatched, even if the gateway did not acknowledge. Messages already
-        # delivered stay 'sent' — they cannot be recalled.
         blast.recipients.filter(status='pending').update(status='cancelled')
         blast.status = 'cancelled'
         blast.save(update_fields=['status', 'updated_at'])
@@ -739,15 +634,7 @@ def _serialize_blast(b, *, detail=False):
     return data
 
 
-# ── Patient opt-in ─────────────────────────────────────────────────────────
-
 class PatientWhatsAppOptInView(APIView):
-    """PATCH /api/patients/<patient_no>/wa-opt-in/  {"opt_in": true|false}
-
-    Its own endpoint rather than a field on the patient update: consent changes
-    are logged, and this keeps them out of the generic admin PUT where a stale
-    form could flip them back by accident.
-    """
     permission_classes = [AllowAny]
 
     def patch(self, request, patient_no):
@@ -789,5 +676,5 @@ def _log(request, action, description):
             entity_id='',
             description=description,
         )
-    except Exception:  # pragma: no cover - logging must never break a send
+    except Exception:  # pragma: no cover
         logger.exception('[whatsapp] audit log failed')

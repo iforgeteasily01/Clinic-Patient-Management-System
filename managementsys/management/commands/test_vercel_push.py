@@ -17,7 +17,6 @@ class Command(BaseCommand):
         result = {'ok': False, 'error': None}
         original_post = None
 
-        # Monkey-patch _post so we can capture the outcome synchronously
         import managementsys.vercel_push as vp
         import urllib.request
         import json
@@ -62,12 +61,11 @@ class Command(BaseCommand):
             },
         )
 
-        # Wait for the background thread to finish (max 12 s)
         deadline = time.time() + 12
         while time.time() < deadline and not result['ok'] and result['error'] is None:
             time.sleep(0.1)
 
-        vp._post = original_post  # restore
+        vp._post = original_post
 
         if result['ok']:
             self.stdout.write('SUCCESS')

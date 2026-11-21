@@ -1,29 +1,3 @@
-"""
-Evaluation of TaxRule rows against the LedgerEntry journal.
-
-A rule is built on the page as data (accounts + rate shape); this module turns
-that data into a number for a requested period, together with a full trace of
-how it got there. Nothing here writes to the ledger.
-
-Two properties matter more than anything else and are the reason this is not
-just a sum:
-
-* **Every figure comes from `account_movements()`**, the same helper the
-  financial reports use, so a tax base and the Laba Rugi it is supposed to
-  agree with can never diverge. Cached `ChartOfAccounts.balance` is never read.
-
-* **Rules may reference other rules**, which makes the rule set a graph. It is
-  evaluated in dependency order with cycle detection, so `PPN Kurang Bayar =
-  keluaran - masukan` works and `A -> B -> A` is reported rather than hanging.
-
-Sign convention
----------------
-Component amounts are *natural-signed* (`signed_balance`): revenue reads
-positive, expenses read positive. A base is the signed sum of its components,
-so subtracting an expense group from a revenue group is `sign=-1`, not a
-sign-flip buried in the account type.
-"""
-
 from datetime import date
 from decimal import Decimal, ROUND_DOWN
 
@@ -35,9 +9,6 @@ from ..views.financial_reports_utils import (
     signed_balance,
 )
 
-# Rounding step per TaxRule.rounding choice. Indonesian tax figures round
-# *down* — never half-up — so a rounded figure is never more than the ledger
-# supports.
 ROUNDING_STEPS = {
     'none':     None,
     'rupiah':   Decimal('1'),
@@ -46,33 +17,16 @@ ROUNDING_STEPS = {
 
 
 class TaxRuleError(Exception):
-    """A rule cannot be evaluated: bad reference, cycle, or missing account."""
+    pass
 
-
-# ── window ───────────────────────────────────────────────────────────────────
 
 def rule_window(rule, date_from, date_to):
-    """The (date_from, date_to) a rule actually reads.
-
-    ``basis='ytd'`` widens the start to 1 January of ``date_to``'s year. The
-    Rp 4,8bn omzet ceiling and the Pasal 31E caps are annual tests; running
-    them against a single month would clear every threshold and silently
-    produce the wrong rate.
-    """
     if rule.basis == 'ytd':
         return date(date_to.year, 1, 1), date_to
     return date_from, date_to
 
 
-# ── component resolution ─────────────────────────────────────────────────────
-
 def _subtree_ids(root, accounts):
-    """`root` plus every account beneath it, walking the parent chain.
-
-    ChartOfAccounts nests only head -> sub today, but the walk is written to
-    handle arbitrary depth so a future third level does not silently drop
-    accounts out of a tax base.
-    """
     children = {}
     for acc in accounts.values():
         if acc.parent_id:
@@ -89,7 +43,6 @@ def _subtree_ids(root, accounts):
 
 
 def _component_accounts(component, accounts):
-    """Account ids a component draws from, and the label to show for it."""
     if component.source == 'account':
         if not component.account_id:
             raise TaxRuleError(f'Komponen {component.pk} tidak menunjuk akun.')
@@ -116,10 +69,6 @@ def _component_accounts(component, accounts):
 
 
 def _resolve_component(component, movements, accounts, results):
-    """Evaluate one component to (signed_amount, trace_dict).
-
-    ``results`` maps rule code -> already-computed result, for source='rule'.
-    """
     sign = Decimal(component.sign if component.sign in (1, -1) else 1)
 
     if component.source == 'fixed':
@@ -180,11 +129,7 @@ def _resolve_component(component, movements, accounts, results):
     }
 
 
-# ── rate application ─────────────────────────────────────────────────────────
-
 def _apply_brackets(base, brackets):
-    """Progressive layers. Only the slice of `base` inside a layer is taxed at
-    that layer's rate — a bracket rate never applies to the whole base."""
     tax = ZERO
     lower = ZERO
     trace = []
@@ -211,25 +156,12 @@ def _apply_brackets(base, brackets):
 
 
 def _apply_facility(rule, base, turnover):
-    """Pasal 31E.
-
-    Income attributable to the first ``facility_turnover_cap`` of gross
-    turnover is taxed at the discounted rate; the rest at the full rate. The
-    proportional middle band is the legally correct treatment and is what makes
-    this its own mode rather than a simple if/else on the rate:
-
-        turnover <= cap            -> the whole base is facilitated
-        cap < turnover <= full_cap -> facilitated share = base * cap / turnover
-        turnover > full_cap        -> no facility at all
-    """
     rate = (rule.rate_percent or ZERO) / Decimal('100')
     factor = rule.facility_factor if rule.facility_factor is not None else Decimal('1')
     cap = rule.facility_turnover_cap or ZERO
     full_cap = rule.facility_full_rate_cap or ZERO
 
     if turnover <= ZERO or cap <= ZERO:
-        # Nothing to test against — charge the plain rate rather than silently
-        # granting a discount the turnover does not support.
         facilitated = ZERO
     elif turnover <= cap:
         facilitated = base
@@ -256,20 +188,12 @@ def _round(amount, mode):
     step = ROUNDING_STEPS.get(mode)
     if step is None:
         return amount.quantize(Decimal('0.01'), rounding=ROUND_DOWN)
-    # Round the magnitude down and restore the sign, so a refund position
-    # (-1_500) rounds to -1_000 rather than -2_000.
     sign = Decimal(-1) if amount < ZERO else Decimal(1)
     magnitude = (abs(amount) / step).quantize(Decimal('1'), rounding=ROUND_DOWN) * step
     return sign * magnitude
 
 
-# ── ordering ─────────────────────────────────────────────────────────────────
-
 def order_rules(rules):
-    """Rules in dependency order: a rule always follows the rules it reads.
-
-    Raises TaxRuleError naming the cycle rather than recursing forever.
-    """
     by_id = {r.id: r for r in rules}
 
     def deps(rule):
@@ -281,7 +205,7 @@ def order_rules(rules):
             out.add(rule.facility_turnover_rule_id)
         return out
 
-    ordered, state = [], {}  # state: 1 = visiting, 2 = done
+    ordered, state = [], {}
 
     def visit(rule, path):
         mark = state.get(rule.id)
@@ -301,10 +225,7 @@ def order_rules(rules):
     return ordered
 
 
-# ── evaluation ───────────────────────────────────────────────────────────────
-
 def evaluate_rule(rule, date_from, date_to, accounts, results, movement_cache):
-    """Evaluate one rule. Returns the result dict that the API serialises."""
     win_from, win_to = rule_window(rule, date_from, date_to)
     key = (win_from, win_to)
     if key not in movement_cache:
@@ -321,8 +242,6 @@ def evaluate_rule(rule, date_from, date_to, accounts, results, movement_cache):
     gross_base = base
     deduction = rule.deduction_amount or ZERO
     if deduction:
-        # A deduction can only reduce the base to nil, never invert it into a
-        # negative tax (PTKP above gross pay means no PPh 21, not a refund).
         base = max(base - deduction, ZERO)
 
     rate_trace = {}
@@ -338,8 +257,6 @@ def evaluate_rule(rule, date_from, date_to, accounts, results, movement_cache):
             if ref is None:
                 raise TaxRuleError(
                     f'{rule.code}: aturan peredaran bruto belum dihitung.')
-            # 31E tests gross turnover, which is the referenced rule's *base* —
-            # its result would be a tax amount, not a turnover.
             turnover = ref['base']
         tax, rate_trace = _apply_facility(rule, base, turnover)
     else:
@@ -370,11 +287,6 @@ def evaluate_rule(rule, date_from, date_to, accounts, results, movement_cache):
 
 
 def compute(date_from, date_to, rules=None):
-    """Evaluate every applicable rule for the window.
-
-    ``rules`` defaults to all active rules whose effective window covers
-    ``date_to``. Returns a list of result dicts in display order.
-    """
     if rules is None:
         rules = [
             r for r in TaxRule.objects
@@ -391,7 +303,5 @@ def compute(date_from, date_to, rules=None):
         results[rule.id] = evaluate_rule(
             rule, date_from, date_to, accounts, results, movement_cache)
 
-    # Dependency order is an implementation detail; the page shows the order
-    # the operator arranged the rules in.
     ordered = sorted(rules, key=lambda r: (r.display_order, r.code))
     return [results[r.id] for r in ordered]

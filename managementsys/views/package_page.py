@@ -8,11 +8,6 @@ from ..models import PatientPackage
 
 
 class PatientPackagesView(APIView):
-    """GET active + exhausted packages for a patient, newest first.
-
-    Used by the patient profile page (CRM) and the POS billing detail to show
-    redemption status. Filter by ?status=active to limit to redeemable ones.
-    """
     authentication_classes = []
     permission_classes = [AllowAny]
 

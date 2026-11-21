@@ -14,7 +14,6 @@ from ..models import IssueTicket, IssueTicketImage
 
 
 def _push_to_vercel(ticket: IssueTicket):
-    """Fire-and-forget: send ticket metadata to the Vercel dashboard."""
     vercel_url = getattr(settings, 'CPMS_VERCEL_URL', '').rstrip('/')
     ingest_secret = getattr(settings, 'CPMS_INGEST_SECRET', '')
     if not vercel_url or not ingest_secret:
@@ -41,11 +40,10 @@ def _push_to_vercel(ticket: IssueTicket):
     try:
         urllib.request.urlopen(req, timeout=10)
     except Exception:
-        pass  # Vercel push is best-effort; don't break the local flow
+        pass
 
 
 def _push_status_to_vercel(ticket: IssueTicket):
-    """Fire-and-forget: sync status update to Vercel."""
     vercel_url = getattr(settings, 'CPMS_VERCEL_URL', '').rstrip('/')
     ingest_secret = getattr(settings, 'CPMS_INGEST_SECRET', '')
     if not vercel_url or not ingest_secret:

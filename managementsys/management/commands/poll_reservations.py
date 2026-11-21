@@ -1,15 +1,3 @@
-"""
-Collects online bookings from the Vercel reservation form.
-
-    python manage.py poll_reservations                    # one pass, then exit
-    python manage.py poll_reservations --loop             # every 60s, forever
-    python manage.py poll_reservations --loop --interval 30
-
-The loop is what `start-servers.bat` launches. A single pass is idempotent, so
-running the one-shot form by hand — or from Task Scheduler — is equally valid
-and is the quickest way to test the link end to end.
-"""
-
 import time
 
 from django.core.management.base import BaseCommand
@@ -47,7 +35,6 @@ class Command(BaseCommand):
         )
         while True:
             try:
-                # A backlog drains at full speed rather than one batch a minute.
                 while self._pass(limit):
                     pass
             except KeyboardInterrupt:
@@ -56,13 +43,6 @@ class Command(BaseCommand):
             time.sleep(interval)
 
     def _pass(self, limit):
-        """One collection pass. Returns True when more rows are waiting.
-
-        Never raises in loop mode: a clinic that lost its internet for ten
-        minutes is an ordinary event, and the bookings stay queued on Vercel
-        until it comes back. Crashing the poller would mean somebody has to
-        notice and restart it.
-        """
         try:
             result = run_once(limit)
         except ReservationSyncError as exc:

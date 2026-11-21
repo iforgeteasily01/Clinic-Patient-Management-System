@@ -1,29 +1,3 @@
-"""Void billing-queue invoices that re-bill a visit the POS had already invoiced.
-
-The POS creates an invoice via /api/invoices/create/ and then clears the queue entry.
-When the caller omitted ``?skip_invoice=1`` the billing endpoint billed the same
-treatments again, producing a second invoice with no cashier and no payment method.
-The patient paid once, so the second invoice is a phantom that inflates revenue and
-the patient's recorded spend.
-
-Scope is deliberately narrow, because voiding a real sale is worse than leaving a
-phantom in place:
-
-* Only invoices ``repair_accounting_balance`` routed to the legacy clearing account
-  (1100011) are considered. That is the exact signature of the billing queue:
-  no cashier, no warehouse, no payment method of its own. iPos-imported rows are
-  never candidates — they are not in the ledger and are not queue output.
-* A candidate is matched only against an invoice that is **not itself a candidate**
-  and that carries a real payment method, so the two halves of a pair can never void
-  each other.
-* Matching is 1:1 and greedy by time. A paid invoice can absorb at most one
-  duplicate, so two phantoms against a single payment leave the second one standing
-  for a human to look at.
-* Every line must match on name, quantity and price. Partial overlap is reported,
-  never voided.
-
-Read-only by default; pass --apply to commit.
-"""
 from collections import defaultdict
 from datetime import date
 from decimal import Decimal
@@ -41,12 +15,6 @@ D = Decimal
 
 
 def line_signature(invoice):
-    """(name, quantity, price) per line, normalised across both checkout paths.
-
-    The POS writes ``item_name`` with no FK; the billing queue writes ``item_id``
-    with a blank name. Comparing on the resolved display name is what makes the
-    same treatment recognisable from either side.
-    """
     return {
         (((item.item.name if item.item_id else item.item_name) or '').strip().lower(),
          item.quantity, item.price)
@@ -81,12 +49,6 @@ class Command(BaseCommand):
                     payment_method__linked_account__account_number=ACC_LEGACY_CLEARING)
             .exclude(invoice_number__startswith=IMPORTED_INVOICE_PREFIX)
             .prefetch_related('items__item')
-            # Tie-break on id. A POS run stamps every invoice of a visit with
-            # the same `datetime`, so ordering on that column alone leaves the
-            # row order up to PostgreSQL — and because a paid invoice may absorb
-            # only one duplicate (`claimed`), the order decides *which* invoice
-            # gets voided. That must not be arbitrary for a command that
-            # destroys revenue records. id preserves the intended chronology.
             .order_by('datetime', 'id')
         )
         candidate_ids = {inv.id for inv in candidates}
@@ -95,7 +57,6 @@ class Command(BaseCommand):
         stats['voided_amount'] = D('0')
         stats['kept_amount'] = D('0')
         decisions = []
-        # A paid invoice may absorb only one duplicate.
         claimed = set()
 
         with transaction.atomic():
@@ -112,10 +73,10 @@ class Command(BaseCommand):
                             datetime__date=invoice.datetime.date(),
                             is_voided=False,
                             payment_method__isnull=False)
-                    .exclude(id__in=candidate_ids)      # never match another phantom
-                    .exclude(id__in=claimed)            # 1:1
+                    .exclude(id__in=candidate_ids)
+                    .exclude(id__in=claimed)
                     .prefetch_related('items__item')
-                    .order_by('datetime', 'id')         # same tie-break as above
+                    .order_by('datetime', 'id')
                 )
 
                 match = None
@@ -146,10 +107,6 @@ class Command(BaseCommand):
             for invoice, match, verdict in decisions:
                 if verdict != 'duplicate':
                     continue
-                # These invoices carry only the cash/revenue block written by
-                # repair_accounting_balance, and no stock ever moved for them
-                # (none of the duplicated treatments consume materials), so the
-                # rows are removed rather than reversed.
                 LedgerEntry.objects.filter(invoice=invoice).delete()
                 invoice.is_voided = True
                 invoice.voided_at = timezone.now()

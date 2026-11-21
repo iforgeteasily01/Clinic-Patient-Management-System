@@ -1,11 +1,3 @@
-"""``manage.py create_app_user``.
-
-The point of this file is the first test. The command used to declare
-``--role`` as ``default='admin', choices=['admin']``, and ``admin`` is not one
-of ``AppUser.ROLE_CHOICES``. Django validates choices in forms, not in the
-database, so the row saved fine and the user was then invisible to every
-role check in the app — a lockout with no error anywhere.
-"""
 from io import StringIO
 
 import pytest
@@ -26,7 +18,6 @@ class TestCreateAppUser:
         assert user.role in VALID_ROLES
 
     def test_every_offered_role_is_a_real_role(self):
-        """Guards the literal list from drifting away from the model again."""
         for role in VALID_ROLES:
             call_command('create_app_user', f'Staff {role}', '123456',
                          '--role', role, stdout=StringIO())

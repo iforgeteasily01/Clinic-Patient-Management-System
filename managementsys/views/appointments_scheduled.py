@@ -1,14 +1,3 @@
-"""
-Scheduled appointments — future-dated bookings, shaped for a later SatuSehat
-(FHIR R4 Appointment) push. See docs/satusehat-appointment-page-design.md.
-
-Separate from the walk-in queue in patient_page.py. The only intersection is
-AppointmentCheckInView, which reuses the ActivePatient create logic so a booked
-patient lands in the existing queue.
-
-No SatuSehat calls are made here. This phase only captures the data.
-"""
-
 from django.db import transaction
 from django.utils.dateparse import parse_date
 from rest_framework import status
@@ -34,10 +23,6 @@ def _base_queryset():
 
 
 def _day_bounds(day):
-    """
-    UTC range covering one Jakarta calendar day. start_at is stored UTC, so a
-    naive `start_at__date` filter would slice the day at 07:00 local.
-    """
     from datetime import datetime, time
 
     start_local = datetime.combine(day, time.min, tzinfo=JAKARTA_TZ)
@@ -46,11 +31,6 @@ def _day_bounds(day):
 
 
 class ScheduledAppointmentListCreateView(APIView):
-    """
-    GET  /api/scheduled-appointments/?date=YYYY-MM-DD&from=&to=&status=&practitioner=
-    POST /api/scheduled-appointments/
-    """
-
     def get(self, request):
         qs = _base_queryset()
 
@@ -119,12 +99,6 @@ class ScheduledAppointmentListCreateView(APIView):
 
 
 class ScheduledAppointmentDetailView(APIView):
-    """
-    GET    /api/scheduled-appointments/<pk>/
-    PATCH  /api/scheduled-appointments/<pk>/   update / reschedule / change status
-    DELETE /api/scheduled-appointments/<pk>/   soft-cancel (status='cancelled')
-    """
-
     def _get_object(self, pk):
         return _base_queryset().filter(pk=pk).first()
 
@@ -175,8 +149,6 @@ class ScheduledAppointmentDetailView(APIView):
         return Response(AppointmentSerializer(appointment).data)
 
     def delete(self, request, pk):
-        """Soft-cancel. The row is kept — a cancelled Appointment is still a
-        reportable FHIR record, and hard-deleting would orphan the audit trail."""
         appointment = self._get_object(pk)
         if appointment is None:
             return Response(
@@ -201,14 +173,6 @@ class ScheduledAppointmentDetailView(APIView):
 
 
 class AppointmentCheckInView(APIView):
-    """
-    POST /api/scheduled-appointments/<pk>/check-in/
-        { consult_status?: bool }
-
-    Bridges a booking into the walk-in queue: creates the ActivePatient exactly
-    as AppointmentAddView / GeneralAppointmentCreateView do, and links it back.
-    """
-
     def post(self, request, pk):
         appointment = _base_queryset().filter(pk=pk).first()
         if appointment is None:
@@ -228,8 +192,6 @@ class AppointmentCheckInView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # Same rule as the walk-in views: a consult starts at 1 (waiting for
-        # doctor), a treatment-only visit skips to 3 (beautician queue).
         if 'consult_status' in request.data:
             consult_status = bool(request.data.get('consult_status'))
         else:
@@ -269,8 +231,6 @@ class AppointmentCheckInView(APIView):
 
 
 class AppointmentLocationListView(APIView):
-    """GET /api/appointment-locations/ — rooms for the booking form dropdown."""
-
     def get(self, request):
         qs = AppointmentLocation.objects.filter(is_active=True)
         return Response(AppointmentLocationSerializer(qs, many=True).data)

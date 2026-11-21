@@ -1,27 +1,3 @@
-"""CRM dashboard, CRM patient profile, and WhatsApp message templates.
-
-Scope boundary with the rest of the app
----------------------------------------
-``/api/crm/patients/`` (crm_page.py) is the *patient directory* — one row per
-patient, sortable, paginated, the thing the old CRM page showed. It moved to
-``/patients`` in the UI and is untouched here.
-
-This module is the *relationship* view: who came recently, who is worth calling,
-and what one patient's history looks like when the accounting is stripped off
-it. Nothing here writes to the ledger, creates a document, or sends a message.
-
-Two conventions worth stating because they are easy to get wrong later:
-
-* **Jakarta, not UTC.** Every window here is a clinic day as staff experience
-  it, so days are cut in ``Asia/Jakarta`` (models.JAKARTA_TZ) — the same
-  convention as reports_page.py. The accounting layer's ``timezone.now().date()``
-  would put a 22:30 WIB checkout on the previous day.
-* **A visit is a non-voided invoice**, matching ``refresh_crm_profile`` so this
-  page and the directory can never disagree about a visit count. Patients still
-  in the queue today have no invoice yet, so today's list unions in open
-  ``ActivePatient`` rows and marks them ``in_clinic`` — without that, the
-  dashboard is empty every morning until the first checkout.
-"""
 import datetime
 import logging
 from decimal import Decimal
@@ -56,37 +32,25 @@ logger = logging.getLogger(__name__)
 
 WINDOW_DAYS = 30
 RECENT_DAYS = 7
-# The recent-visitor list has its own page now, which offers a wider window than
-# the dashboard's default. Capped so ?recent_days= cannot be turned into a
-# request to render the entire patient book.
 RECENT_DAYS_MAX = 90
 BIRTHDAY_LOOKAHEAD_DAYS = 30
 
-# Age bands for the demographic split. Open-ended at both ends so every patient
-# with a birth_date lands in exactly one.
 AGE_BANDS = [('<20', 0, 19), ('20-29', 20, 29), ('30-39', 30, 39),
              ('40-49', 40, 49), ('50+', 50, 200)]
 
 _MONEY = DecimalField(max_digits=18, decimal_places=2)
 
-# Net revenue of one invoice line. InvoiceItem stores a per-line percentage
-# discount, so summing `price` alone overstates every discounted line.
 _LINE_REVENUE = ExpressionWrapper(
     F('price') * F('quantity') * (Value(Decimal('1')) - F('discount_pct') / Value(Decimal('100'))),
     output_field=_MONEY,
 )
 
-# The multiplication above widens the scale (Postgres keeps every digit of
-# price * quantity * ratio), so anything serialized out of it is rounded back
-# to rupiah-with-cents rather than shipping a 25-decimal string to the browser.
 _RUPIAH = Decimal('0.01')
 
 
 def _money(value):
     return str((value or Decimal('0')).quantize(_RUPIAH))
 
-
-# ── Time helpers ───────────────────────────────────────────────────────────
 
 def _today():
     return timezone.now().astimezone(JAKARTA_TZ).date()
@@ -97,7 +61,6 @@ def _day_start(d):
 
 
 def _visits_between(start, end_exclusive):
-    """Non-voided, patient-attached invoices in a half-open Jakarta day range."""
     return Invoice.objects.filter(
         is_voided=False,
         patient_no__isnull=False,
@@ -107,12 +70,6 @@ def _visits_between(start, end_exclusive):
 
 
 def _pct_delta(current, previous):
-    """Percentage change, or None when there is no baseline to compare against.
-
-    None rather than 0 or 100: a metric that went from nothing to something has
-    no meaningful percentage, and rendering "+100%" there invites the operator
-    to read a first month of data as growth.
-    """
     if not previous:
         return None
     return round((float(current) - float(previous)) / float(previous) * 100, 1)
@@ -138,14 +95,7 @@ def _empty_recent_entry(patient):
     }
 
 
-# ── Dashboard ──────────────────────────────────────────────────────────────
-
 class CRMDashboardView(APIView):
-    """GET /api/crm/dashboard/
-
-    One request, because every tile on the page is a different cut of the same
-    two windows and splitting it would mean re-scanning invoices per tile.
-    """
     permission_classes = [AllowAny]
 
     def get(self, request):
@@ -159,7 +109,6 @@ class CRMDashboardView(APIView):
 
         settings_obj = ReportSettings.get_solo()
 
-        # ── Window aggregates ──────────────────────────────────────────────
         cur_rows = list(
             _visits_between(window_start, tomorrow)
             .values('patient_no')
@@ -179,9 +128,6 @@ class CRMDashboardView(APIView):
         cur_spend = sum((r['spend'] or Decimal('0')) for r in cur_rows)
         prev_spend = sum((r['spend'] or Decimal('0')) for r in prev_rows)
 
-        # New vs returning. "New" means no non-voided invoice anywhere before
-        # the window opened — a patient registered years ago who is only now
-        # buying something is new revenue, not a returning one.
         seen_before = set(
             Invoice.objects
             .filter(is_voided=False, patient_no__isnull=False,
@@ -192,24 +138,15 @@ class CRMDashboardView(APIView):
         new_ids = cur_ids - seen_before
         returning_ids = cur_ids & seen_before
 
-        # Retention: of the patients who came in the *previous* window, how many
-        # came back in this one. The denominator is deliberately the previous
-        # window and not all patients — it answers "are the people we saw last
-        # month still coming", which is the decision this page exists for.
         retained = len(prev_ids & cur_ids)
         retention_rate = round(retained / len(prev_ids) * 100, 1) if prev_ids else None
 
         repeat_patients = sum(1 for r in cur_rows if r['visits'] > 1)
 
-        # ── Activity buckets across the whole book ─────────────────────────
         buckets = {'active': 0, 'lapsing': 0, 'inactive': 0, 'never': 0}
         for last_visit in Patient.objects.values_list('crm_profile__last_visit_date', flat=True):
             buckets[classify(last_visit, today, settings_obj)] += 1
 
-        # ── Demographics ───────────────────────────────────────────────────
-        # Both fields arrived in migration 0110, so coverage is reported
-        # alongside every split — a 70% female clinic and a 70% unfilled form
-        # look identical without it.
         total_patients = Patient.objects.count()
         gender = {'F': 0, 'M': 0, 'unknown': 0}
         for row in Patient.objects.values('gender').annotate(n=Count('patient_no')):
@@ -225,7 +162,6 @@ class CRMDashboardView(APIView):
                     age_counts[label] += 1
                     break
 
-        # ── Top treatments and products in the window ──────────────────────
         line_rows = (
             InvoiceItem.objects
             .filter(
@@ -288,12 +224,6 @@ class CRMDashboardView(APIView):
 
 
 def _upcoming_birthdays(today, lookahead):
-    """Patients whose birthday falls in the next ``lookahead`` days.
-
-    Filtered on (month, day) in the database rather than pulling every dated
-    patient into Python. When the window runs past 31 December the two
-    day-of-year ranges are asked for separately and OR-ed.
-    """
     end = today + datetime.timedelta(days=lookahead)
     qs = Patient.objects.filter(birth_date__isnull=False).annotate(
         bmonth=ExtractMonth('birth_date'), bday=ExtractDay('birth_date'),
@@ -326,12 +256,6 @@ def _upcoming_birthdays(today, lookahead):
 
 
 def _next_birthday(birth_date, today):
-    """The next occurrence of ``birth_date``'s day on or after ``today``.
-
-    A 29 February birthday is observed on 1 March in a common year — the clinic
-    has to greet those patients on some specific day, and skipping three years
-    out of four is not it.
-    """
     def occurrence(year):
         try:
             return birth_date.replace(year=year)
@@ -343,13 +267,6 @@ def _next_birthday(birth_date, today):
 
 
 def _recent_patients(recent_start, today, settings_obj):
-    """Unique patients seen in the last RECENT_DAYS, today's flagged.
-
-    The union the CRM page asks for: everyone who came in the window, deduped,
-    with ``visited_today`` set for those here today. Patients currently in the
-    queue with no invoice yet are folded in from ActivePatient and marked
-    ``in_clinic`` — they have no spend to report and that is not missing data.
-    """
     tomorrow = today + datetime.timedelta(days=1)
     invoices = (
         _visits_between(recent_start, tomorrow)
@@ -366,8 +283,6 @@ def _recent_patients(recent_start, today, settings_obj):
         entry['visits'] += 1
         entry['spend'] += inv.grand_total or Decimal('0')
         entry['visit_dates'].add(local_dt.date())
-        # Ordered by datetime ascending, so the last write wins and the two
-        # lists below always describe the most recent visit in the window.
         entry['last_dt'] = local_dt
         entry['last_treatments'] = [
             li.item.name for li in inv.items.all() if li.item_id and li.item.is_service
@@ -377,7 +292,6 @@ def _recent_patients(recent_start, today, settings_obj):
             for li in inv.items.all() if not (li.item_id and li.item.is_service)
         ]
 
-    # Patients in the queue right now, invoice or not.
     open_visits = (
         ActivePatient.objects
         .filter(patient_no__isnull=False, visit_time__gte=_day_start(today))
@@ -409,10 +323,6 @@ def _recent_patients(recent_start, today, settings_obj):
             'distinct_days_in_window': len(entry['visit_dates']),
             'spend_in_window': str(entry['spend']),
             'last_visit_at': entry['last_dt'].isoformat() if entry['last_dt'] else None,
-            # Whole Jakarta days between that visit and today: 0 is today, 1 is
-            # yesterday. Computed here rather than in the browser because the
-            # browser's timezone is not necessarily the clinic's, and an
-            # off-by-one would recolour the row.
             'days_ago': ((today - entry['last_dt'].date()).days
                          if entry['last_dt'] else None),
             'last_treatments': entry['last_treatments'],
@@ -423,25 +333,11 @@ def _recent_patients(recent_start, today, settings_obj):
             'birth_date': str(patient.birth_date) if patient.birth_date else None,
         })
 
-    # Today first, then most recent — the operator works top-down through the
-    # people who are here now before chasing the rest of the week.
     rows.sort(key=lambda r: (r['visited_today'], r['last_visit_at'] or ''), reverse=True)
     return rows
 
 
-# ── CRM patient profile ────────────────────────────────────────────────────
-
 class CRMPatientProfileView(APIView):
-    """GET /api/crm/patients/<patient_no>/profile/
-
-    Deliberately *not* the same shape as PatientProfilePage's data. That page is
-    the transactional record — full invoice lines, payment methods, totals, SOAP
-    notes. This one answers "what do we know about this person and what have we
-    actually done to them", so each visit collapses to a date, the treatments
-    performed and the products taken home. Money is summarised per visit, never
-    itemised: a line-by-line receipt is one click away on the patient page and
-    reproducing it here just makes the history harder to read.
-    """
     permission_classes = [AllowAny]
 
     def get(self, request, patient_no):
@@ -465,9 +361,6 @@ class CRMPatientProfileView(APIView):
             .order_by('-datetime')
         )
 
-        # Treatment sessions carry the beautician, which invoices do not. Keyed
-        # by Jakarta date so a session can be matched to the visit it belongs
-        # to; two sessions on one day merge, which is what the operator sees.
         sessions_by_day = {}
         for session in (
             TreatmentSession.objects
@@ -483,17 +376,6 @@ class CRMPatientProfileView(APIView):
                 if t.name not in bucket['treatments']:
                     bucket['treatments'].append(t.name)
 
-        # Doctor seen per day, from the medical record. The note text stays out
-        # of this payload on purpose — clinical content belongs on the medical
-        # records page, behind its own role check.
-        #
-        # The visit date comes out of ``medrec_id`` (MR-<patient>-<YYYYMMDD>-<n>)
-        # rather than from the ActivePatient row that created it: that row is
-        # deleted when billing closes the visit, so joining through it would
-        # leave the doctor blank on every completed visit — which is all of them.
-        # ``doctor_id`` is unpopulated on the great majority of records — the
-        # SOAP form writes the free-text ``clinician`` instead — so the FK is
-        # preferred where it exists and the text used otherwise.
         doctors_by_day = {}
         for rec in MedRec.objects.filter(patient_no=patient).select_related('doctor_id'):
             day = _medrec_date(rec.medrec_id)
@@ -513,12 +395,6 @@ class CRMPatientProfileView(APIView):
                     'quantity': float(li.quantity),
                 })
             session = sessions_by_day.get(day, {})
-            # Sessions record treatments the invoice may not name (a package
-            # redemption bills at Rp 0 under the package's own line), so the two
-            # sources are merged rather than one preferred.
-            # Case-insensitive, because the treatment catalog and the invoice
-            # line can spell the same treatment differently ('Skin booster' vs
-            # 'Skin Booster') and listing it twice reads as two treatments.
             billed = {t['name'].casefold() for t in treatments}
             session_only = [
                 {'name': name, 'quantity': 1.0}
@@ -537,8 +413,6 @@ class CRMPatientProfileView(APIView):
                 'doctor': doctors_by_day.get(day),
             })
 
-        # Lifetime favourites, over every visit rather than the recent window —
-        # this is the "what does this person actually buy" question.
         fav_treatments, fav_products = _favourites(patient)
 
         packages = [
@@ -603,11 +477,6 @@ class CRMPatientProfileView(APIView):
 
 
 def _medrec_date(medrec_id):
-    """Visit date encoded in a medrec_id, or None if it is not the known shape.
-
-    Legacy and imported records do not all follow MR-<patient>-<YYYYMMDD>-<n>,
-    so a parse failure means "unknown day", never an exception.
-    """
     parts = (medrec_id or '').split('-')
     for part in parts:
         if len(part) == 8 and part.isdigit():
@@ -619,7 +488,6 @@ def _medrec_date(medrec_id):
 
 
 def _favourites(patient):
-    """Lifetime treatment / product frequency for one patient, most-used first."""
     rows = (
         InvoiceItem.objects
         .filter(invoice__patient_no=patient, invoice__is_voided=False)
@@ -648,19 +516,11 @@ def _favourites(patient):
 
 
 def _avg_gap(invoices):
-    """Mean days between consecutive visits, or None with fewer than two.
-
-    Distinct days, not invoices: two invoices raised in one afternoon are one
-    visit, and counting them separately drags the average toward zero and makes
-    a monthly patient look weekly.
-    """
     days = sorted({inv.datetime.astimezone(JAKARTA_TZ).date() for inv in invoices})
     if len(days) < 2:
         return None
     return round((days[-1] - days[0]).days / (len(days) - 1), 1)
 
-
-# ── Message templates ──────────────────────────────────────────────────────
 
 class MessageTemplateListCreateView(APIView):
     permission_classes = [AllowAny]
@@ -733,12 +593,6 @@ class MessageTemplateDetailView(APIView):
 
 
 class MessageTemplateRenderView(APIView):
-    """POST /api/crm/message-templates/<pk>/render/  {"patient_no": "..."}
-
-    Rendering server-side rather than substituting in the browser keeps one
-    definition of what a token means, and lets the placeholder set grow without
-    a frontend release.
-    """
     permission_classes = [AllowAny]
 
     def post(self, request, pk):

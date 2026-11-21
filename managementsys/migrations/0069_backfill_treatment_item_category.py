@@ -1,19 +1,3 @@
-"""Backfill item_category on existing treatments' mirror catalog items.
-
-Historically, `Treatment.save()` created the mirror service `InventoryItem`
-without linking it to a `TreatmentCategory`, so every treatment sold via POS
-fell back to the single system revenue/COGS accounts (4200000 / 5100000)
-regardless of category.
-
-This one-time backfill links each existing treatment's mirror item to the
-`TreatmentCategory` whose name matches `Treatment.category` (case-insensitive),
-creating the category and its revenue/COGS/expense GL accounts when missing —
-so their *future* sales route per-category. Legacy invoices are not touched;
-their ledger entries stay as posted.
-
-Ranges/labels mirror `TreatmentCategory.ensure_accounts()`; kept inline here so
-the migration runs against historical models without importing app code.
-"""
 from django.db import migrations
 from django.db.models import Max
 
@@ -36,15 +20,6 @@ def _next_account_number(COA, range_min, range_max, step=1000):
 
 
 def _ensure_accounts(cat, COA):
-    """Create any missing GL accounts for a category (historical models).
-
-    ``hasattr`` guards around cogs_account/expense_account keep this function
-    working two ways: replayed at its real position in migration history (the
-    fields exist — they were not dropped until migration 0086) and invoked
-    directly against the *current* model in tests that exercise this backfill
-    logic in isolation (Phase 3 dropped both fields, so only revenue_account
-    is provisioned then).
-    """
     changed = False
     if cat.revenue_account_id is None:
         cat.revenue_account = COA.objects.create(
@@ -73,7 +48,6 @@ def backfill(apps, schema_editor):
     TreatmentCategory = apps.get_model('managementsys', 'TreatmentCategory')
     COA = apps.get_model('managementsys', 'ChartOfAccounts')
 
-    # Case-insensitive name -> category cache (seeded from existing categories).
     cats = {c.name.strip().lower(): c for c in TreatmentCategory.objects.all()}
 
     for treatment in Treatment.objects.select_related('catalog_item').all():
@@ -96,12 +70,10 @@ def backfill(apps, schema_editor):
 
 
 def noop(apps, schema_editor):
-    # Irreversible data backfill; leave rows as-is on reverse.
     pass
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0068_appointmentlocation_seed'),
     ]

@@ -1,24 +1,8 @@
-"""Widen PatientNote so walk-in guests can have notes and every note can name
-its author.
-
-  * patient_no becomes nullable (guests have no Patient row)
-  * active_patient FK added — the visit a guest note belongs to
-  * author_user FK + author_role snapshot added for attribution
-  * date gains an index, plus a composite (patient_no, date) index — both list
-    endpoints and the billing-queue embed filter on exactly those columns
-  * CheckConstraint: a note must have a patient OR a visit
-
-Existing rows all have a patient_no, so the AlterField and the constraint are
-satisfied without any backfill. author_user cannot be reconstructed for legacy
-rows (only the free-text `author` was ever recorded) and is left NULL; the
-serializer falls back to `author` for display.
-"""
 import django.db.models.deletion
 from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ('managementsys', '0087_expense_expenseitem'),
     ]
