@@ -163,6 +163,7 @@ urlpatterns = [
     path('api/inventory/items/import/preview/', views.InventoryItemImportPreviewView.as_view(), name='inventory-items-import-preview'),
     path('api/inventory/items/import/', views.InventoryItemImportView.as_view(), name='inventory-items-import'),
     path('api/inventory/items/<int:pk>/', views.InventoryItemDetailView.as_view(), name='inventory-item-detail'),
+    path('api/inventory/items/<int:pk>/movements/', views.InventoryItemMovementsView.as_view(), name='inventory-item-movements'),
     path('api/inventory/warehouses/', views.WarehouseListCreateView.as_view(), name='inventory-warehouses'),
     path('api/inventory/warehouses/<int:pk>/', views.WarehouseDetailView.as_view(), name='inventory-warehouse-detail'),
     path('api/inventory/stock/', views.StockLevelView.as_view(), name='inventory-stock'),

@@ -257,6 +257,7 @@ All models are in a single file. Search carefully.
 | POST | `/api/inventory/items/import/preview/` | Preview bulk import |
 | POST | `/api/inventory/items/import/` | Confirm bulk import |
 | GET/PUT | `/api/inventory/items/<id>/` | Item detail |
+| GET | `/api/inventory/items/<id>/movements/` | Kartu stok — every movement from source documents, with status + running balance. `warehouse_id`, `date_from`, `date_to`, `kind`, `page`, `page_size` (≤500). superuser/manager. See `services/stock_card.py` |
 | GET/POST | `/api/inventory/warehouses/` | Warehouse CRUD |
 | GET | `/api/inventory/stock/` | Current stock levels |
 | GET | `/api/inventory/batches/` | All FIFO batches |
