@@ -786,14 +786,15 @@ def commit_preview(actor, batch, summary_builder):
                         variances.extend(
                             _commit_entry(staged_entry, number, journal_batch, actor)
                         )
-                    except AlreadyPostedError:
+                    except SkipDocument as skip:
                         # Its reserved number is simply burned. Gaps in the
-                        # sequence are cheap; posting the document twice is not.
+                        # sequence are cheap; posting the document twice — or
+                        # posting one that was cancelled — is not.
                         skipped.append({
                             'staged_entry_id': staged_entry.id,
                             'source_label': staged_entry.source_label,
                             'date': staged_entry.date.isoformat(),
-                            'reason': 'Dokumen sudah dicatat di jurnal lain.',
+                            'reason': skip.reason,
                         })
                         continue
                     posted_today += 1
@@ -826,19 +827,43 @@ def commit_preview(actor, batch, summary_builder):
     yield _commit_done(journal_batch, documents_posted, summary, variances, skipped)
 
 
-class AlreadyPostedError(Exception):
-    """The document was posted by something else between preview and commit.
+class SkipDocument(Exception):
+    """A staged document that must not be posted after all.
 
-    Not an error the operator caused, and not fatal: the entry is skipped and
-    the rest of the day still posts.
+    Not an error the operator caused, and not fatal: the entry is skipped, the
+    reason is reported in the run's ``skipped`` list, and the rest of the day
+    still posts.
     """
+    reason = ''
+
+    def __init__(self, label):
+        self.label = label
+        super().__init__(f'{label}: {self.reason}')
+
+
+class AlreadyPostedError(SkipDocument):
+    """The document was posted by something else between preview and commit."""
+    reason = 'Dokumen sudah dicatat di jurnal lain.'
+
+
+class VoidedDocumentError(SkipDocument):
+    """The document was voided after the commit's freshness check.
+
+    ``check_freshness`` runs once, before day one; a commit then takes a
+    transaction per day, so a cashier can void a document whose day has not
+    been reached yet. Its fingerprint would now differ, but nothing re-checks
+    it — without this the sale is journalled with no reversal, because the
+    void saw it unposted and (correctly) wrote none.
+    """
+    reason = 'Dokumen dibatalkan setelah pratinjau.'
 
 
 def _commit_entry(staged_entry, entry_number, journal_batch, actor):
     """Post one staged entry for real. Returns any variance notes.
 
     Raises ``AlreadyPostedError`` when the document has already been journalled,
-    rather than posting it a second time.
+    rather than posting it a second time, and ``VoidedDocumentError`` when it
+    was voided after the draft was checked.
     """
     kind = staged_entry.source_model
     model = MODEL_BY_KIND[kind]
@@ -853,6 +878,14 @@ def _commit_entry(staged_entry, entry_number, journal_batch, actor):
     obj = model.objects.select_for_update().get(pk=staged_entry.source_id)
     if obj.posting_status == 'posted':
         raise AlreadyPostedError(staged_entry.source_label)
+    # Same lock, same reason: the void endpoints take this row FOR UPDATE too,
+    # so a void either finished before this read (seen here) or waits for the
+    # day to commit and then sees 'posted' and writes its reversal memo.
+    # Models without ``is_voided`` (expense, transfer, stock) are hard-deleted
+    # instead; the .get() above raises for those and fails the day, which is
+    # loud and resumable rather than silent.
+    if getattr(obj, 'is_voided', False):
+        raise VoidedDocumentError(staged_entry.source_label)
 
     # Rebuild rather than replay — see the module docstring. The fingerprint
     # check already proved the source is unchanged, so for deterministic

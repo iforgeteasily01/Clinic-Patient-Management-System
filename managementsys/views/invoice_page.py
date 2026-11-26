@@ -1123,6 +1123,13 @@ class InvoiceDetailView(APIView):
     @transaction.atomic
     def delete(self, request, pk):
         """Void (soft-delete) an invoice: reverse its accounting but keep the record."""
+        # Lock before reading posting_status. A journal commit holds this row
+        # FOR UPDATE while it posts the invoice's day; without the lock a void
+        # landing mid-commit read 'unposted', wrote no reversal, and left a
+        # voided invoice journalled. Locked, it waits, then sees 'posted'.
+        # (Locked on its own: FOR UPDATE refuses the nullable outer joins
+        # _get's select_related produces.)
+        Invoice.objects.select_for_update().filter(pk=pk).values_list('pk').first()
         invoice = self._get(pk)
         if invoice is None:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)

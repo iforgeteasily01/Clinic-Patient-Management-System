@@ -265,7 +265,11 @@ class SalesReturnDetailView(APIView):
                             status=status.HTTP_404_NOT_FOUND)
         return Response(SalesReturnDetailSerializer(obj).data)
 
+    @transaction.atomic
     def delete(self, request, pk):
+        # Lock first so a void racing a journal commit sees the posting_status
+        # the commit leaves behind — see InvoiceDetailView.delete.
+        SalesReturn.objects.select_for_update().filter(pk=pk).values_list('pk').first()
         obj = self._get(pk)
         if obj is None:
             return Response({'error': 'Retur tidak ditemukan.'},

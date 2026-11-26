@@ -1116,6 +1116,9 @@ class PurchaseInvoiceDetailView(APIView):
     @transaction.atomic
     def delete(self, request, pk):
         """Void (soft-delete) a purchase invoice: reverse stock and accounting but keep the record."""
+        # Lock first so a void racing a journal commit sees the posting_status
+        # the commit leaves behind — see InvoiceDetailView.delete.
+        PurchaseInvoice.objects.select_for_update().filter(pk=pk).values_list('pk').first()
         obj = self._get(pk)
         if not obj:
             return Response({'error': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
