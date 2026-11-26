@@ -672,7 +672,10 @@ def check_freshness(batch):
     for kind, entries in by_kind.items():
         model = MODEL_BY_KIND[kind]
         qs = model.objects.filter(pk__in=[e.source_id for e in entries])
-        if kind != 'transfer':      # transfers have no line rows to prefetch
+        # Only these have line rows. A transfer and a stock-out are single-row
+        # documents; prefetching 'items' on StockOutLog raised AttributeError and
+        # failed every commit that included a valued stock-out.
+        if kind in ('invoice', 'purchase', 'expense', 'sales_return'):
             qs = qs.prefetch_related('items')
         objs = {o.pk: o for o in qs}
         for entry in entries:
