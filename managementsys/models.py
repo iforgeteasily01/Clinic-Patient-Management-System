@@ -1733,6 +1733,86 @@ class StockOpnameTemplateItem(models.Model):
         return f'{self.template} – {self.item.code} @ {self.section}'
 
 
+class StockSnapshot(models.Model):
+    """The book stock at one instant: every item's quantity and value, frozen.
+
+    ``InventoryBatch`` only ever holds *now*, so "what did we hold on the 31st"
+    cannot be asked of it afterwards. A snapshot copies the batch state — and the
+    item master as it stood — at the moment it is taken. It is never
+    reconstructed: see ``services/stock_snapshot.py`` for why.
+
+    The GL side is captured in the same transaction, so the two can be compared
+    without either having moved in between. ``unposted_*`` are the two known
+    timing differences between batches and the ledger; whatever is left after
+    them is a real discrepancy.
+    """
+    SOURCE_MANUAL = 'manual'
+    SOURCE_AUTO = 'auto'
+    SOURCE_CHOICES = [(SOURCE_MANUAL, 'Manual'), (SOURCE_AUTO, 'Otomatis')]
+
+    snapshot_date = models.DateField(db_index=True)   # Jakarta date of taken_at
+    taken_at = models.DateTimeField()
+    taken_by = models.ForeignKey(
+        'AppUser', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='stock_snapshots',
+    )
+    source = models.CharField(max_length=10, choices=SOURCE_CHOICES, default=SOURCE_MANUAL)
+    notes = models.TextField(blank=True, default='')
+
+    item_count = models.PositiveIntegerField(default=0)
+    items_in_stock = models.PositiveIntegerField(default=0)
+    total_quantity = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    total_value = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    # Ledger balance of the inventory account (1300000) at taken_at.
+    gl_inventory_balance = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    # Purchases already on the shelf (batches carry value) but not yet journalled.
+    unposted_purchase_value = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    # Stock-outs already off the shelf (batches reduced) but not yet journalled.
+    unposted_stock_out_value = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+
+    class Meta:
+        ordering = ['-taken_at', '-id']
+
+    def __str__(self):
+        return f'Snapshot stok {self.snapshot_date} #{self.pk}'
+
+
+class StockSnapshotLine(models.Model):
+    """One item in one warehouse, as it stood when the snapshot was taken.
+
+    Master fields are copied, not joined: the export is "the master item on that
+    day", and a rename or a price change next month must not rewrite it. An item
+    with no stock anywhere gets a single line with ``warehouse`` null, so the
+    snapshot lists the whole catalogue.
+    """
+    snapshot = models.ForeignKey(StockSnapshot, on_delete=models.CASCADE, related_name='lines')
+    item = models.ForeignKey('InventoryItem', on_delete=models.SET_NULL, null=True, blank=True,
+                             related_name='snapshot_lines')
+    warehouse = models.ForeignKey('Warehouse', on_delete=models.SET_NULL, null=True, blank=True,
+                                  related_name='snapshot_lines')
+
+    item_code = models.CharField(max_length=60)
+    item_name = models.CharField(max_length=60)
+    category = models.CharField(max_length=100, blank=True, default='')
+    unit_small = models.CharField(max_length=30, blank=True, default='')
+    selling_price = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    min_stock = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    warehouse_name = models.CharField(max_length=100, blank=True, default='')
+
+    quantity = models.DecimalField(max_digits=14, decimal_places=4, default=0)
+    value = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    batch_count = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['item_code', 'warehouse_name']
+        indexes = [models.Index(fields=['snapshot', 'item'], name='idx_snapline_snap_item')]
+
+    def __str__(self):
+        return f'{self.snapshot_id}: {self.item_code} @ {self.warehouse_name or "-"} = {self.quantity}'
+
+
 class SiteConfig(models.Model):
     """Singleton row (always pk=1) holding clinic-wide receipt settings."""
     clinic_name          = models.CharField(max_length=200, default='')

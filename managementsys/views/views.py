@@ -64,6 +64,7 @@ from .admin_views import (
 )
 from .stock_movement_report import StockMovementReportView, StockMovementExportView
 from .stock_card_page import InventoryItemMovementsView
+from .stock_snapshot_page import StockSnapshotDetailView, StockSnapshotExportView, StockSnapshotListView
 from .patient_activity_report import PatientActivityReportView, PatientActivityExportView
 from .beautician_expense_page import (
     BeauticianExpenseAliasListView, BeauticianExpenseListCreateView, BeauticianExpenseDetailView,

@@ -262,6 +262,9 @@ All models are in a single file. Search carefully.
 | GET | `/api/inventory/stock/` | Current stock levels |
 | GET | `/api/inventory/batches/` | All FIFO batches |
 | GET | `/api/inventory/dashboard/` | Low-stock counts + alert rows for the module hub |
+| GET/POST | `/api/inventory/snapshots/` | Stock snapshots: list (`date_from`/`date_to`) / take one now (`{notes}`). superuser/manager. See "Stock snapshots" below |
+| GET/DELETE | `/api/inventory/snapshots/<pk>/` | Item rows (`warehouse_id`, `q`, `compare_to`, `in_stock=true`). Delete is superuser only |
+| GET | `/api/inventory/snapshots/<pk>/export/` | `.xlsx` (Ringkasan / Per Item / Per Gudang), same params as detail |
 | POST | `/api/inventory/stock-in/` | Receive stock — **always zero-value**, ignores any `value` sent |
 | POST | `/api/inventory/stock-out/` | Issue stock (FIFO); `reason` picks the GL account |
 | GET | `/api/inventory/stock-out/reasons/` | Reason → account catalog, with live COA names |
@@ -519,6 +522,32 @@ warehouse row — `min_stock` belongs to the item. `LOW_STOCK_WARN_RATIO = 1.2`
 defines the amber band and is mirrored in the frontend's `inventoryTypes.ts`.
 
 Covered by `tests/test_inventory_module.py`.
+
+### Stock snapshots
+
+`StockSnapshot` + `StockSnapshotLine` (migration 0122), driven by
+`services/stock_snapshot.py`. A snapshot freezes every physical item's quantity
+and value per warehouse — plus a copy of its master fields (code, name, category,
+price, min stock) — and the ledger balance of the inventory account 1300000, in
+one transaction (REPEATABLE READ when it owns the transaction).
+
+- **Stored, never reconstructed.** Batches hold only the present, and replaying
+  history through FIFO cannot be exact: the kartu stok does not see treatment
+  material draws, restock refills newest-first, and nothing records which batch
+  a past sale hit. So only dates on which a snapshot was taken can be viewed.
+  Unattended daily capture is `manage.py take_stock_snapshot --once-per-day`
+  from a scheduled task (no background worker exists).
+- **The GL comparison explains two timing gaps and nothing else.** Purchases put
+  valued batches on the shelf before the run debits 1300000
+  (`unposted_purchase_value`); stock-outs reduce batches before the run credits
+  it (`unposted_stock_out_value`). Sales and returns move both together at
+  posting. `unexplained_difference` = batch value − (GL + purchases −
+  stock-outs) is computed on read, not stored.
+- Value uses `inventory_page._batch_value_expr` — the same rule as
+  `StockLevelView` — and the GL figure is summed from `LedgerEntry`, not
+  `ChartOfAccounts.balance`.
+
+Covered by `tests/test_stock_snapshot.py`.
 
 ### FIFO Inventory
 `InventoryBatch` tracks stock by batch. Stock-out deducts from oldest batch first (ordered by `input_date`).
